@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EmbedForge IDE — Agentic Firmware Studio</title>
+  <meta name="description" content="EmbedForge IDE: an autonomous embedded-firmware agent that researches official datasheets, writes real firmware, compiles it with a real toolchain and delivers a verified .hex.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ============ Title bar ============ -->
+  <header id="titlebar">
+    <div class="tb-left">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" fill="currentColor"/></svg>
+      </div>
+      <span class="brand">EmbedForge</span>
+      <span class="badge-pill">IDE</span>
+    </div>
+    <div class="tb-center">
+      <button id="project-switch" class="project-switch" title="Switch project">
+        <span id="project-name">No project</span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <button id="btn-new-proj" class="btn sm" style="font-weight:600" title="Start a fresh, clean project">＋ New Project</button>
+      <div id="project-menu" class="menu hidden"></div>
+    </div>
+    <div class="tb-right">
+      <div class="pill" id="pill-llm" title="Nebius Token Factory"><i class="dot"></i><span>Nemotron</span></div>
+      <div class="pill" id="pill-tavily" title="Tavily research"><i class="dot"></i><span>Tavily</span></div>
+      <div class="pill" id="pill-pio" title="PlatformIO toolchain"><i class="dot"></i><span>Toolchain</span></div>
+      <div class="pill" id="pill-ls" title="LangSmith tracing"><i class="dot"></i><span>LangSmith</span></div>
+    </div>
+  </header>
+
+  <div id="workbench">
+    <!-- ============ Activity bar ============ -->
+    <nav id="activity" aria-label="Views">
+      <button class="act active" data-view="explorer" title="Explorer">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+      </button>
+      <button class="act" data-view="ledger" title="Fact Ledger">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 12l2 2 4-4"/><path d="M12 3l8 3v6c0 4.5-3.2 8-8 9-4.8-1-8-4.5-8-9V6l8-3z"/></svg>
+        <span class="act-count" id="cnt-facts">0</span>
+      </button>
+      <button class="act" data-view="sources" title="Sources">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>
+        <span class="act-count" id="cnt-sources">0</span>
+      </button>
+      <button class="act" data-view="builds" title="Builds & HEX">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>
+        <span class="act-count" id="cnt-builds">0</span>
+      </button>
+      <div class="act-spacer"></div>
+      <button class="act" id="btn-debug-open" title="Report a hardware problem">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 2l1.5 2M16 2l-1.5 2"/><rect x="7" y="6" width="10" height="13" rx="5"/><path d="M3 11h4M17 11h4M3 17h4M17 17h4M12 6v13"/></svg>
+      </button>
+    </nav>
+
+    <!-- ============ Side panel ============ -->
+    <aside id="sidebar">
+      <section class="view active" id="view-explorer">
+        <div class="view-head">
+          <span>EXPLORER</span>
+          <div class="view-head-actions">
+            <button class="icon-btn" id="btn-upload-file" title="Upload schematics, images, code files, or .ZIP archive">⬆</button>
+            <button class="icon-btn" id="btn-zip" title="Download project ZIP">⬇</button>
+          </div>
+        </div>
+        <div id="file-tree" class="tree"><div class="empty">No files yet.<br>Ask the agent to build something or upload files.</div></div>
+      </section>
+      <section class="view" id="view-ledger">
+        <div class="view-head"><span>FACT LEDGER</span></div>
+        <div class="view-note">Every hardware constant must trace to a verbatim quote from an official source.</div>
+        <div id="ledger-list" class="list"><div class="empty">No facts recorded yet.</div></div>
+      </section>
+      <section class="view" id="view-sources">
+        <div class="view-head"><span>SOURCES</span></div>
+        <div id="sources-list" class="list"><div class="empty">No documents retrieved yet.</div></div>
+      </section>
+      <section class="view" id="view-builds">
+        <div class="view-head"><span>BUILDS & HEX</span></div>
+        <div id="builds-list" class="list"><div class="empty">No builds yet.</div></div>
+      </section>
+    </aside>
+
+    <!-- ============ Editor + bottom panel ============ -->
+    <main id="center">
+      <div id="tabs"></div>
+      <div id="editor">
+        <div id="welcome">
+          <div class="hero-icon">
+            <svg viewBox="0 0 24 24" width="40" height="40"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" fill="currentColor"/></svg>
+          </div>
+          <h1>EmbedForge</h1>
+          <p class="sub">Tell the agent your MCU and sensors. It researches the official datasheets, writes real firmware, compiles it with a real toolchain and hands you a <b>.hex</b> to flash.</p>
+          <div class="cards">
+            <div class="card"><b>① Research</b><span>Official datasheets only — every register value quoted &amp; verified.</span></div>
+            <div class="card"><b>② Build</b><span>Genuine GCC cross-compile with the vendor SDK. No simulation.</span></div>
+            <div class="card"><b>③ Debug</b><span>Report what you see on the bench; the agent diagnoses &amp; patches.</span></div>
+          </div>
+          <div class="try">Try: <button class="chip" data-prompt="I'm using a NUCLEO-F401RE (STM32F401RE) with an MPU6050 on I2C1 (PB8 = SCL, PB9 = SDA), AD0 tied to GND. Initialise the sensor and read accelerometer and gyroscope data at 100 Hz.">STM32F401 + MPU6050</button>
+            <button class="chip" data-prompt="Write firmware for an ESP32 DevKit with a BME280 on I2C that reads temperature, pressure and humidity once per second.">ESP32 + BME280</button>
+            <button class="chip" data-prompt="Raspberry Pi Pico (RP2040) reading a DS18B20 on a GPIO pin every 2 seconds.">Pico + DS18B20</button></div>
+        </div>
+        <div id="code-wrap" class="hidden">
+          <div id="code-gutter"></div>
+          <pre id="code"><code id="code-content"></code></pre>
+        </div>
+        <div id="asset-wrap" class="asset-wrap hidden">
+          <div class="asset-header">
+            <span id="asset-title" class="asset-title"></span>
+            <div class="asset-actions">
+              <a id="asset-btn-open" class="btn sm ghost" target="_blank" rel="noopener">Open ↗</a>
+              <a id="asset-btn-download" class="btn sm" download>⬇ Download</a>
+            </div>
+          </div>
+          <div id="asset-body" class="asset-body"></div>
+        </div>
+      </div>
+
+      <div id="bottom">
+        <div id="bottom-tabs">
+          <button class="btab active" data-p="terminal">TERMINAL</button>
+          <button class="btab" data-p="problems">PROBLEMS <span id="cnt-problems" class="mini-count hidden">0</span></button>
+          <button class="btab" data-p="trace">TRACEABILITY <span id="cnt-trace" class="mini-count hidden">0</span></button>
+          <div class="btab-spacer"></div>
+          <button class="icon-btn" id="btn-clear" title="Clear terminal">⌫</button>
+        </div>
+        <div id="p-terminal" class="bpanel active"></div>
+        <div id="p-problems" class="bpanel"><div class="empty">No problems.</div></div>
+        <div id="p-trace" class="bpanel"><div class="empty">Run <b>verify</b> to see how each constant traces to the datasheet.</div></div>
+      </div>
+    </main>
+
+    <!-- ============ Agent panel ============ -->
+    <aside id="agent">
+      <div class="agent-head">
+        <div class="agent-title"><span class="spark"></span>Agent</div>
+        <div class="agent-head-right">
+          <select id="prompt-select" class="prompt-select" title="Switch prompt preset">
+            <option value="strict">Strict Truth</option>
+            <option value="fast">Fast Prototype</option>
+            <option value="custom">Custom</option>
+          </select>
+          <button id="btn-edit-prompt" class="icon-btn" title="View & Edit Agent Prompt">⚙</button>
+          <div class="agent-model" id="agent-model">—</div>
+        </div>
+      </div>
+      <div id="plan" class="plan hidden"></div>
+      <div id="chat" class="chat">
+        <div class="msg assistant">
+          <div class="bubble">Hi! Tell me what you're building — for example your <b>MCU/board</b>, the <b>sensors</b>, and what the firmware should do. I'll only use facts from official datasheets or from you, and I'll ask when something is missing.</div>
+        </div>
+      </div>
+      <div class="composer">
+        <div id="composer-attachments" class="composer-attachments hidden"></div>
+        <textarea id="input" rows="3" placeholder="Describe your MCU, sensors & goal… (Enter to send, Shift+Enter for newline)"></textarea>
+        <div class="composer-row">
+          <button id="btn-attach" class="btn-icon-subtle" title="Attach schematics, images, code files, or .ZIP folder">📎 Attach</button>
+          <span id="run-state" class="run-state">Idle</span>
+          <button id="btn-stop" class="btn warn hidden" title="Interrupt the agent immediately">⏸ Interrupt</button>
+          <button id="btn-send" class="btn primary">Send ↵</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <footer id="statusbar">
+    <span id="sb-left">EmbedForge</span>
+    <span class="sb-spacer"></span>
+    <span id="sb-target">No target</span>
+    <span id="sb-verify"></span>
+  </footer>
+</div>
+
+<!-- fact popover -->
+<div id="popover" class="popover hidden"></div>
+
+<!-- Hardware debug dialog -->
+<dialog id="debug-dialog">
+  <form method="dialog" id="debug-form">
+    <h2>Report a hardware problem</h2>
+    <p class="muted">Describe what you observe on the bench. The agent will research the datasheet/errata, patch the firmware if it's a software cause, or tell you exactly what to check.</p>
+    <label>What happens?<textarea id="dbg-symptom" rows="3" placeholder="e.g. WHO_AM_I read returns 0xFF, I2C transaction NACKs, values are all zero…" required></textarea></label>
+    <label>Serial / UART log (optional)<textarea id="dbg-serial" rows="3" placeholder="Paste log output"></textarea></label>
+    <div class="row2">
+      <label>Measured supply (V)<input type="number" step="0.01" id="dbg-volt" placeholder="3.30"></label>
+      <label>Wiring / pull-ups<input type="text" id="dbg-wiring" placeholder="SDA/SCL 4.7k to 3V3, AD0→GND"></label>
+    </div>
+    <label>Scope / logic-analyzer notes (optional)<input type="text" id="dbg-scope" placeholder="Address byte 0xD0 sent, no ACK…"></label>
+    <menu>
+      <button value="cancel" class="btn ghost">Cancel</button>
+      <button id="dbg-submit" value="ok" class="btn primary">Diagnose &amp; fix</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- Agent Prompt Editor dialog -->
+<dialog id="prompt-dialog">
+  <form method="dialog" id="prompt-form">
+    <h2>Agent System Prompt</h2>
+    <p class="muted">Switch between presets or edit the instructions guiding how the agent researches, writes code, and verifies firmware.</p>
+    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+      <button type="button" class="btn sm" id="btn-load-strict">Load Strict Truth</button>
+      <button type="button" class="btn sm" id="btn-load-fast">Load Fast Prototype</button>
+    </div>
+    <label>
+      System Prompt Instructions:
+      <textarea id="prompt-edit-text" rows="14" style="font-family: var(--mono); font-size: 11px; margin-top: 6px;"></textarea>
+    </label>
+    <menu>
+      <button type="button" class="btn ghost" id="btn-prompt-close">Cancel</button>
+      <button id="btn-prompt-save" type="submit" value="save" class="btn primary">Apply &amp; Save Prompt</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- Hidden file picker -->
+<input type="file" id="file-upload-input" multiple class="hidden" accept=".pdf,.png,.jpg,.jpeg,.webp,.svg,.bmp,.gif,.zip,.sch,.kicad_sch,.kicad_pcb,.brd,.net,.c,.h,.cpp,.hpp,.cc,.ino,.ini,.txt,.json,.md,.py">
+
+<!-- Drag and drop upload overlay -->
+<div id="drop-overlay" class="drop-overlay hidden">
+  <div class="drop-box">
+    <div class="drop-icon">📥</div>
+    <div class="drop-title">Drop Files &amp; Schematics to Upload</div>
+    <div class="drop-subtitle">Schematics (.pdf, .sch, .kicad_sch), Images (.png, .jpg), Code, or .ZIP archives</div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
