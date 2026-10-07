@@ -15,10 +15,11 @@ TEXT_EXTS = {
     ".c", ".h", ".cpp", ".hpp", ".cc", ".ino", ".ini", ".md", ".txt", ".json",
     ".py", ".s", ".ld", ".cmake", ".mmd", ".csv", ".yaml", ".yml", ".toml",
     ".sch", ".kicad_sch", ".kicad_pcb", ".brd", ".net",
+    ".esch", ".enet", ".asc", ".tsv",  # EasyEDA Pro sheets/netlists, PADS netlists, BOMs
 }
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".bmp", ".gif", ".ico"}
 DOC_EXTS = {".pdf"}
-ARCHIVE_EXTS = {".zip"}
+ARCHIVE_EXTS = {".zip", ".epro", ".epro2"}
 ALLOWED_EXTS = TEXT_EXTS | IMAGE_EXTS | DOC_EXTS | ARCHIVE_EXTS
 HIDDEN_DIRS = {".pio", "sources", "builds", "__pycache__", ".git", ".vscode"}
 MAX_FILE_BYTES = 400_000
@@ -110,10 +111,11 @@ class Project:
             if not p.is_file():
                 continue
             rel = p.relative_to(self.root)
-            if rel.parts[0] in HIDDEN_DIRS or rel.name in ("project.json", "conversation.json", "trace.jsonl", "ledger.json"):
+            if rel.parts[0] in HIDDEN_DIRS or rel.name in ("project.json", "conversation.json", "trace.jsonl", "ledger.json", "board.json"):
                 continue
             suffix = p.suffix.lower()
-            kind = "image" if suffix in IMAGE_EXTS else "pdf" if suffix in DOC_EXTS else "schematic" if suffix in {".sch", ".kicad_sch", ".kicad_pcb", ".brd"} else "text"
+            kind = ("image" if suffix in IMAGE_EXTS else "pdf" if suffix in DOC_EXTS
+                    else "schematic" if suffix in {".sch", ".kicad_sch", ".kicad_pcb", ".brd", ".epro", ".epro2", ".esch"} else "text")
             out.append({"path": str(rel).replace("\\", "/"), "bytes": p.stat().st_size, "kind": kind})
         return out
 

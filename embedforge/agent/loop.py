@@ -1,6 +1,8 @@
 """The EmbedForge agent loop: LLM decides, deterministic tools act, truth layer gates the result."""
 
+import hashlib
 import json
+import re
 import time
 from collections import Counter
 from typing import Any, Dict, List, Optional
@@ -26,6 +28,14 @@ MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10
 STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
 STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
+
+
+_CONTEXT_MARKERS = re.compile(r"\n\n\[(?:Requirement Engine|Board imported)")
+
+
+def visible_user_text(content: str) -> str:
+    """The user's own words, without the context blocks the runner appends for the model."""
+    return _CONTEXT_MARKERS.split(content or "", maxsplit=1)[0]
 
 
 def _summ(result: Any, limit: int = 500) -> str:
@@ -139,6 +149,25 @@ class AgentRunner:
             logger.log_event("REQ_ENGINE_WARN", str(e))
             return ""
 
+    def _board_context(self) -> str:
+        """Announce an imported schematic once (and again whenever it changes)."""
+        bp = self.project.root / "board.json"
+        if not bp.exists():
+            return ""
+        digest = hashlib.sha256(bp.read_bytes()).hexdigest()[:16]
+        if self.project.meta().get("board_seen") == digest:
+            return ""
+        from embedforge import eda
+        board = eda.load_board(self.project.root)
+        if board is None:
+            return ""
+        s = board.summary()
+        mcus = ", ".join(f"{m['ref']} {m['mpn'] or m['value']} ({m['pin_count']} pins)" for m in s["mcus"]) or "none identified"
+        self.project.update_meta(board_seen=digest)
+        self.session.emit("board", summary=s)
+        return (f"\n\n[Board imported from {', '.join(i['file'] for i in s['imported'])}: {s['parts']} parts, {s['nets']} nets; "
+                f"MCU: {mcus}. It is the ground truth for pins and wiring — use query_board.]")
+
     def _walkthrough(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger) -> str:
         meta = self.project.meta()
         builds = self.project.builds()
@@ -185,8 +214,8 @@ class AgentRunner:
             messages = project.load_conversation()
             is_first = not messages
             req_ctx = self._requirement_context(user_message) if is_first else ""
-            messages.append({"role": "user", "content": user_message + req_ctx})
-            store.add_user_text("\n".join(m["content"].split("\n\n[Requirement Engine")[0] for m in messages if m["role"] == "user"))
+            messages.append({"role": "user", "content": user_message + req_ctx + self._board_context()})
+            store.add_user_text("\n".join(visible_user_text(m["content"]) for m in messages if m["role"] == "user"))
             if is_first and not project.meta().get("title_set"):
                 project.update_meta(name=user_message.strip().split("\n")[0][:48] or project.id, title_set=True)
                 s.emit("project", meta=project.meta())

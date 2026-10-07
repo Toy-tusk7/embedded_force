@@ -21,9 +21,11 @@ import time
 from embedforge.core.config import config
 from embedforge.agent import AgentRunner, ProjectManager, RunSession
 from embedforge.agent.llm import default_provider, list_models, providers
+from embedforge.agent.loop import visible_user_text
 from embedforge.agent.workspace import (
     HIDDEN_DIRS, TEXT_EXTS, IMAGE_EXTS, DOC_EXTS, ARCHIVE_EXTS, ALLOWED_EXTS
 )
+from embedforge import eda
 from embedforge.truth import SourceStore
 from embedforge.toolchain import pio
 from embedforge.engines.debug import PhysicalDebugEngine
@@ -239,7 +241,7 @@ def get_project(project_id: str):
     chat = []
     for m in p.load_conversation():
         if m.get("role") == "user":
-            chat.append({"role": "user", "text": m["content"].split("\n\n[Requirement Engine")[0]})
+            chat.append({"role": "user", "text": visible_user_text(m["content"])})
         elif m.get("role") == "assistant" and m.get("content"):
             chat.append({"role": "assistant", "text": m["content"]})
     with _LOCK:
@@ -247,8 +249,10 @@ def get_project(project_id: str):
         if active and (active not in _RUNS or _RUNS[active].done):
             _ACTIVE.pop(project_id, None)
             active = None
+    board = eda.load_board(p.root)
     return {
         "meta": p.meta(), "files": p.list_files(), "builds": p.builds(), "ledger": ledger, "sources": sources,
+        "board": board.summary() if board else None,
         "plan": plan.read_text(encoding="utf-8") if plan.exists() else "",
         "walkthrough": walk.read_text(encoding="utf-8") if walk.exists() else "",
         "chat": chat,
@@ -321,6 +325,7 @@ async def upload_files(
     p = _project(project_id)
     store = SourceStore(p.root)
     uploaded_records = []
+    eda_imported = False
 
     for f in files:
         raw_name = Path(f.filename or "uploaded_file").name
@@ -328,6 +333,18 @@ async def upload_files(
         suffix = Path(clean_name).suffix.lower()
         content = await f.read()
         if not content:
+            continue
+
+        # EasyEDA / netlist / BOM exports are recognised by content and feed the board model.
+        eda_kind = eda.detect(clean_name, content)
+        if eda_kind:
+            dest = f"{eda.EDA_DIR}/{clean_name}"
+            p.write_bytes(dest, content)
+            eda_imported = True
+            uploaded_records.append({
+                "name": clean_name, "path": dest, "kind": "eda", "format": eda.FORMAT_LABELS[eda_kind], "size": len(content),
+                "summary": f"Imported {eda.FORMAT_LABELS[eda_kind]} {clean_name}",
+            })
             continue
 
         if suffix == ".zip" and extract_zip:
@@ -350,6 +367,13 @@ async def upload_files(
                         entry_suffix = Path(norm).suffix.lower()
                         if entry_suffix in ALLOWED_EXTS:
                             data = z.read(info)
+                            entry_kind = eda.detect(norm, data)
+                            if entry_kind:  # e.g. an EasyEDA Standard project download (zip of JSON sources)
+                                rel = norm if norm.startswith(eda.EDA_DIR + "/") else f"{eda.EDA_DIR}/{norm}"
+                                p.write_bytes(rel, data)
+                                eda_imported = True
+                                extracted_count += 1
+                                continue
                             p.write_bytes(norm, data)
                             extracted_count += 1
 
@@ -432,6 +456,10 @@ async def upload_files(
                 "summary": f"Uploaded file {clean_name} to docs/"
             })
 
+    board = None
+    if eda_imported:
+        board = eda.rebuild_project_board(p.root, store, name=p.meta().get("name") or project_id)
+
     sp = p.root / "sources" / "index.json"
     sources_data = json.loads(sp.read_text(encoding="utf-8")) if sp.exists() else []
 
@@ -441,7 +469,24 @@ async def upload_files(
         "files": p.list_files(),
         "sources": sources_data,
         "count": len(uploaded_records),
+        "board": board,
     }
+
+
+@app.get("/api/projects/{project_id}/board")
+def get_board(project_id: str):
+    p = _project(project_id)
+    board = eda.load_board(p.root)
+    if board is None:
+        return {"board": None, "summary": None}
+    return {"board": board.to_json(), "summary": board.summary()}
+
+
+@app.post("/api/projects/{project_id}/board/rebuild")
+def rebuild_board(project_id: str):
+    p = _project(project_id)
+    summary = eda.rebuild_project_board(p.root, SourceStore(p.root), name=p.meta().get("name") or project_id)
+    return {"summary": summary}
 
 
 # ------------------------------------------------------------------ agent runs

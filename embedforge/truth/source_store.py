@@ -197,10 +197,11 @@ class SourceStore:
         )
 
     # ---------- core API ----------
-    def add(self, url: str, title: str, text: str, kind: str = "web") -> Source:
+    def add(self, url: str, title: str, text: str, kind: str = "web", replace: bool = False) -> Source:
+        """Store a document. Re-adding a URL keeps the longer text unless `replace` (e.g. a re-imported schematic)."""
         with self._lock:
             existing_id = self._by_url.get(url)
-            if existing_id and len(self.sources[existing_id].text) >= len(text):
+            if existing_id and not replace and len(self.sources[existing_id].text) >= len(text):
                 return self.sources[existing_id]
             sid = existing_id or f"SRC-{len(self.sources) + 1:03d}"
             # Preserve full technical text for datasheets; cap only extreme outliers (>2MB)

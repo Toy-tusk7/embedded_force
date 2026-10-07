@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from embedforge import eda
 from embedforge.agent.events import RunSession
 from embedforge.agent.workspace import Project
 from embedforge.toolchain import pio
@@ -59,6 +60,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Record a fact the USER stated explicitly (MCU model, pin, address, rate...). `quote` must be the user's exact words.",
         {"subject": S, "property": S, "value": S, "quote": S}, ["subject", "property", "value", "quote"]),
     _fn("list_facts", "List all facts currently in the ledger (with FACT ids).", {}, []),
+    _fn("query_board",
+        "Look up the user's imported schematic/netlist (EasyEDA, Protel, PADS, KiCad): a designator ('U1'), a net ('HIN_A'), "
+        "an MCU pin name ('PA8') or a part number ('FD6288Q'); empty query returns the board summary. This is the ground truth "
+        "for pins and wiring. Each returned line is verbatim text of the board source — quote one with "
+        "record_fact(source_id=<returned source_id>) to turn a connection into a fact.",
+        {"query": S}, []),
     _fn("search_framework",
         "Regex-search the installed vendor SDK/HAL headers (real local source of truth for HAL function/macro names).",
         {"pattern": S, "extension": S}, ["pattern"]),
@@ -175,7 +182,7 @@ class ToolBelt:
         self._handlers: Dict[str, Callable[..., Any]] = {
             "resolve_target": self.resolve_target, "init_project": self.init_project, "web_search": self.web_search,
             "fetch_document": self.fetch_document, "read_source": self.read_source, "record_fact": self.record_fact,
-            "record_user_fact": self.record_user_fact, "list_facts": self.list_facts,
+            "record_user_fact": self.record_user_fact, "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
             "write_file": self.write_file, "replace_in_file": self.replace_in_file, "read_file": self.read_file,
             "list_files": self.list_files, "build": self.build, "verify": self.verify, "set_plan": self.set_plan,
@@ -356,6 +363,19 @@ class ToolBelt:
         res = self.ledger.record(subject, property, value, sid, quote)
         if res.get("ok"):
             self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
+        return res
+
+    def query_board(self, query: str = "") -> Dict[str, Any]:
+        board = eda.load_board(self.project.root)
+        if board is None:
+            return {"error": "No schematic is imported for this project. Ask the user to upload their EasyEDA exports "
+                             "(netlist + schematic source or BOM), or to describe the wiring."}
+        sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
+        res = board.query(query or "")
+        res["source_id"] = sid
+        if res.get("lines"):
+            res["how_to_record"] = (f"record_fact(subject='<ref>', property='<e.g. PA8_net>', value='<net or pin>', "
+                                    f"source_id='{sid}', quote='<one line above, verbatim>')")
         return res
 
     def list_facts(self) -> Dict[str, Any]:

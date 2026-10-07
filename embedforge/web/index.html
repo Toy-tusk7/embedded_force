@@ -78,6 +78,7 @@
         <div id="run-health" class="run-health"></div>
       </section>
       <section class="rail-section rail-actions">
+        <button id="btn-eda-rail" class="btn ghost block"><span data-icon="board"></span>Import EasyEDA schematic</button>
         <button id="btn-debug" class="btn ghost block"><span data-icon="bug"></span>Report a hardware issue</button>
         <button id="btn-zip" class="btn ghost block"><span data-icon="download"></span>Download project</button>
       </section>
@@ -93,6 +94,7 @@
           <textarea id="input" rows="1" placeholder="Describe your MCU, peripherals, wiring and what the firmware should do…"></textarea>
           <div class="composer-row">
             <button id="btn-attach" class="btn ghost sm" title="Attach datasheets, schematics, images, code or a .zip"><span data-icon="clip"></span>Attach</button>
+            <button id="btn-eda" class="btn ghost sm" title="Import your schematic from EasyEDA"><span data-icon="board"></span>EasyEDA</button>
             <span id="run-state" class="run-state">Ready</span>
             <button id="btn-stop" class="btn danger sm hidden" title="Stop the agent"><span data-icon="stop"></span>Stop</button>
             <button id="btn-send" class="btn primary sm" title="Send (Enter)"><span data-icon="send"></span>Send</button>
@@ -106,6 +108,7 @@
     <aside class="inspector" id="inspector">
       <nav class="tabs" id="tabs" role="tablist">
         <button class="tab active" data-tab="files" role="tab"><span data-icon="code"></span>Files</button>
+        <button class="tab" data-tab="board" role="tab"><span data-icon="board"></span>Board <b class="count" id="cnt-board"></b></button>
         <button class="tab" data-tab="facts" role="tab"><span data-icon="shield"></span>Facts <b class="count" id="cnt-facts"></b></button>
         <button class="tab" data-tab="sources" role="tab"><span data-icon="book"></span>Sources <b class="count" id="cnt-sources"></b></button>
         <button class="tab" data-tab="builds" role="tab"><span data-icon="chip"></span>Builds <b class="count" id="cnt-builds"></b></button>
@@ -131,6 +134,7 @@
           </div>
         </div>
       </section>
+      <section class="pane" data-pane="board"><div id="board"></div></section>
       <section class="pane" data-pane="facts"><div class="pane-intro">Every raw hardware constant must cite one of these facts. Each fact's quote was checked verbatim against its source.</div><div id="facts" class="card-list"></div></section>
       <section class="pane" data-pane="sources"><div class="pane-intro">Documents the agent retrieved. Only manufacturer sites, official repos and your own uploads/statements count as authoritative.</div><div id="sources" class="card-list"></div></section>
       <section class="pane" data-pane="builds"><div id="builds" class="card-list"></div></section>
@@ -165,6 +169,42 @@
   </form>
 </dialog>
 
+<!-- EasyEDA import dialog -->
+<dialog id="eda-dialog" class="dialog wide">
+  <form method="dialog" id="eda-form">
+    <div class="eda-head">
+      <span class="eda-mark" data-icon="board"></span>
+      <div><h2>Import from EasyEDA</h2><p class="muted">Give the agent your real wiring. It reads every pin, net and part number, so it never has to guess or ask which pin goes where.</p></div>
+    </div>
+    <div class="segmented eda-seg" id="eda-seg" role="tablist">
+      <button type="button" data-ed="pro" class="on">EasyEDA Pro</button>
+      <button type="button" data-ed="std">EasyEDA Standard</button>
+    </div>
+    <ol class="eda-steps" data-ed="pro">
+      <li><b>Project file</b> — <kbd>File › Save As (Local)</kbd> → <code>.epro</code> / <code>.epro2</code>. <span class="muted">Best: contains pins with names (PA8…), nets and part numbers.</span></li>
+      <li><b>Netlist</b> <span class="opt">optional</span> — <kbd>File › Export › Netlist</kbd>, type <b>Protel2</b> or <b>PADS</b>.</li>
+      <li><b>BOM</b> <span class="opt">optional</span> — <kbd>File › Export › Bill of Materials (BOM)</kbd> as <b>CSV</b>.</li>
+    </ol>
+    <ol class="eda-steps hidden" data-ed="std">
+      <li><b>Schematic source</b> — <kbd>File › EasyEDA File Source…</kbd> → <code>.json</code>, or right-click the project folder › <kbd>Download</kbd> for a <code>.zip</code> of all sheets.</li>
+      <li><b>Netlist</b> <span class="opt">optional</span> — <kbd>File › Export Netlist</kbd>, <b>Protel/Altium</b> or <b>PADS</b>.</li>
+      <li><b>BOM</b> <span class="opt">optional</span> — export the BOM as <b>CSV</b>.</li>
+    </ol>
+    <label class="eda-drop" id="eda-drop">
+      <span data-icon="upload" class="drop-icon"></span>
+      <b>Drop your EasyEDA files here</b>
+      <span class="muted small">.epro · .epro2 · .json · .zip · .net · .asc · BOM .csv — KiCad netlists work too</span>
+      <input type="file" id="eda-input" multiple class="hidden" accept=".epro,.epro2,.json,.zip,.net,.asc,.csv,.tsv,.txt">
+    </label>
+    <div id="eda-result" class="eda-result hidden"></div>
+    <menu>
+      <button value="cancel" class="btn ghost">Close</button>
+      <button type="button" id="eda-view" class="btn ghost hidden">View board</button>
+      <button type="button" id="eda-use" class="btn primary hidden">Tell the agent</button>
+    </menu>
+  </form>
+</dialog>
+
 <!-- System prompt dialog -->
 <dialog id="prompt-dialog" class="dialog wide">
   <form method="dialog" id="prompt-form">
@@ -182,7 +222,7 @@
   </form>
 </dialog>
 
-<input type="file" id="file-input" multiple class="hidden" accept=".pdf,.png,.jpg,.jpeg,.webp,.svg,.bmp,.gif,.zip,.sch,.kicad_sch,.kicad_pcb,.brd,.net,.c,.h,.cpp,.hpp,.cc,.ino,.ini,.txt,.json,.md">
+<input type="file" id="file-input" multiple class="hidden" accept=".pdf,.png,.jpg,.jpeg,.webp,.svg,.bmp,.gif,.zip,.epro,.epro2,.asc,.sch,.kicad_sch,.kicad_pcb,.brd,.net,.c,.h,.cpp,.hpp,.cc,.ino,.ini,.txt,.json,.md,.csv,.tsv">
 
 <div id="drop-overlay" class="drop-overlay hidden">
   <div class="drop-box"><span data-icon="upload" class="drop-icon"></span><b>Drop to attach</b><span>Datasheets, schematics, images, source code or a .zip</span></div>

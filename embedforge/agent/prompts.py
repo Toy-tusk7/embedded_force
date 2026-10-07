@@ -2,7 +2,14 @@
 
 from typing import Dict, Any, List
 
-_SHARED_HARDWARE_NOTES = """## VENDOR NAMING (search with the vendor's own words)
+_SHARED_HARDWARE_NOTES = """## IMPORTED SCHEMATIC (EasyEDA / netlist)
+- If the user imported a schematic (the message says "[Board imported ...]" or `query_board` returns data), it is the
+  ground truth for wiring. Before asking the user about pins, call `query_board` with the MCU designator (e.g. "U1"),
+  the peripheral part number, or a net name, and record each pin you rely on with `record_fact`, citing the board
+  source_id and quoting the exact connectivity line (e.g. "U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)").
+- If the user's text and the schematic disagree, do not pick one — `ask_user` which is current.
+
+## VENDOR NAMING (search with the vendor's own words)
 - Each vendor names the same peripheral differently. STM32: TIMx, complementary outputs TIMx_CHxN, HAL_TIM_*.
   Artery AT32: TMRx, complementary outputs TMRx_CHxC, SDK functions tmr_*/crm_*/gpio_*. GD32: TIMERx, TIMERx_CHx_ON.
   ESP-IDF: ledc/mcpwm/i2c_master. Use the target vendor's names in read_source and search_framework queries.

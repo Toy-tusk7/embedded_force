@@ -48,6 +48,7 @@
     message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
     image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/>',
     box: '<rect x="4" y="4" width="16" height="16" rx="3"/>',
+    board: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8" cy="8" r="1.5"/><circle cx="16" cy="16" r="1.5"/><path d="M9.5 8H14l2 2v4.5M8 9.5V14l2 2h4.5"/>',
     boxcheck: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8 12 3 3 5-6"/>',
   };
   const ico = (n) => `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ICONS.circle}</svg>`;
@@ -59,7 +60,7 @@
     runId: null, es: null, running: false, rows: {}, activity: null, thinkRow: null,
     problems: { build: [], verify: [] }, trace: [], verify: null, staged: [], fresh: null,
     models: [], modelDefault: null, modelErrors: {}, providers: [], prompts: [], mode: 'strict',
-    stages: {}, live: null, stats: null, guards: [], replayTexts: null, config: {},
+    stages: {}, live: null, stats: null, guards: [], replayTexts: null, config: {}, board: null, boardFilter: '',
   };
 
   // ------------------------------------------------------------------ api
@@ -177,7 +178,7 @@
   ];
   const TOOL_STAGE = {
     resolve_target: 'target', init_project: 'target', web_search: 'research', fetch_document: 'research', read_source: 'research',
-    record_fact: 'facts', record_user_fact: 'facts', list_facts: 'facts', search_framework: 'code', read_framework_file: 'code',
+    record_fact: 'facts', record_user_fact: 'facts', list_facts: 'facts', query_board: 'facts', search_framework: 'code', read_framework_file: 'code',
     write_file: 'code', replace_in_file: 'code', read_file: 'code', list_files: 'code', build: 'build', verify: 'verify', finish: 'deliver',
   };
   function resetStages() { S.stages = Object.fromEntries(STAGES.map((s) => [s.id, { state: 'idle', detail: '', failed: false }])); }
@@ -227,19 +228,20 @@
   // ------------------------------------------------------------------ run health
   const TOOL_LABEL = {
     web_search: 'Search', fetch_document: 'Download', read_source: 'Read source', record_fact: 'Record fact',
-    record_user_fact: 'Record your fact', list_facts: 'List facts', resolve_target: 'Find board', init_project: 'Create project',
+    record_user_fact: 'Record your fact', list_facts: 'List facts', query_board: 'Read schematic', resolve_target: 'Find board', init_project: 'Create project',
     search_framework: 'Search SDK', read_framework_file: 'Read SDK file', write_file: 'Write file', replace_in_file: 'Edit file',
     read_file: 'Read file', list_files: 'List files', build: 'Build', verify: 'Verify', set_plan: 'Update plan', ask_user: 'Ask you', finish: 'Finish',
   };
   const TOOL_ICON = {
     web_search: 'search', fetch_document: 'download', read_source: 'book', record_fact: 'shield', record_user_fact: 'shield',
-    list_facts: 'list', resolve_target: 'target', init_project: 'cpu', search_framework: 'search', read_framework_file: 'file',
+    list_facts: 'list', query_board: 'board', resolve_target: 'target', init_project: 'cpu', search_framework: 'search', read_framework_file: 'file',
     write_file: 'edit', replace_in_file: 'edit', read_file: 'file', list_files: 'list', build: 'chip', verify: 'check',
     set_plan: 'list', ask_user: 'help', finish: 'flag',
   };
   const TOOL_KIND = {
     web_search: 'search', fetch_document: 'download', read_source: 'read', record_fact: 'fact', record_user_fact: 'fact',
     write_file: 'edit', replace_in_file: 'edit', search_framework: 'SDK lookup', read_framework_file: 'SDK lookup', build: 'build', verify: 'check',
+    query_board: 'schematic lookup',
   };
   const plural = (n, w) => `${n} ${n === 1 ? w : w === 'search' ? 'searches' : w + 's'}`;
   function diagnose(st) {
@@ -314,8 +316,10 @@
       <p>Name your MCU, peripherals and wiring. The agent quotes official datasheets for every hardware value, compiles with the real vendor toolchain and verifies each constant before handing you a <b>.hex</b>.</p>
       <div class="flow">${STAGES.slice(1, 8).map((s) => `<span>${ico(s.icon)}${s.label}</span>`).join('')}</div>
       <div class="examples">${EXAMPLES.map(([t, sub, p], i) => `<button class="example" data-ex="${i}"><b>${esc(t)}</b><span>${esc(sub)}</span></button>`).join('')}</div>
+      <button class="btn ghost sm welcome-eda" data-eda-open>${ico('board')}Have a schematic? Import it from EasyEDA first</button>
     </div>`;
     $$('.example', chat()).forEach((b) => b.onclick = () => { const inp = $('#input'); inp.value = EXAMPLES[+b.dataset.ex][2]; autosize(); inp.focus(); });
+    $$('[data-eda-open]', chat()).forEach((b) => b.onclick = openEdaDialog);
   }
 
   // activity groups (tool calls between assistant messages)
@@ -365,6 +369,7 @@
       case 'search_framework': return a.pattern || '';
       case 'read_framework_file': return a.path || '';
       case 'write_file': case 'replace_in_file': case 'read_file': return a.path || '';
+      case 'query_board': return a.query || '(summary)';
       case 'ask_user': return a.question || '';
       case 'finish': return a.status || '';
       default: return Object.entries(a).map(([k, v]) => `${k}=${String(v).slice(0, 40)}`).join(', ');
@@ -515,6 +520,103 @@
     $$('#checks .problem').forEach((el) => el.onclick = () => { const f = el.dataset.file; if (f && f in S.files) openFile(f); });
     if (S.active) renderViewer();
   }
+  // ------------------------------------------------------------------ inspector: board (imported schematic)
+  async function loadBoard() {
+    if (!S.projectId) return;
+    try { S.board = (await api(`/api/projects/${S.projectId}/board`)).board; } catch (_) { S.board = null; }
+    renderBoard();
+  }
+  const natural = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  function nodeLabel(ref, num) {
+    const part = S.board.parts[ref];
+    const pin = part && part.pins.find((p) => p.number === num);
+    return `${ref}.${num}${pin && pin.name && pin.name !== num ? ` (${pin.name})` : ''}`;
+  }
+  function pinRows(part) {
+    const q = S.boardFilter.toLowerCase();
+    return part.pins.map((p) => {
+      const to = p.net ? (S.board.nets[p.net] || []).filter(([r, n]) => !(r === part.ref && n === p.number)).map(([r, n]) => nodeLabel(r, n)) : [];
+      return { ...p, to: to.join(', ') };
+    }).filter((r) => !q || [r.number, r.name, r.net, r.to].some((x) => String(x || '').toLowerCase().includes(q)));
+  }
+  function renderBoard() {
+    const el = $('#board');
+    const b = S.board;
+    setCount('#cnt-board', b ? Object.keys(b.parts).length : 0);
+    if (!b) {
+      el.innerHTML = `<div class="empty-state">${ico('board')}<div><b>No schematic imported</b></div><div>Import your EasyEDA design so the agent uses your real pin assignments.</div>
+        <div style="margin-top:14px"><button class="btn primary sm" data-eda-open>${ico('board')}Import from EasyEDA</button></div></div>`;
+      $$('[data-eda-open]', el).forEach((x) => x.onclick = openEdaDialog);
+      return;
+    }
+    const parts = Object.values(b.parts).sort((x, y) => natural(x.ref, y.ref));
+    const mcus = parts.filter((p) => p.is_mcu);
+    const main = mcus.length ? mcus : parts.filter((p) => /^(U|IC)/i.test(p.ref)).sort((x, y) => y.pin_count - x.pin_count).slice(0, 1);
+    const pinTable = (part) => {
+      const rows = pinRows(part);
+      return `<div class="board-section"><h4>${esc(part.ref)} · ${esc(part.mpn || part.value || '')} <small>${esc(part.footprint || '')} · ${part.pin_count} pins${part.is_mcu ? ' · MCU' : ''}</small></h4></div>
+        <div class="pin-table"><table><thead><tr><th>Pin</th><th>Name</th><th>Net</th><th>Connected to</th></tr></thead><tbody>
+        ${rows.map((r) => `<tr class="${r.net ? '' : 'nc'}"><td class="num">${esc(r.number)}</td><td class="pn">${esc(r.name || '—')}</td><td class="net">${esc(r.net || 'not connected')}</td><td class="to">${esc(r.to)}</td></tr>`).join('')
+          || '<tr><td colspan="4" class="muted">No pins match the filter.</td></tr>'}</tbody></table></div>`;
+    };
+    const others = parts.filter((p) => !main.includes(p));
+    const namesKnown = parts.some((p) => p.pins.some((x) => x.name && x.name !== x.number));
+    el.innerHTML = `<div class="board-head"><span class="eda-mark">${ico('board')}</span>
+        <div><b>${esc(b.name)}</b><span class="muted">${parts.length} parts · ${Object.keys(b.nets).length} nets${namesKnown ? '' : ' · pin names unknown — add the schematic source (.epro / .json)'}</span></div>
+        <button class="btn ghost sm" data-eda-open>${ico('upload')}Re-import</button>
+        <div class="board-files">${(b.imported || []).map((i) => `<span class="pill neutral" title="${esc(i.file)}">${esc(i.format)} · ${esc(i.file.split('/').pop())}</span>`).join('')}</div></div>
+      <div class="board-section"><h4>Pin map</h4><label class="board-filter">${ico('search')}<input id="board-filter" placeholder="Filter pins, nets…" value="${esc(S.boardFilter)}"></label></div>
+      ${main.map(pinTable).join('')}
+      ${others.length ? `<div class="board-section"><h4>Other parts <small>${others.length}</small></h4></div>
+        <div class="pin-table"><table><thead><tr><th>Ref</th><th>Part</th><th>Footprint</th><th>Pins</th></tr></thead><tbody>
+        ${others.map((p) => `<tr><td class="pn">${esc(p.ref)}</td><td>${esc(p.mpn || p.value || '')}</td><td class="to">${esc(p.footprint || '')}</td><td class="num">${p.pin_count}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${(b.warnings || []).length ? `<details class="warn-list"><summary>${b.warnings.length} import warning(s)</summary>${b.warnings.slice(0, 40).map((w) => `<div>${esc(w)}</div>`).join('')}</details>` : ''}`;
+    $$('[data-eda-open]', el).forEach((x) => x.onclick = openEdaDialog);
+    const f = $('#board-filter');
+    f.oninput = () => { S.boardFilter = f.value; const pos = f.selectionStart; renderBoard(); const nf = $('#board-filter'); nf.focus(); nf.setSelectionRange(pos, pos); };
+  }
+
+  // ------------------------------------------------------------------ EasyEDA import dialog
+  function openEdaDialog() {
+    $('#eda-result').className = 'eda-result hidden';
+    $('#eda-view').classList.add('hidden');
+    $('#eda-use').classList.add('hidden');
+    $('#eda-dialog').showModal();
+  }
+  async function importEda(files) {
+    if (!files.length) return;
+    const res = $('#eda-result');
+    res.className = 'eda-result busy';
+    res.innerHTML = `<span class="spinner"></span>Importing ${files.length} file(s)…`;
+    try {
+      const data = await uploadFiles(files, false);
+      const eda = (data.uploaded || []).filter((u) => u.kind === 'eda');
+      const other = (data.uploaded || []).filter((u) => u.kind !== 'eda');
+      const s = data.board;
+      if (!s) {
+        res.className = 'eda-result bad';
+        res.innerHTML = `<b>No EasyEDA data recognised</b>These files were stored but don't look like an EasyEDA project, schematic source, netlist or BOM.${other.length ? `<ul>${other.map((u) => `<li>${esc(u.name)}</li>`).join('')}</ul>` : ''}`;
+        return;
+      }
+      const mcu = (s.mcus || [])[0];
+      res.className = 'eda-result good';
+      res.innerHTML = `<b>${ico('check')} Imported ${s.parts} parts and ${s.nets} nets</b>
+        ${mcu ? `MCU: <b style="display:inline">${esc(mcu.ref)} ${esc(mcu.mpn || mcu.value)}</b> (${mcu.pin_count} pins)` : 'No MCU identified — check that the MCU part number is set in EasyEDA.'}
+        <ul>${eda.map((u) => `<li>${esc(u.format)} — ${esc(u.name)}</li>`).join('')}</ul>
+        ${s.pin_names_known ? '' : '<div class="hint">Pin names (PA8…) are missing — netlists only carry pin numbers. Add the .epro or schematic .json too.</div>'}
+        ${(s.warnings || []).length ? `<div class="hint">${s.warnings.length} warning(s) — see the Board tab.</div>` : ''}`;
+      $('#eda-view').classList.remove('hidden');
+      $('#eda-use').classList.remove('hidden');
+      S.edaMcu = mcu;
+      await loadBoard();
+      S.stages.understand.detail = 'schematic imported';
+      renderStepper();
+    } catch (e) {
+      res.className = 'eda-result bad';
+      res.innerHTML = `<b>Import failed</b>${esc(e.message)}`;
+    }
+  }
+
   function term(line, cls = '') {
     const t = $('#terminal');
     const d = document.createElement('div');
@@ -697,6 +799,10 @@
         S.stats = { ...e, final: true };
         renderHealth();
         break;
+      case 'board':
+        addActivityNote(`Using your imported schematic: ${e.summary.parts} parts, ${e.summary.nets} nets`, 'ok');
+        loadBoard();
+        break;
       case 'state':
         S.ledger = Object.fromEntries((e.ledger || []).map((f) => [f.id, f]));
         S.builds = e.builds || S.builds;
@@ -777,7 +883,8 @@
       setRunning(false);
       if (data.sources) { S.sources = data.sources; renderSources(); }
       if (data.files) await syncFiles(data.files);
-      toast(`Uploaded ${data.uploaded.length} item(s)`);
+      if (data.board) { await loadBoard(); toast(`Schematic imported: ${data.board.parts} parts, ${data.board.nets} nets`); }
+      else toast(`Uploaded ${data.uploaded.length} item(s)`);
       const first = data.uploaded.find((u) => u.path);
       if (openFirst && first) openFile(first.path);
       return data;
@@ -809,10 +916,10 @@
   }
   function resetProjectUI() {
     Object.assign(S, { files: {}, order: [], active: null, ledger: {}, sources: [], builds: [], rows: {}, activity: null, thinkRow: null,
-      problems: { build: [], verify: [] }, trace: [], verify: null, staged: [], live: null, stats: null, guards: [] });
+      problems: { build: [], verify: [] }, trace: [], verify: null, staged: [], live: null, stats: null, guards: [], board: null, boardFilter: '' });
     $('#terminal').innerHTML = '';
     $('#plan').className = 'plan hidden';
-    renderStaged(); renderTree(); renderViewer(); renderFacts(); renderSources(); renderBuilds(); renderChecks(); renderHealth();
+    renderStaged(); renderTree(); renderViewer(); renderFacts(); renderSources(); renderBuilds(); renderChecks(); renderHealth(); renderBoard();
     resetStages(); renderStepper();
   }
   async function newProject() {
@@ -845,6 +952,7 @@
     if (first) { S.active = first; renderTree(); renderViewer(); }
     renderFacts(); renderSources(); renderBuilds(); renderChecks();
     deriveStages();
+    if (d.board) { await loadBoard(); S.stages.understand.state = 'done'; S.stages.understand.detail = 'schematic imported'; renderStepper(); }
     renderProjectMenu();
     if (d.active_run) {
       S.replayTexts = new Set(d.chat.filter((m) => m.role === 'assistant').map((m) => m.text));
@@ -1023,14 +1131,38 @@
     const pick = (cb) => { const fi = $('#file-input'); fi.value = ''; fi.onchange = () => { if (fi.files && fi.files.length) cb([...fi.files]); }; fi.click(); };
     $('#btn-attach').onclick = () => pick((files) => { S.staged.push(...files); renderStaged(); });
     $('#btn-upload').onclick = () => pick((files) => uploadFiles(files, true));
+    // EasyEDA import
+    $('#btn-eda').onclick = openEdaDialog;
+    $('#btn-eda-rail').onclick = openEdaDialog;
+    $$('#eda-seg button').forEach((b) => b.onclick = () => {
+      $$('#eda-seg button').forEach((x) => x.classList.toggle('on', x === b));
+      $$('.eda-steps').forEach((s) => s.classList.toggle('hidden', s.dataset.ed !== b.dataset.ed));
+    });
+    const edaInput = $('#eda-input');
+    edaInput.onchange = () => { if (edaInput.files.length) importEda([...edaInput.files]); edaInput.value = ''; };
+    const edaDrop = $('#eda-drop');
+    edaDrop.addEventListener('dragover', (e) => { e.preventDefault(); edaDrop.classList.add('over'); });
+    edaDrop.addEventListener('dragleave', () => edaDrop.classList.remove('over'));
+    edaDrop.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); edaDrop.classList.remove('over'); if (e.dataTransfer.files.length) importEda([...e.dataTransfer.files]); });
+    $('#eda-view').onclick = () => { $('#eda-dialog').close(); showTab('board'); $('.app').classList.add('show-inspector'); };
+    $('#eda-use').onclick = () => {
+      $('#eda-dialog').close();
+      const m = S.edaMcu;
+      $('#input').value = `I imported my EasyEDA schematic${m ? ` (MCU ${m.ref} ${m.mpn || m.value})` : ''}. Use it as the source of truth for every pin assignment and connection, and tell me if anything in my request disagrees with it.`;
+      autosize();
+      $('#input').focus();
+    };
+
     let drag = 0;
-    window.addEventListener('dragenter', (e) => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); drag++; $('#drop-overlay').classList.remove('hidden'); } });
+    const edaOpen = () => $('#eda-dialog').open;
+    window.addEventListener('dragenter', (e) => { if (!edaOpen() && e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); drag++; $('#drop-overlay').classList.remove('hidden'); } });
     window.addEventListener('dragleave', (e) => { e.preventDefault(); if (--drag <= 0) { drag = 0; $('#drop-overlay').classList.add('hidden'); } });
     window.addEventListener('dragover', (e) => e.preventDefault());
     window.addEventListener('drop', (e) => {
       e.preventDefault();
       drag = 0;
       $('#drop-overlay').classList.add('hidden');
+      if (edaOpen()) return;
       if (e.dataTransfer && e.dataTransfer.files.length) { S.staged.push(...e.dataTransfer.files); renderStaged(); toast(`${e.dataTransfer.files.length} file(s) attached — they upload when you send`); }
     });
 

@@ -178,6 +178,21 @@ Then navigate to **`http://localhost:8000`** in your browser:
   versioned builds (.hex/.bin/.elf), checks (compiler + datasheet verification + traceability) and a terminal.
 * Model picker, Strict / Fast / Custom prompt modes, light & dark themes, responsive down to phone width.
 
+### Import your schematic from EasyEDA
+
+Click **EasyEDA** in the composer (or *Import EasyEDA schematic* in the left rail) and drop your exports:
+
+| Editor | Best file | Optional extras |
+|---|---|---|
+| EasyEDA Pro | `File › Save As (Local)` → `.epro` (V2) or `.epro2` (V3) | `File › Export › Netlist` (Protel2 / PADS), `File › Export › Bill of Materials` (CSV) |
+| EasyEDA Standard | `File › EasyEDA File Source…` → `.json`, or right-click the project › `Download` (`.zip`) | `File › Export Netlist` (Protel/Altium / PADS), BOM CSV |
+
+KiCad netlists (`.net`) work too. Files are recognised by content, stored under `schematics/`, and merged into one
+board model: netlists give connectivity, the schematic source gives pin names (`PA8`…), the BOM gives part numbers.
+The **Board** tab shows the MCU pin map; the agent reads it with the `query_board` tool and records each pin it relies
+on as a Fact Ledger entry quoting the exact connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`),
+so wiring in the firmware is traceable to your schematic. The agent cannot write to `schematics/`.
+
 ### Agent guard-rails
 
 * **No fake targets.** MCUs are resolved against the real PlatformIO registry. Official vendor platforms that are

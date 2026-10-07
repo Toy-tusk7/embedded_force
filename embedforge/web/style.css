@@ -293,6 +293,7 @@ svg.ic { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none
 .example { display: flex; flex-direction: column; gap: 4px; text-align: left; padding: 13px 14px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); cursor: pointer; transition: border-color .15s, box-shadow .15s, transform .15s; }
 .example:hover { border-color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
 .example b { font-size: 13.5px; }
+.welcome-eda { margin-top: 14px; color: var(--accent-text); }
 .example span { font-size: 12.5px; color: var(--text-2); }
 
 /* plan */
@@ -427,6 +428,53 @@ svg.ic { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none
 .terminal .err { color: #ff7b72; }
 .terminal .warn { color: #e3b341; }
 .terminal .dim { color: #6e7681; }
+
+/* ---------------------------------------------------------------- board (imported schematic) */
+.board-head { margin: 14px 16px 6px; padding: 14px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface-2); display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; }
+.board-head .eda-mark { width: 38px; height: 38px; }
+.board-head b { display: block; font-size: 15px; }
+.board-head .muted { font-size: 12.5px; }
+.board-files { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+.board-section { margin: 14px 16px 6px; display: flex; align-items: center; gap: 10px; }
+.board-section h4 { margin: 0; font-size: 13.5px; flex: 1; min-width: 0; }
+.board-section h4 small { color: var(--text-3); font-weight: 500; }
+.board-filter { display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text-3); }
+.board-filter input { border: 0; outline: 0; background: transparent; width: 150px; }
+.pin-table { margin: 0 16px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: auto; max-height: 52vh; }
+.pin-table table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.pin-table th, .pin-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+.pin-table th { background: var(--surface-2); color: var(--text-2); font-size: 11.5px; font-weight: 600; position: sticky; top: 0; z-index: 1; }
+.pin-table tr:last-child td { border-bottom: 0; }
+.pin-table td.num { font-family: var(--mono); color: var(--text-3); width: 1%; }
+.pin-table td.pn { font-family: var(--mono); font-weight: 600; }
+.pin-table td.net { font-family: var(--mono); color: var(--accent-text); }
+.pin-table td.to { color: var(--text-2); white-space: normal; }
+.pin-table tr.nc td { color: var(--text-3); }
+.pin-table tr.nc td.net { color: var(--text-3); font-style: italic; }
+.warn-list { margin: 0 16px 16px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--warn-weak); font-size: 12.5px; }
+.warn-list summary { cursor: pointer; font-weight: 600; color: var(--warn); }
+.warn-list div { margin-top: 4px; color: var(--text-2); }
+
+/* EasyEDA import dialog */
+.eda-head { display: flex; gap: 14px; align-items: flex-start; }
+.eda-head h2 { margin-bottom: 4px; }
+.eda-mark { width: 44px; height: 44px; flex: none; border-radius: 12px; display: grid; place-items: center; background: linear-gradient(135deg, #1e88e5, #00bfa5); color: #fff; }
+.eda-mark svg.ic { width: 22px; height: 22px; }
+.eda-seg { align-self: flex-start; }
+.eda-steps { margin: 0; padding: 0 0 0 20px; display: grid; gap: 8px; font-size: 13px; }
+.eda-steps li { padding-left: 4px; }
+.eda-steps li::marker { color: var(--accent); font-weight: 700; }
+kbd { font-family: var(--font); font-size: 12px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--border-strong); border-bottom-width: 2px; background: var(--surface-2); white-space: nowrap; }
+.eda-drop { display: flex !important; flex-direction: column; align-items: center; gap: 4px; padding: 24px 16px; border: 2px dashed var(--border-strong); border-radius: var(--radius); background: var(--surface-2); text-align: center; cursor: pointer; transition: border-color .15s, background .15s; font-weight: 400 !important; }
+.eda-drop:hover, .eda-drop.over { border-color: var(--accent); background: var(--accent-weak); }
+.eda-drop .drop-icon svg.ic { width: 26px; height: 26px; color: var(--accent); }
+.eda-result { border-radius: var(--radius); padding: 12px 14px; font-size: 13px; }
+.eda-result.good { background: var(--good-weak); }
+.eda-result.bad { background: var(--bad-weak); }
+.eda-result.busy { background: var(--surface-2); display: flex; align-items: center; gap: 10px; }
+.eda-result b { display: block; margin-bottom: 4px; }
+.eda-result ul { margin: 6px 0 0; padding-left: 18px; color: var(--text-2); }
+.eda-result .hint { margin-top: 8px; color: var(--warn); }
 
 /* ---------------------------------------------------------------- popover, toasts, dialogs, drop */
 .popover { position: fixed; z-index: 60; width: 420px; max-width: calc(100vw - 24px); padding: 12px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-lg); font-size: 13px; }
