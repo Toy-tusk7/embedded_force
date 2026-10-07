@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 MCU_PREFIXES = (
-    "STM32", "AT32", "GD32", "APM32", "CH32", "HK32", "MM32", "N32", "ESP32", "ESP8266", "RP2040", "RP2350",
+    "STM32", "AT32", "GD32", "APM32", "CH32", "HK32", "MM32", "N32", "ESP32", "ESP8266", "RP20", "RP23",
     "NRF51", "NRF52", "NRF53", "ATMEGA", "ATTINY", "ATSAM", "SAMD", "PIC", "DSPIC", "MSP430", "EFM32", "EFR32",
     "LPC", "MK", "MKL", "S32", "TM4C", "CC26", "CC13", "R7F", "RA", "PY32", "CW32", "HC32", "BL6", "W806",
 )

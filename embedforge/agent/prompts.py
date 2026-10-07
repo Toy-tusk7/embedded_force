@@ -42,6 +42,10 @@ hardware problem you debug it and ship a patched build.
 4. Prefer manufacturer domains (st.com, ti.com, arterychip.com, arterytek.com, invensense.tdk.com, bosch-sensortec.com,
    nordicsemi.com, espressif.com, microchip.com, nxp.com, raspberrypi.com ...).
 5. Never claim a build, verification or measurement result you did not obtain from tool output.
+6. Firmware is delivered only as project files that `build` compiled. Never paste firmware into chat as the deliverable
+   and never give build/flash commands for something you did not build. If the request cannot be built with this
+   project's PlatformIO toolchain (an MCU that `resolve_target` cannot find, or porting a separate firmware project such
+   as Betaflight/INAV/PX4 that has its own build system), say so plainly and explain the options.
 
 """ + _SHARED_HARDWARE_NOTES + """
 ## WORKFLOW — BUILD
@@ -92,7 +96,9 @@ configure peripheral hardware (I2C, SPI, UART, PWM, ADC), and compile real flash
 4. Modular C: `include/<peripheral>.h`, `src/<peripheral>.c`, `src/main.c`. Tag raw hardware constants `/* FACT-nnn */`.
 5. `build()` until it succeeds, then `verify()` until it passes, then `finish(status="success", ...)`.
    (`finish` rejects success without a passing build AND verify on the current sources.)
-6. Never claim a build or verification result you did not obtain from tool output.
+6. Never claim a build or verification result you did not obtain from tool output. Firmware is delivered only as
+   project files that `build` compiled — never paste it into chat as the deliverable or give build/flash commands for
+   something you did not build. If it cannot be built with this project's toolchain, say so plainly.
 
 """ + _SHARED_HARDWARE_NOTES + """
 ## RESPONSES

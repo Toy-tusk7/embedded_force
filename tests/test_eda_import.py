@@ -94,6 +94,63 @@ def test_merge_netlist_names_and_bom_without_spurious_warnings():
     assert "U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)" in b.report()
 
 
+PROTEL2_PRO = """PROTEL NETLIST 2.0
+[
+DESIGNATOR
+U1
+FOOTPRINT
+QFN-80_L10.0-W10.0-P0.40-TL-EP3.4
+PARTTYPE
+RP2354B_C39843328
+DESCRIPTION
+MCU
+Reuse Block
+
+Supplier Part
+C39843328
+Manufacturer Part
+RP2354B
+]
+[
+DESIGNATOR
+U6
+FOOTPRINT
+SD-CARD-SMD_SD-CARD-11P
+PARTTYPE
+SD-CARD 11P
+Name
+SD-CARD 11P
+]
+(
+FLASH_SCL
+U1-53 RP2354B_C39843328-GPIO42_ADC2 Passive
+U6-5 SD-CARD 11P-CLK Passive
+)
+(
+GND
+U6-12 SD-CARD 11P-GND Passive
+)
+"""
+
+
+def test_easyeda_pro_protel2_keyvalue_variant_with_pin_names():
+    """EasyEDA Pro writes key/value component blocks and 'REF-PIN PARTTYPE-PINNAME TYPE' nodes."""
+    b = _parse("Netlist_Schematic1.net", PROTEL2_PRO.encode())
+    assert set(b.parts) == {"U1", "U6"}
+    u1 = b.parts["U1"]
+    assert (u1.mpn, u1.lcsc, u1.footprint) == ("RP2354B", "C39843328", "QFN-80_L10.0-W10.0-P0.40-TL-EP3.4")
+    assert (u1.pins["53"].name, u1.pins["53"].net) == ("GPIO42_ADC2", "FLASH_SCL")
+    assert b.parts["U6"].pins["5"].name == "CLK"          # part type with a space and a dash
+    assert b.query("GPIO42_ADC2")["lines"] == ["U1 pin 53 (GPIO42_ADC2) -> net FLASH_SCL -> U6.5 (CLK)"]
+
+
+def test_rp2354_is_recognised_as_mcu():
+    b = _parse("n.net", PROTEL2_PRO.encode())
+    for i in range(10):
+        b.parts["U1"].pin(str(100 + i))
+    assert [m.ref for m in b.mcus()] == ["U1"]
+
+
 def test_non_eda_files_are_not_detected():
     assert eda.detect("notes.txt", b"just some notes") is None
     assert eda.detect("data.csv", b"time,value\n1,2\n") is None

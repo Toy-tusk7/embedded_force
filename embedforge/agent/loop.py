@@ -26,6 +26,26 @@ RESEARCH_TOOLS = {"web_search", "fetch_document"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10
+MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
+MAX_UNBUILT_CODE_NUDGES = 2
+_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+_BUILD_CMD = re.compile(r"\b(cmake|ninja|make\s+\w|pio\s+run|platformio\s+run|dfu-util|picotool|openocd|st-flash|esptool)\b", re.I)
+
+
+def unbuilt_code_problem(content: str, built: bool) -> Optional[str]:
+    """Firmware or build/flash steps presented in chat without a successful build of the project sources."""
+    if built or not content:
+        return None
+    blocks = _CODE_BLOCK.findall(content)
+    code_lines = sum(b.count("\n") for b in blocks)
+    if code_lines >= 15:
+        return (f"Your reply contains {code_lines} lines of code in chat, but nothing was written or built. Code in chat is not "
+                "delivered firmware: write it to project files with write_file, then build and verify. If you cannot build "
+                "it with this project's toolchain, say so plainly instead of presenting it as finished.")
+    if any(_BUILD_CMD.search(b) for b in blocks):
+        return ("Your reply gives build/flash commands for firmware that was never built by the build tool. Do not claim or "
+                "imply a build exists: build it here, or tell the user exactly what is not done and why.")
+    return None
 STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
 STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
 
@@ -94,8 +114,19 @@ class ProgressGuard:
         self.steps_since_progress = 0
         self.calls: Counter = Counter()
         self.failures: Counter = Counter()
+        self.fail_name = ""
+        self.fail_streak = 0
+        self.code_nudges = 0
 
     def before(self, name: str, n_sources: int) -> Optional[Dict[str, Any]]:
+        if name == self.fail_name and self.fail_streak >= MAX_CONSECUTIVE_FAILURES:
+            return {"error": (
+                f"{name} has failed {self.fail_streak} times in a row. Retrying with variations will not help. "
+                + ("This MCU/board is not in the PlatformIO registry, so this project's toolchain cannot build for it — tell "
+                   "the user plainly (finish with status='blocked' or ask_user) instead of searching again."
+                   if name == "resolve_target" else
+                   "Change approach, or explain the blocker to the user with ask_user / finish(status='blocked').")
+            ), "guard": "repeated_failure"}
         if name in RESEARCH_TOOLS and self.research >= MAX_RESEARCH_WITHOUT_PROGRESS:
             return {"error": (
                 f"Research budget reached: {self.research} searches/fetches since your last recorded fact or code change "
@@ -110,10 +141,15 @@ class ProgressGuard:
             ), "guard": "sdk_budget"}
         return None
 
-    def after(self, name: str, ok: bool) -> None:
+    def after(self, name: str, ok: bool, result: Any = None) -> None:
         self.calls[name] += 1
-        if not ok:
+        failed = not ok or (isinstance(result, dict) and result.get("found") is False)
+        if failed:
             self.failures[name] += 1
+            self.fail_streak = self.fail_streak + 1 if name == self.fail_name else 1
+            self.fail_name = name
+        elif name == self.fail_name:
+            self.fail_name, self.fail_streak = "", 0
         if name in PROGRESS_TOOLS and ok:
             self.research = self.sdk = self.steps_since_progress = 0
         elif name in RESEARCH_TOOLS:
@@ -258,7 +294,17 @@ class AgentRunner:
                     continue
 
                 if not tool_calls:
-                    # Model gave a conversational response or asked for input without calling tools.
+                    # Model gave a conversational response. Before handing back to the user, make sure it is not
+                    # presenting unbuilt firmware (code in chat / build+flash steps) as if it were delivered.
+                    built = belt.state["build_ok"] and belt.state["build_hash"] == belt.source_hash()
+                    problem = unbuilt_code_problem(resp["content"], built)
+                    if problem and guard.code_nudges < MAX_UNBUILT_CODE_NUDGES:
+                        guard.code_nudges += 1
+                        s.emit("guard", kind="unbuilt_code", text="The reply above contains firmware that was not written to files or built — asking the agent to fix that.")
+                        messages.append({"role": "user", "content": f"[System Notice]: {problem}"})
+                        continue
+                    if problem:
+                        s.emit("guard", kind="unbuilt_code", text="Warning: the reply above presents code or build steps that EmbedForge did not build or verify.")
                     status = "needs_input"
                     break
 
@@ -277,8 +323,8 @@ class AgentRunner:
                         tracer.end_span(f"{span}-{tc['id']}", outputs={"summary": _summ(result, 300)})
                     elif result.get("guard"):
                         s.emit("guard", kind=result["guard"], text=result["error"])
-                    ok = not (isinstance(result, dict) and (result.get("error") or result.get("ok") is False))
-                    guard.after(name, ok)
+                    ok = not (isinstance(result, dict) and (result.get("error") or result.get("ok") is False or result.get("found") is False))
+                    guard.after(name, ok, result)
                     s.emit("tool_result", id=tc["id"], name=name, ok=ok, summary=_summ(result))
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, default=str)})
                     if belt.ended:

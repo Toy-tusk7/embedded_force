@@ -94,6 +94,35 @@ def test_search_results_carry_relevant_excerpt(project, monkeypatch):
     assert "default value is 0x68" in _events(session, "tool_result")[0]["summary"]
 
 
+def test_repeated_failures_of_one_tool_are_stopped(project, monkeypatch):
+    monkeypatch.setattr(pio, "list_boards", lambda q, limit=25: [])
+    monkeypatch.setattr(pio, "vendor_platform_for", lambda q: None)
+    turns = [[_call(i, "resolve_target", {"query": f"rp2354b variant {i}"})] for i in range(5)] + ["stop"]
+    session = _run(project, turns, monkeypatch)
+    results = _events(session, "tool_result")
+    assert [r["ok"] for r in results] == [False] * 5                        # 'found: false' x3, then blocked x2
+    assert all("not in the PlatformIO registry" in r["summary"] for r in results[3:])
+    assert "No board/MCU" in results[0]["summary"]
+    assert any(g["kind"] == "repeated_failure" for g in _events(session, "guard"))
+
+
+def test_code_in_chat_without_a_build_is_sent_back(project, monkeypatch):
+    code = "Here is your firmware:\n```c\n" + "\n".join(f"int x{i} = {i};" for i in range(20)) + "\n```\nDone, flash it."
+    llm_turns = [code, "I cannot build this yet: the MCU is not supported by the toolchain."]
+    session = _run(project, llm_turns, monkeypatch)
+    msgs = [e["text"] for e in _events(session, "message")]
+    assert len(msgs) == 2                                      # the run continued after the nudge
+    assert any(g["kind"] == "unbuilt_code" for g in _events(session, "guard"))
+    convo = project.load_conversation()
+    assert any("[System Notice]" in m.get("content", "") and "code in chat" in m["content"] for m in convo if m["role"] == "user")
+
+
+def test_unbuilt_code_problem_rules():
+    assert loop_mod.unbuilt_code_problem("```bash\ncmake -B build\nninja -C build\n```", built=False)
+    assert loop_mod.unbuilt_code_problem("```bash\ncmake -B build\n```", built=True) is None
+    assert loop_mod.unbuilt_code_problem("Use `GPIO14` for CS.", built=False) is None
+
+
 def test_record_fact_rejection_offers_verbatim_candidates(project):
     store = SourceStore(project.root)
     src = store.add("https://invensense.tdk.com/rm.pdf", "rm", DATASHEET, kind="pdf")

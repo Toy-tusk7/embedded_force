@@ -15,37 +15,79 @@ def _split_node(node: str, sep: str) -> Tuple[str, str]:
     return ref, pin
 
 
+_PIN_TYPES = {"passive", "input", "output", "bidirectional", "bidirection", "bi", "power", "powerinput", "poweroutput",
+              "opencollector", "openemitter", "hiz", "tristate", "unspecified", "undefined", "in", "out", "io", "nc"}
+
+
+def _protel_component(block: List[str], b: Board, parttypes: dict) -> None:
+    """Classic layout is positional (REF, FOOTPRINT, VALUE, ...); EasyEDA Pro's 'PROTEL NETLIST 2.0' is KEY/VALUE pairs."""
+    if block and block[0].upper() == "DESIGNATOR":
+        kv = {}
+        for k, v in zip(block[0::2], block[1::2]):
+            kv.setdefault(k.strip(), v.strip())
+        ref = kv.get("DESIGNATOR") or kv.get("Designator")
+        if not ref:
+            return
+        part = b.part(ref)
+        parttype = kv.get("PARTTYPE", "")
+        parttypes[ref] = parttype
+        part.footprint = kv.get("FOOTPRINT", "")
+        part.value = kv.get("Value") or kv.get("Name") or parttype
+        part.mpn = kv.get("Manufacturer Part", "")
+        part.manufacturer = kv.get("Manufacturer", "")
+        part.lcsc = kv.get("Supplier Part", "")
+    elif block and block[0]:
+        part = b.part(block[0])
+        part.footprint = block[1] if len(block) > 1 else ""
+        part.value = block[2] if len(block) > 2 else ""
+        parttypes[block[0]] = part.value
+
+
+def _protel_node(node: str, parttypes: dict) -> Tuple[str, str, str]:
+    """'U1-3' (classic) or 'U1-3 RP2354B_C39843328-GPIO6 Passive' (EasyEDA Pro: REF-PIN PARTTYPE-PINNAME TYPE)."""
+    node = node.strip()
+    first, _, rest = node.partition(" ")
+    ref, pin = _split_node(first, "-")
+    rest = rest.strip()
+    if rest:
+        toks = rest.split()
+        if len(toks) > 1 and toks[-1].lower() in _PIN_TYPES:
+            rest = rest[: rest.rfind(toks[-1])].strip()
+    name = ""
+    if rest:
+        pt = parttypes.get(ref, "")
+        name = rest[len(pt) + 1:] if pt and rest.startswith(pt + "-") else rest.rpartition("-")[2]
+    return ref, pin, (name if name != pin else "")
+
+
 def parse_protel(text: str, filename: str = "netlist.net") -> Board:
-    """Protel2 / Altium netlist:  [ REF FOOTPRINT VALUE ... ]  and  ( NETNAME  REF-PIN ... )."""
+    """Protel2 / Altium netlist:  [ component ]  and  ( NETNAME  REF-PIN ... ), incl. EasyEDA Pro's key/value variant."""
     b = Board(imported=[{"file": filename, "format": "Protel2 netlist"}])
     lines = [ln.strip() for ln in text.replace("\r", "").split("\n")]
+    parttypes: dict = {}
+    nets: List[List[str]] = []
     i = 0
     while i < len(lines):
         ln = lines[i]
-        if ln == "[":
+        if ln in ("[", "("):
+            close = "]" if ln == "[" else ")"
             block = []
             i += 1
-            while i < len(lines) and lines[i] != "]":
+            while i < len(lines) and lines[i] != close:
                 block.append(lines[i])
                 i += 1
-            if block and block[0]:
-                part = b.part(block[0])
-                part.footprint = block[1] if len(block) > 1 else ""
-                part.value = block[2] if len(block) > 2 else ""
-        elif ln == "(":
-            block = []
-            i += 1
-            while i < len(lines) and lines[i] != ")":
-                block.append(lines[i])
-                i += 1
-            if block:
-                net = block[0]
-                for node in block[1:]:
-                    if node and "-" in node:
-                        ref, pin = _split_node(node, "-")
-                        if ref and pin:
-                            b.connect(net, ref, pin)
+            if ln == "[":
+                _protel_component(block, b, parttypes)
+            elif block:
+                nets.append(block)
         i += 1
+    for block in nets:  # after all components, so PARTTYPEs are known for splitting pin names
+        net = block[0]
+        for node in block[1:]:
+            if node and "-" in node.split(" ", 1)[0]:
+                ref, pin, name = _protel_node(node, parttypes)
+                if ref and pin:
+                    b.connect(net, ref, pin, name)
     if not b.parts:
         b.warnings.append(f"{filename}: no components or nets found in Protel netlist")
     return b
