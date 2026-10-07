@@ -228,8 +228,9 @@ class SourceStore:
         return self.sources.get(source_id)
 
     def add_user_text(self, text: str) -> Source:
-        """User statements are a first-class source (tier USER)."""
-        return self.add("user://conversation", "User statements", text, kind="user")
+        """User statements are a first-class source (tier USER). Always the full current text: rebuilt from the user's own
+        messages, so it can also shrink (e.g. when earlier harness text is no longer included)."""
+        return self.add("user://conversation", "User statements", text, kind="user", replace=True)
 
     # ---------- retrieval ----------
     def excerpts(self, source_id: str, query: str, max_chunks: int = 4, chunk_chars: int = 1400) -> List[Dict[str, Any]]:

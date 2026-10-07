@@ -175,20 +175,22 @@ class Board:
         qu = qs.upper()
         if not qs:
             return {"summary": self.summary()}
+        net = next((n for n in nets if n.upper() == qu), None)
         if qs in self.parts or qu in {r.upper() for r in self.parts}:
             part = next(p for r, p in self.parts.items() if r.upper() == qu)
-            return {"part": self._part_dict(part), "lines": self._part_lines(part, nets, limit)}
-        net = next((n for n in nets if n.upper() == qu), None)
+            res = {"part": self._part_dict(part), "lines": self._part_lines(part, nets, limit)}
+            if net:  # a part and a net with the same name (test point 'Moto0' on net 'MOTO0'): show both
+                res["net"] = net
+                res["lines"] = [f"net {net}: " + ", ".join(self.node_label(r, n) for r, n in nets[net])] + res["lines"]
+            return res
         if net:
             return {"net": net, "lines": [f"net {net}: " + ", ".join(self.node_label(r, n) for r, n in nets[net])]}
-        lines = []
-        for part in self.parts.values():
-            for pin in self._sorted_pins(part):
-                if pin.name and pin.name.upper() == qu:
-                    lines.append(self.pin_line(part, pin, nets))
+        lines = [self.pin_line(part, pin, nets) for part, pin in self._pins_named(qu)]
         if lines:
             return {"pin_name": qs, "lines": lines[:limit]}
-        hits = [p for p in self.parts.values() if qu and (qu in p.value.upper() or qu in p.mpn.upper() or qu in p.footprint.upper())]
+        alias = next((rx for words, rx in self._FUNCTION_ALIASES if qu in words), None)
+        hits = [p for p in self.parts.values() if qu and (qu in p.value.upper() or qu in p.mpn.upper() or qu in p.footprint.upper()
+                                                         or (alias and re.search(alias, f"{p.value} {p.mpn}".upper())))]
         if hits:
             out = []
             for part in hits[:3]:
@@ -200,7 +202,51 @@ class Board:
             fuzzy = [n for n in nets if stem in n.upper()]
         if fuzzy:
             return {"nets": fuzzy[:20], "lines": [f"net {n}: " + ", ".join(self.node_label(r, x) for r, x in nets[n]) for n in fuzzy[:20]]}
-        return {"error": f"Nothing on the board matches '{qs}'. Try a designator (U1), net name, pin name (PA8) or part number."}
+        mcu = self.mcus()[0] if self.mcus() else None
+        example = next((p.name for p in (self._sorted_pins(mcu) if mcu else []) if p.name and p.net), "PA8")
+        return {"error": f"Nothing on the board matches '{qs}'. Try a designator ({mcu.ref if mcu else 'U1'} lists every MCU "
+                         f"pin), a net name, a pin name ({example}) or a part number.",
+                "available_nets": sorted(nets)[:60]}
+
+    # function words -> part-number patterns (so 'gyro' finds a BMI270 and 'baro' a BMP388)
+    _FUNCTION_ALIASES = [
+        ({"GYRO", "IMU", "ACCEL", "ACC", "ACCELEROMETER", "GYROSCOPE"}, r"BMI\d|ICM|MPU|LSM|BMX|LSM6"),
+        ({"BARO", "BAROMETER", "PRESSURE"}, r"BMP\d|DPS\d|SPL\d|MS56|LPS\d|BME\d"),
+        ({"FLASH", "BLACKBOX"}, r"W25|GD25|MX25|IS25|M25P|AT25"),
+        ({"SD", "SDCARD", "MICROSD", "TF"}, r"\bSD\b|SD-CARD|MICRO\s*SD|TF"),
+        ({"OSD"}, r"MAX7456|AT7456"),
+        ({"MAG", "COMPASS", "MAGNETOMETER"}, r"QMC|HMC|IST\d|LIS3MDL|MMC"),
+        ({"LED", "LEDS", "LED_STRIP", "WS2812", "RGB"}, r"WS2812|SK6812"),
+    ]
+
+    def _pins_named(self, qu: str) -> List[Tuple[Part, Pin]]:
+        """Pins whose name is `qu` or has `qu` as one of its '_' or '/' separated tokens (GPIO43 -> GPIO43_ADC3). On an MCU
+        whose pins are named GPIOn, PAn means GPIOn (Betaflight's RP2350 naming)."""
+        alts = {qu}
+        m = re.fullmatch(r"PA(\d{1,2})", qu)
+        if m:
+            alts.add(f"GPIO{int(m.group(1))}")
+        out = []
+        for part in self.parts.values():
+            for pin in self._sorted_pins(part):
+                name = (pin.name or "").upper()
+                if name and (name in alts or alts & set(re.split(r"[_/]", name))):
+                    out.append((part, pin))
+        return out
+
+    def gpio_net(self, gpio: int) -> Tuple[str, List[str]]:
+        """(net, other part refs on it) for the MCU's GPIO n; ('', []) when it is not connected or not found."""
+        refs = {m.ref for m in self.mcus()}
+        for part, pin in self._pins_named(f"GPIO{int(gpio)}"):
+            if part.ref in refs and pin.net:
+                return pin.net, sorted({r for r, _ in self.nets().get(pin.net, []) if r != part.ref})
+        return "", []
+
+    def mcu_pin_lines(self, gpio: int) -> List[str]:
+        """Connectivity line(s) of the MCU pin for GPIO n (exact report text, so it can be quoted)."""
+        nets = self.nets()
+        refs = {m.ref for m in self.mcus()}
+        return [self.pin_line(part, pin, nets) for part, pin in self._pins_named(f"GPIO{int(gpio)}") if part.ref in refs]
 
     # ------------------------------------------------------------------ rendering
     @staticmethod

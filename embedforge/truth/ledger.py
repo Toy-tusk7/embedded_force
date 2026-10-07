@@ -68,7 +68,10 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
             float(v)
             out.append(("number", rf"(?<![0-9a-z]){re.escape(v)}(?![0-9])", "STRICT"))
         except ValueError:
-            out.append(("text", re.escape(v.lower()), "STRICT"))
+            if re.fullmatch(r"(?i)(gpio|gp|p[a-k])\d+", v):  # pin names: GPIO4 must not match inside GPIO41
+                out.append(("pin", rf"(?<![0-9a-z]){re.escape(v.lower())}(?![0-9])", "STRICT"))
+            else:
+                out.append(("text", re.escape(v.lower()), "STRICT"))
     return out
 
 
@@ -119,6 +122,39 @@ class FactLedger:
     def _save(self) -> None:
         self.path.write_text(json.dumps([f.public() for f in self.facts.values()], indent=2), encoding="utf-8")
 
+    @property
+    def _retired_path(self) -> Path:
+        return self.path.with_name("ledger_retired.json")
+
+    def _next_id(self) -> str:
+        """Ids are never reused, even after a fact is retired."""
+        ids = list(self.facts)
+        if self._retired_path.exists():
+            try:
+                ids += [r.get("id", "") for r in json.loads(self._retired_path.read_text(encoding="utf-8"))]
+            except Exception:
+                pass
+        nums = [int(i.split("-")[1]) for i in ids if re.fullmatch(r"FACT-\d+", i)]
+        return f"FACT-{max(nums + [0]) + 1:03d}"
+
+    def retire(self, fact_id: str, reason: str) -> bool:
+        """Take a fact out of use (e.g. a pin recorded under the wrong define). It stays on record in ledger_retired.json;
+        code still citing it then fails verify with UNKNOWN_FACT_TAG."""
+        with self._lock:
+            f = self.facts.pop(fact_id, None)
+            if f is None:
+                return False
+            retired = []
+            if self._retired_path.exists():
+                try:
+                    retired = json.loads(self._retired_path.read_text(encoding="utf-8"))
+                except Exception:
+                    retired = []
+            retired.append({**f.public(), "retired_reason": reason})
+            self._retired_path.write_text(json.dumps(retired, indent=2), encoding="utf-8")
+            self._save()
+            return True
+
     # ---------- recording ----------
     def record(
         self, subject: str, prop: str, value: Any, source_id: str, quote: str, unit: str = ""
@@ -166,7 +202,7 @@ class FactLedger:
                         return {"ok": True, "fact": ex.public(), "warnings": ["Duplicate; existing fact returned."]}
                     if str(ex.value).lower() != value.lower():
                         warnings.append(f"CONFLICT with {ex.id} ({ex.value}) for the same property.")
-            fid = f"FACT-{len(self.facts) + 1:03d}"
+            fid = self._next_id()
             fact = Fact(
                 id=fid, subject=subject, property=prop, value=value, unit=unit, source_id=source_id,
                 source_url=src.url, tier=tier.value, quote=quote, match_form=form, confidence=conf,

@@ -112,7 +112,8 @@ class Project:
             if not p.is_file():
                 continue
             rel = p.relative_to(self.root)
-            if rel.parts[0] in HIDDEN_DIRS or rel.name in ("project.json", "conversation.json", "trace.jsonl", "ledger.json", "board.json"):
+            if rel.parts[0] in HIDDEN_DIRS or rel.name in ("project.json", "conversation.json", "trace.jsonl", "ledger.json",
+                                                           "board.json", "user_messages.jsonl"):
                 continue
             suffix = p.suffix.lower()
             kind = ("image" if suffix in IMAGE_EXTS else "pdf" if suffix in DOC_EXTS
@@ -132,6 +133,27 @@ class Project:
 
     def save_conversation(self, messages: List[Dict[str, Any]]) -> None:
         (self.root / "conversation.json").write_text(json.dumps(messages, indent=1), encoding="utf-8")
+
+    def user_messages(self, seed: Optional[List[str]] = None) -> List[str]:
+        """Everything the user has typed, append-only (the USER-tier source is built from this, never from the
+        model-facing history, so harness notices can't become 'user statements')."""
+        p = self.root / "user_messages.jsonl"
+        if not p.exists():
+            if not seed:
+                return []
+            with self._lock, open(p, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps({"t": None, "text": s}) + "\n" for s in seed)
+        out = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                out.append(json.loads(line)["text"])
+            except Exception:
+                continue
+        return out
+
+    def append_user_message(self, text: str) -> None:
+        with self._lock, open(self.root / "user_messages.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": time.time(), "text": text}) + "\n")
 
     def trace(self, record: Dict[str, Any]) -> None:
         with self._lock, open(self.root / "trace.jsonl", "a", encoding="utf-8") as f:

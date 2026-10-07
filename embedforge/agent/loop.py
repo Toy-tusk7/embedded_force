@@ -7,32 +7,37 @@ import time
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
+from embedforge.agent import context as ctx
+from embedforge.agent.context import visible_user_text  # noqa: F401  (re-exported; server.py imports it from here)
 from embedforge.agent.events import RunSession
 from embedforge.agent.llm import AgentLLM, LLMError, parse_tool_args
 from embedforge.agent.prompts import get_active_prompt_text
-from embedforge.agent.tools import TOOL_SPECS, ToolBelt
+from embedforge.agent.tools import ToolBelt, tools_for
 from embedforge.agent.workspace import Project
 from embedforge.core.config import config
 from embedforge.core.logger import logger
 from embedforge.core.telemetry import tracer
 from embedforge.truth import FactLedger, SourceStore
 
-MAX_CONTEXT_CHARS = 45_000
-KEEP_RECENT = 6
-
 # Tools whose success means the run moved forward (resets the research / SDK budgets).
-PROGRESS_TOOLS = {"record_fact", "record_user_fact", "init_project", "init_betaflight", "query_board",
+PROGRESS_TOOLS = {"record_fact", "record_user_fact", "record_board_pins", "init_project", "init_betaflight", "query_board",
                   "write_file", "replace_in_file", "build", "verify"}
 RESEARCH_TOOLS = {"web_search", "fetch_document"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10
 MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
-MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments, back to back
+MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments while its result is still visible
 READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_framework", "query_board", "list_facts",
                    "read_source", "init_betaflight", "init_project", "resolve_target", "set_plan"}
 ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
+# failing builds/verifies between edits are the normal fix loop; finish and the record tools have their own truth gates
+NO_FAILURE_STREAK_TOOLS = {"build", "verify", "finish", "record_fact", "record_user_fact", "record_board_pins"}
 MAX_UNBUILT_CODE_NUDGES = 2
+MAX_TRUNCATION_RETRIES = 2
+MAX_CONTINUE_NUDGES = 1
+STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
+STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
 _CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 _BUILD_CMD = re.compile(r"\b(cmake|ninja|make\s+\w|pio\s+run|platformio\s+run|dfu-util|picotool|openocd|st-flash|esptool)\b", re.I)
 
@@ -51,16 +56,6 @@ def unbuilt_code_problem(content: str, built: bool) -> Optional[str]:
         return ("Your reply gives build/flash commands for firmware that was never built by the build tool. Do not claim or "
                 "imply a build exists: build it here, or tell the user exactly what is not done and why.")
     return None
-STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
-STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
-
-
-_CONTEXT_MARKERS = re.compile(r"\n\n\[(?:Requirement Engine|Board imported)")
-
-
-def visible_user_text(content: str) -> str:
-    """The user's own words, without the context blocks the runner appends for the model."""
-    return _CONTEXT_MARKERS.split(content or "", maxsplit=1)[0]
 
 
 def _summ(result: Any, limit: int = 500) -> str:
@@ -68,42 +63,33 @@ def _summ(result: Any, limit: int = 500) -> str:
     return s if len(s) <= limit else s[:limit] + "…"
 
 
-def _compact(messages: List[Dict[str, Any]]) -> None:
-    """Shrink old messages safely while preserving turn integrity and valid tool-call pairs."""
-    if len(messages) > 20:
-        # Walk forward to a clean cut point that is not in the middle of tool responses
-        cut_idx = max(1, len(messages) - 16)
-        while cut_idx < len(messages) and messages[cut_idx].get("role") == "tool":
-            cut_idx += 1
+def _no_op(result: Any) -> bool:
+    """A 'successful' call that changed nothing: a duplicate fact, or a write that left the file identical."""
+    if not isinstance(result, dict):
+        return False
+    if any("Duplicate" in str(w) for w in result.get("warnings") or []):
+        return True
+    if result.get("unchanged") or (isinstance(result.get("recorded"), list) and result.get("all_duplicates")):
+        return True
+    return False
 
-        user_msgs = [m for m in messages[:cut_idx] if m.get("role") == "user"]
-        recent = messages[cut_idx:]
-        messages.clear()
-        messages.extend(user_msgs + recent)
 
-    total = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or [])) for m in messages)
-    if total <= MAX_CONTEXT_CHARS:
-        return
-    for m in messages[: max(0, len(messages) - KEEP_RECENT)]:
-        if m.get("role") == "tool":
-            c = m.get("content") or ""
-            if len(c) > 400:
-                try:
-                    data = json.loads(c)
-                    if isinstance(data, dict):
-                        if "excerpts" in data and len(data["excerpts"]) > 1:
-                            data["excerpts"] = data["excerpts"][:1]
-                        if "preview" in data and len(data["preview"]) > 200:
-                            data["preview"] = data["preview"][:200] + "…"
-                        if isinstance(data.get("results"), list):
-                            for r in data["results"]:
-                                if isinstance(r, dict) and len(r.get("excerpt", "")) > 200:
-                                    r["excerpt"] = r["excerpt"][:200] + "…"
-                        m["content"] = json.dumps(data)
-                    else:
-                        m["content"] = c[:300] + " …[truncated]"
-                except Exception:
-                    m["content"] = c[:300] + " …[truncated]"
+def _harness_version() -> str:
+    """git HEAD of the harness (+ '-dirty'), so every trace says which code produced it."""
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "embedforge"], cwd=root, capture_output=True, text=True, timeout=5).stdout.strip()
+        return head + ("-dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+def notice(text: str) -> Dict[str, Any]:
+    """A harness message to the model: shown while relevant, never persisted, never a 'user statement'."""
+    return {"role": "user", "content": f"[System Notice]: {text}", "_ephemeral": True}
 
 
 class ProgressGuard:
@@ -117,27 +103,32 @@ class ProgressGuard:
         self.research = 0
         self.sdk = 0
         self.steps_since_progress = 0
+        self.step = 0
         self.calls: Counter = Counter()
         self.failures: Counter = Counter()
+        self.blocked: Counter = Counter()
         self.fail_name = ""
         self.fail_streak = 0
         self.code_nudges = 0
         self.seen_queries: set = set()
-        self.reads_since_change: List[str] = []
+        self.reads_since_change: List[tuple] = []   # (key, step, digest of its result)
 
     def before(self, name: str, n_sources: int, args: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         key = name + json.dumps(args or {}, sort_keys=True)
         if name in READ_ONLY_TOOLS:
-            # identical reads since the last change to the project (edits/builds reset this) return nothing new
-            seen = self.reads_since_change.count(key)
-            self.reads_since_change.append(key)
-            if seen >= MAX_IDENTICAL_READS:
-                return {"error": (f"You already made this exact {name} call {seen} times since the project last changed, and "
-                                  "its result is above. Act on what you have (edit, build, record facts) or read something else."),
+            # identical reads since the last project change whose result is still verbatim in the context
+            recent = [r for r in self.reads_since_change if r[0] == key and self.step - r[1] < ctx.VERBATIM_TURNS]
+            if len(recent) >= MAX_IDENTICAL_READS:
+                return {"error": (f"You already made this exact {name} call {len(recent)} times since the project last changed; "
+                                  f"its result is in your context above ({recent[-1][2]}). Act on it (record facts, edit, "
+                                  "build) or read something else."),
                         "guard": "identical_call"}
         else:
             self.reads_since_change.clear()
-        if name == self.fail_name and self.fail_streak >= MAX_CONSECUTIVE_FAILURES:
+        lookup = name in READ_ONLY_TOOLS and name != "resolve_target"  # misses with new arguments are cheap information
+        if name == self.fail_name and self.fail_streak >= MAX_CONSECUTIVE_FAILURES and name not in NO_FAILURE_STREAK_TOOLS and not lookup:
+            if name != "resolve_target":
+                self.fail_streak = MAX_CONSECUTIVE_FAILURES - 1  # the block expires: the next call may try once more
             return {"error": (
                 f"{name} has failed {self.fail_streak} times in a row. Retrying with variations will not help. "
                 + ("This MCU/board is not in the PlatformIO registry, so this project's toolchain cannot build for it — tell "
@@ -159,8 +150,15 @@ class ProgressGuard:
             ), "guard": "sdk_budget"}
         return None
 
-    def after(self, name: str, ok: bool, result: Any = None, args: Optional[Dict[str, Any]] = None) -> None:
+    def after(self, name: str, ok: bool, result: Any = None, args: Optional[Dict[str, Any]] = None,
+              counted: bool = True, digest: str = "") -> None:
+        """Record a call. Guard blocks and unparseable arguments are not counted as tool failures (counted=False)."""
         self.calls[name] += 1
+        if not counted:
+            self.blocked[name] += 1
+            return
+        if name in READ_ONLY_TOOLS:
+            self.reads_since_change.append((name + json.dumps(args or {}, sort_keys=True), self.step, digest[:160]))
         failed = not ok or (isinstance(result, dict) and result.get("found") is False)
         if failed:
             self.failures[name] += 1
@@ -174,8 +172,9 @@ class ProgressGuard:
             self.seen_queries.add(key)
             if not fresh:
                 return
-        if name in PROGRESS_TOOLS and ok:
+        if name in PROGRESS_TOOLS and ok and not _no_op(result):
             self.research = self.sdk = self.steps_since_progress = 0
+            self.fail_name, self.fail_streak = "", 0
         elif name in RESEARCH_TOOLS:
             self.research += 1
         elif name in SDK_TOOLS:
@@ -209,26 +208,30 @@ class AgentRunner:
             logger.log_event("REQ_ENGINE_WARN", str(e))
             return ""
 
-    def _board_context(self) -> str:
-        """Announce an imported schematic once (and again whenever it changes)."""
+    def _announce_board(self) -> None:
+        """Tell the UI about an imported schematic once (and again whenever it changes). The model learns about it from
+        the PROJECT STATE block, so nothing is added to the conversation."""
         bp = self.project.root / "board.json"
         if not bp.exists():
-            return ""
+            return
         digest = hashlib.sha256(bp.read_bytes()).hexdigest()[:16]
         if self.project.meta().get("board_seen") == digest:
-            return ""
+            return
         from embedforge import eda
         board = eda.load_board(self.project.root)
         if board is None:
-            return ""
-        s = board.summary()
-        mcus = ", ".join(f"{m['ref']} {m['mpn'] or m['value']} ({m['pin_count']} pins)" for m in s["mcus"]) or "none identified"
+            return
         self.project.update_meta(board_seen=digest)
-        self.session.emit("board", summary=s)
-        return (f"\n\n[Board imported from {', '.join(i['file'] for i in s['imported'])}: {s['parts']} parts, {s['nets']} nets; "
-                f"MCU: {mcus}. It is the ground truth for pins and wiring — use query_board.]")
+        self.session.emit("board", summary=board.summary())
 
-    def _walkthrough(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger) -> str:
+    def _user_statements(self, history: List[Dict[str, Any]], user_message: str) -> List[str]:
+        """The user's own messages (append-only log; seeded once from an older saved conversation)."""
+        seed = [visible_user_text(str(m.get("content") or "")) for m in history if m.get("role") == "user" and not ctx.is_notice(m)]
+        prior = self.project.user_messages(seed=seed)
+        self.project.append_user_message(user_message)
+        return prior + [user_message]
+
+    def _walkthrough(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger, fin: Optional[Dict[str, Any]] = None) -> str:
         meta = self.project.meta()
         builds = self.project.builds()
         lines = [f"# Walkthrough — {meta.get('name')}", "",
@@ -243,19 +246,21 @@ class AgentRunner:
             lines.append(f"- v{b['version']}: flash {b.get('flash_used')}/{b.get('flash_total')} B, RAM {b.get('ram_used')}/{b.get('ram_total')} B, "
                          f"hex `{hx}` sha256 `{(b.get('sha256') or {}).get('hex', '—')[:16]}…`, verified: {b.get('verified')}")
         lines += ["", "## Files", ""] + [f"- `{f['path']}` ({f['bytes']} B)" for f in self.project.list_files()]
-        lines += ["", "## Hardware boundary", "",
-                  "This firmware was compiled and statically verified against datasheet facts. It has **not** been "
-                  "flashed or tested on hardware by EmbedForge. Flash the `.hex` yourself and report any symptom to start a debug session."]
+        h = belt.source_hash()
+        built = bool(belt.state["build_ok"] and belt.state["build_hash"] == h)
+        verified = bool(belt.state["verify_ok"] and belt.state["verify_hash"] == h)
+        if (fin or {}).get("status") == "success" and built and verified:
+            boundary = ("This firmware was compiled and statically verified against the recorded facts. It has **not** been "
+                        "flashed or tested on hardware by EmbedForge. Flash it yourself and report any symptom to start a debug session.")
+        else:
+            boundary = (f"**Not delivered.** The run ended with status `{(fin or {}).get('status', 'unknown')}`. Current sources: "
+                        f"{'built' if built else 'NOT built'}, {'verified' if verified else 'NOT verified'}. Nothing here has been "
+                        "flashed or tested on hardware.")
+        lines += ["", "## Hardware boundary", "", boundary]
         text = "\n".join(lines)
         (self.project.root / "artifacts" / "walkthrough.md").write_text(text, encoding="utf-8")
         self.session.emit("artifact", name="walkthrough.md", markdown=text)
         return text
-
-    def _state_digest(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger) -> str:
-        has_ini = (self.project.root / "platformio.ini").exists() or self.project.meta().get("kind") == "betaflight"
-        srcs = [f["path"] for f in self.project.list_files() if f["path"].startswith(("src/", "include/", "betaflight/")) and f["path"].endswith((".c", ".h", ".cpp"))]
-        return (f"facts={len(ledger.facts)}, sources={len(store.sources)}, project_initialised={has_ini}, "
-                f"source_files={len(srcs)}, last_build_ok={belt.state['build_ok']}, verify_ok={belt.state['verify_ok']}")
 
     # ------------------------------------------------------------------ run
     def run(self, user_message: str) -> None:
@@ -269,13 +274,20 @@ class AgentRunner:
         tracer.start_span(span, "EmbedForge Agent Run", run_type="chain", inputs={"user_message": user_message, "project": project.id})
         status = "failed"
         steps = 0
-        messages: List[Dict[str, Any]] = []
+        history: List[Dict[str, Any]] = []
+        nxt = ""
+        truncations = continue_nudges = 0
+        consecutive_cuts = 0
         try:
-            messages = project.load_conversation()
-            is_first = not messages
+            history = [m for m in project.load_conversation() if not ctx.is_notice(m)]  # older saves may still hold notices
+            is_first = not history
+            project.trace({"event": "run_start", "model": self.llm.model, "provider": getattr(self.llm.provider, "id", ""),
+                           "sampling": getattr(self.llm, "sampling", lambda: {})(), "max_steps": config.agent_max_steps,
+                           "kind": project.meta().get("kind"), "harness": _harness_version()})
             req_ctx = self._requirement_context(user_message) if is_first else ""
-            messages.append({"role": "user", "content": user_message + req_ctx + self._board_context()})
-            store.add_user_text("\n".join(visible_user_text(m["content"]) for m in messages if m["role"] == "user"))
+            store.add_user_text("\n".join(self._user_statements(history, user_message)))
+            history.append({"role": "user", "content": user_message + req_ctx})
+            self._announce_board()
             if is_first and not project.meta().get("title_set"):
                 project.update_meta(name=user_message.strip().split("\n")[0][:48] or project.id, title_set=True)
                 s.emit("project", meta=project.meta())
@@ -283,14 +295,19 @@ class AgentRunner:
             s.emit("status", text="Agent started", model=self.llm.model, provider=self.llm.provider.id)
             for step in range(config.agent_max_steps):
                 steps = step + 1
+                guard.step = step
                 if s.cancel_requested:
                     status = "cancelled"
                     s.emit("status", text="Cancelled by user")
                     break
-                _compact(messages)
+                meta = project.meta()
+                state_text, nxt = ctx.state_block(project, ledger, belt, history)
+                messages = [{"role": "system", "content": get_active_prompt_text(meta.get("kind") or "") + "\n\n" + state_text}]
+                messages += ctx.build_context(history)
+                ctx_chars = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or [])) for m in messages)
                 t0 = time.time()
                 try:
-                    resp = self.llm.chat([{"role": "system", "content": get_active_prompt_text()}] + messages, TOOL_SPECS)
+                    resp = self.llm.chat(messages, tools_for(meta))
                 except LLMError as e:
                     s.emit("error", message=str(e))
                     status = "failed"
@@ -299,47 +316,84 @@ class AgentRunner:
                 if resp["reasoning"]:
                     s.emit("thinking", text=resp["reasoning"][:3000])
                 tool_calls = resp["tool_calls"]
+                truncated = resp.get("finish_reason") == "length" and not tool_calls
                 amsg: Dict[str, Any] = {"role": "assistant", "content": resp["content"] or ""}
                 if tool_calls:
                     amsg["tool_calls"] = tool_calls
-                messages.append(amsg)
-                project.trace({"step": step, "llm_seconds": dt, "usage": resp["usage"], "content": resp["content"][:2000],
-                               "model": self.llm.model, "tool_calls": [tc["function"]["name"] for tc in tool_calls]})
+                trace: Dict[str, Any] = {"step": step, "llm_seconds": dt, "usage": resp["usage"], "content": resp["content"][:2000],
+                                         "model": self.llm.model, "finish_reason": resp.get("finish_reason"), "ctx_chars": ctx_chars,
+                                         "ctx_messages": len(messages), "next_step": nxt, "reasoning_chars": len(resp["reasoning"] or ""),
+                                         "tool_calls": [tc["function"]["name"] for tc in tool_calls]}
+
+                if truncated:
+                    # Cut off at max_tokens (usually mid-reasoning): a partial answer is not an answer, never show or keep it.
+                    truncations += 1
+                    consecutive_cuts += 1
+                    project.trace({**trace, "event": "truncated"})
+                    if consecutive_cuts > MAX_TRUNCATION_RETRIES or truncations > 3 * MAX_TRUNCATION_RETRIES:
+                        s.emit("error", message=f"The model's reply was cut off at the token limit {consecutive_cuts} times in a "
+                                                f"row. Next step was: {nxt}. Send 'continue' to retry.")
+                        status = "needs_input"
+                        break
+                    s.emit("thinking", text="[Reply cut off at the token limit — asking the agent to act directly]")
+                    history.append(notice(f"Your reply was cut off at the token limit. Think briefly and call the next tool "
+                                          f"now. NEXT STEP: {nxt}"))
+                    continue
+                consecutive_cuts = 0
+                if tool_calls and resp.get("finish_reason") == "length":  # cut off while writing a call: run none of the broken ones
+                    for tc in tool_calls:
+                        try:
+                            json.loads(tc["function"].get("arguments") or "{}")
+                        except ValueError:
+                            tc["_cut_off"] = True
+                history.append({**amsg, "tool_calls": [{k: v for k, v in tc.items() if k != "_cut_off"} for tc in tool_calls]}
+                               if tool_calls else amsg)
                 if resp["content"]:
                     s.emit("message", text=resp["content"], final=not tool_calls)
 
-                if resp.get("finish_reason") == "length" and not resp["content"] and not tool_calls:
-                    # Model hit max_tokens during reasoning without producing output. Prompt to execute directly.
-                    s.emit("thinking", text="[Thinking token budget reached — recovering and executing next action directly]")
-                    messages.append({
-                        "role": "user",
-                        "content": "[System Notice]: You reached the token limit during reasoning. Keep your thinking concise and immediately invoke the required tool or give your answer."
-                    })
-                    continue
-
                 if not tool_calls:
-                    # Model gave a conversational response. Before handing back to the user, make sure it is not
-                    # presenting unbuilt firmware (code in chat / build+flash steps) as if it were delivered.
+                    project.trace(trace)
+                    # Before handing back to the user, make sure the reply is not presenting unbuilt firmware
+                    # (code in chat / build+flash steps) as if it were delivered.
                     built = belt.state["build_ok"] and belt.state["build_hash"] == belt.source_hash()
                     problem = unbuilt_code_problem(resp["content"], built)
                     if problem and guard.code_nudges < MAX_UNBUILT_CODE_NUDGES:
                         guard.code_nudges += 1
                         s.emit("guard", kind="unbuilt_code", text="The reply above contains firmware that was not written to files or built — asking the agent to fix that.")
-                        messages.append({"role": "user", "content": f"[System Notice]: {problem}"})
+                        history.append(notice(problem))
                         continue
                     if problem:
                         s.emit("guard", kind="unbuilt_code", text="Warning: the reply above presents code or build steps that EmbedForge did not build or verify.")
+                    # A task in progress whose next step needs no user input: one reminder before stopping.
+                    kind = meta.get("kind") or ("platformio" if (project.root / "platformio.ini").exists() else "")
+                    asked_question = user_message.rstrip().endswith("?")  # the user asked something; an answer is the result
+                    in_progress = bool(kind) and not asked_question and not nxt.startswith(("finish", "set up the target"))
+                    if in_progress and continue_nudges < MAX_CONTINUE_NUDGES and not problem:
+                        continue_nudges += 1
+                        s.emit("guard", kind="continue", text=f"The task is not finished — reminding the agent of the next step: {nxt}")
+                        history.append(notice(
+                            f"The task is not finished. NEXT STEP: {nxt}. Continue with tools. If you need information that "
+                            "is not in the schematic or the stored sources, call ask_user with the specific question."))
+                        project.trace({"event": "notice", "kind": "continue"})
+                        continue
                     status = "needs_input"
                     break
 
+                results_trace = []
                 for tc in tool_calls:
                     name = tc["function"]["name"]
+                    counted = True
                     try:
+                        if tc.get("_cut_off"):
+                            raise ValueError("Not executed: your reply was cut off at the token limit while writing this call. "
+                                             "Re-issue it alone; for config edits use replace_in_file instead of rewriting the file.")
                         args = parse_tool_args(tc["function"].get("arguments"))
                     except ValueError as e:
-                        args, result = {}, {"error": str(e)}
+                        args, result, counted = {}, {"error": str(e) if tc.get("_cut_off") else f"{e} Send the arguments as one JSON object."}, False
                     else:
                         result = guard.before(name, len(store.sources), args)
+                        if result is not None:
+                            counted = False
                     s.emit("tool_call", id=tc["id"], name=name, args={k: (v if len(str(v)) < 400 else str(v)[:400] + "…") for k, v in args.items()})
                     if result is None:
                         tracer.start_span(f"{span}-{tc['id']}", name, run_type="tool", inputs=args)
@@ -348,53 +402,75 @@ class AgentRunner:
                     elif result.get("guard"):
                         s.emit("guard", kind=result["guard"], text=result["error"])
                     ok = not (isinstance(result, dict) and (result.get("error") or result.get("ok") is False or result.get("found") is False))
-                    guard.after(name, ok, result, args)
+                    dg = ctx.digest(name, args, result)
+                    guard.after(name, ok, result, args, counted=counted, digest=dg)
                     s.emit("tool_result", id=tc["id"], name=name, ok=ok, summary=_summ(result))
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, default=str)})
+                    history.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, default=str), "_digest": dg})
+                    targs = {k: (v if len(str(v)) <= 200 else f"<{len(str(v))} chars>") for k, v in args.items()}
+                    results_trace.append({"name": name, "args": targs, "ok": ok, "digest": dg[:300], **({} if counted else {"blocked": True})})
                     if belt.ended:
                         break
+                project.trace({**trace, "results": results_trace})
 
+                if belt.ended in ("ask_user", "finish"):  # the same unbuilt-firmware check as for plain replies
+                    built = belt.state["build_ok"] and belt.state["build_hash"] == belt.source_hash()
+                    text = belt.final.get("question") or belt.final.get("summary") or ""
+                    problem = unbuilt_code_problem(text, built)
+                    if problem and guard.code_nudges < MAX_UNBUILT_CODE_NUDGES:
+                        guard.code_nudges += 1
+                        s.emit("guard", kind="unbuilt_code", text="The agent's final text contains firmware that was not built — sending it back.")
+                        belt.ended, belt.final = None, {}
+                        history.append(notice(problem))
+                        project.trace({"event": "notice", "kind": "unbuilt_code"})
+                        continue
                 if belt.ended == "ask_user":
                     s.emit("ask_user", **belt.final)
                     status = "needs_input"
                     break
                 if belt.ended == "finish":
                     fin = belt.final
-                    self._walkthrough(belt, store, ledger)
+                    self._walkthrough(belt, store, ledger, fin)
                     s.emit("done", status=fin["status"], summary=fin["summary"])
                     status = "completed" if fin["status"] == "success" else "failed"
                     break
 
                 guard.steps_since_progress += 1
                 if guard.steps_since_progress == STALL_NUDGE_STEPS:
-                    digest = self._state_digest(belt, store, ledger)
-                    text = (f"No progress in the last {STALL_NUDGE_STEPS} steps ({digest}). Change approach now: record facts from "
-                            "the sources you already have, write the code and build, or ask_user for what is missing.")
+                    text = (f"No progress in the last {STALL_NUDGE_STEPS} steps (no new fact, edit or build). "
+                            f"NEXT STEP: {nxt}. Do that now, or ask_user for what is missing.")
                     s.emit("guard", kind="stall_nudge", text=text)
-                    messages.append({"role": "user", "content": f"[System Notice]: {text}"})
+                    history.append(notice(text))
+                    project.trace({"event": "notice", "kind": "stall_nudge"})
                 elif guard.steps_since_progress >= STALL_STOP_STEPS:
-                    digest = self._state_digest(belt, store, ledger)
-                    text = (f"Paused: {STALL_STOP_STEPS} steps without recording a fact, editing code or building ({digest}). "
-                            "Reply with the missing detail (e.g. a datasheet link or the value) or try a stronger model.")
+                    text = (f"Paused after {STALL_STOP_STEPS} steps with no new fact, edit or build. Stuck at: {nxt}. "
+                            "Reply 'continue' to resume, or give the missing detail.")
                     s.emit("guard", kind="stalled", text=text)
                     s.emit("error", message=text)
                     status = "needs_input"
                     break
             else:
-                s.emit("error", message=f"Step budget ({config.agent_max_steps}) exhausted before completion. Send a message to continue.")
-                status = "failed"
+                first = ((project.meta().get("last_build") or {}).get("diagnostics") or [""])[0]
+                s.emit("error", message=f"Step budget ({config.agent_max_steps}) used up. Next step: {nxt}"
+                                        + (f" (last build error: {first})" if first else "") + ". Send 'continue' to resume.")
+                status = "needs_input"
         except Exception as e:  # never let the worker thread die silently
             logger.log_event("AGENT_CRASH", f"{type(e).__name__}: {e}")
             s.emit("error", message=f"{type(e).__name__}: {e}")
             status = "failed"
         finally:
             try:
-                project.save_conversation(messages)
+                project.save_conversation(ctx.for_persistence(history))
             except Exception:
                 pass
             tracer.end_span(span, outputs={"status": status})
-            s.emit("run_stats", steps=steps, tools=dict(guard.calls), failures=dict(guard.failures),
-                   facts=len(ledger.facts), sources=len(store.sources), builds=len(project.builds()),
-                   build_ok=belt.state["build_ok"], verify_ok=belt.state["verify_ok"], model=self.llm.model)
+            stats = dict(steps=steps, tools=dict(guard.calls), failures=dict(guard.failures), blocked=dict(guard.blocked),
+                         facts=len(ledger.facts), sources=len(store.sources), builds=len(project.builds()),
+                         build_ok=belt.state["build_ok"], verify_ok=belt.state["verify_ok"], model=self.llm.model,
+                         status=status, next_step=nxt, truncations=truncations, continue_nudges=continue_nudges)
+            try:
+                project.trace({"event": "run_end", **stats})
+            except Exception:
+                pass
+            s.emit("run_stats", **stats)
             s.emit("state", ledger=[f.public() for f in ledger.facts.values()], builds=project.builds(), files=project.list_files())
             s.finish(status)

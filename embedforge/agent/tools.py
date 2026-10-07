@@ -61,6 +61,14 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     _fn("record_user_fact",
         "Record a fact the USER stated explicitly (MCU model, pin, address, rate...). `quote` must be the user's exact words.",
         {"subject": S, "property": S, "value": S, "quote": S}, ["subject", "property", "value", "quote"]),
+    _fn("record_board_pins",
+        "Record many MCU pin facts from the imported schematic in ONE call. Each item: `define` = the config define it "
+        "backs (e.g. 'SPI0_SCK_PIN', 'MOTOR1_PIN') and `line` = one query_board line copied exactly, e.g. "
+        "'U1 pin 21 (GPIO14) -> net GYRO_SCK -> U4.13 (SCLK)'. The pin value (GPIO14) is taken from the line. Returns the "
+        "FACT id per define and, in a Betaflight project, adds the tag to matching config.h lines (never changes a pin). "
+        "If a define was recorded for the wrong pin, send that item with replace: true to retire the old fact.",
+        {"pins": _arr({"type": "object", "properties": {"define": S, "line": S, "replace": {"type": "boolean"}},
+                       "required": ["define", "line"]})}, ["pins"]),
     _fn("list_facts", "List all facts currently in the ledger (with FACT ids).", {}, []),
     _fn("query_board",
         "Look up the user's imported schematic/netlist (EasyEDA, Protel, PADS, KiCad): a designator ('U1'), a net ('HIN_A'), "
@@ -81,17 +89,19 @@ TOOL_SPECS: List[Dict[str, Any]] = [
     _fn("read_framework_file",
         "Read lines of a file returned by search_framework (SDK header, or a Betaflight source/config file).",
         {"path": S, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
-    _fn("write_file", "Create or overwrite a project file under src/, include/, lib/, test/ or docs/ (or platformio.ini). "
-        "Build scripts (*.py, extra_scripts, library.json) are not allowed.",
+    _fn("write_file", "Create or overwrite a project file: firmware under src/, include/, lib/ (or platformio.ini), or for a "
+        "Betaflight project the board config betaflight/configs/CUST/<BOARD>/config.h. Build scripts (*.py, *.mk, "
+        "extra_scripts, library.json) are not allowed. For a Betaflight config the result lists the pin defines and lint problems.",
         {"path": S, "content": S}, ["path", "content"]),
     _fn("replace_in_file", "Replace an exact text snippet in a project file (must match exactly once).",
         {"path": S, "old": S, "new": S}, ["path", "old", "new"]),
     _fn("read_file", "Read a project file as numbered lines (long files come in windows; pass start/end for more).",
         {"path": S, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
-    _fn("list_files", "List project files.", {}, []),
+    _fn("list_files", "List project files (optionally only those whose path starts with `path`).", {"path": S}, []),
     _fn("build",
-        "Run a REAL PlatformIO compile + link for the project. Returns structured compiler diagnostics, flash/RAM "
-        "usage and (on success) .elf/.bin/.hex artifacts.",
+        "Run a REAL build of the project — PlatformIO, or for a Betaflight project `make CONFIG=<BOARD>` in WSL. Takes no "
+        "arguments. Returns compiler diagnostics with the surrounding source lines, flash/RAM usage and (on success) the "
+        "firmware files. Re-building unchanged sources after a failure is refused: fix the first error first.",
         {}, []),
     _fn("verify",
         "Deterministic verification: every hardware constant (hex literal / ADDR/REG/ID define) in the sources must be "
@@ -110,12 +120,55 @@ TOOL_SPECS: List[Dict[str, Any]] = [
 ]
 
 
+_BETAFLIGHT_HIDDEN_TOOLS = {"resolve_target", "init_project"}
+
+
+def tools_for(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Tool list for this project: a Betaflight project never needs the PlatformIO target tools, and once its board is
+    set up init_betaflight would only re-initialise it."""
+    if meta.get("kind") != "betaflight":
+        return TOOL_SPECS
+    hide = set(_BETAFLIGHT_HIDDEN_TOOLS) | ({"init_betaflight"} if meta.get("board") else set())
+    return [t for t in TOOL_SPECS if t["function"]["name"] not in hide]
+
+
+_KEEP_SCALARS = ("ok", "error", "passed", "summary", "unchanged", "version", "next", "note", "found", "source_id")
+
+
 def _truncate(obj: Any, limit: int = 7000) -> Any:
+    """Shrink an oversized tool result while keeping it a real object: status keys are never lost, long strings are cut and
+    lists are trimmed from the tail (with '<key>_omitted' counts) until it fits."""
+    import copy
     import json
-    s = json.dumps(obj, default=str)
-    if len(s) <= limit:
+
+    def size(o: Any) -> int:
+        return len(json.dumps(o, default=str))
+
+    if size(obj) <= limit:
         return obj
-    return {"truncated": True, "preview": s[:limit]}
+    if not isinstance(obj, dict):
+        s = json.dumps(obj, default=str)
+        return {"truncated": True, "preview": s[: limit - 100]}
+    out = copy.deepcopy(obj)  # never mutate cached results (web_search cache)
+    for k, v in list(out.items()):
+        if isinstance(v, str) and len(v) > 1500 and k not in _KEEP_SCALARS:
+            out[k] = v[:1500] + "…"
+    lists = [k for k, v in out.items() if isinstance(v, list)]
+    while size(out) > limit and any(out.get(k) for k in lists):
+        k = max((k for k in lists if out.get(k)), key=lambda x: size(out[x]))
+        item = out[k][-1]
+        if isinstance(item, str) and len(item) > 300 and len(out[k]) == 1:
+            out[k][-1] = item[:300] + "…"
+            if size(out) <= limit:
+                break
+        out[k].pop()
+        out[f"{k}_omitted"] = out.get(f"{k}_omitted", 0) + 1
+    if size(out) > limit:  # nested blobs: keep the status keys and a preview of the rest
+        rest = {k: v for k, v in out.items() if k not in _KEEP_SCALARS}
+        out = {k: out[k] for k in _KEEP_SCALARS if k in out}
+        out["preview"] = json.dumps(rest, default=str)[: max(200, limit - size(out) - 100)]
+    out["truncated"] = True
+    return out
 
 
 # ------------------------------------------------------------------ write policy
@@ -192,11 +245,19 @@ class ToolBelt:
         self.final: Dict[str, Any] = {}
         self._searches: Dict[str, List[Dict[str, Any]]] = {}  # normalized query -> results (per run)
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "last_build": None}
+        # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
+        meta = project.meta()
+        lb, lv = meta.get("last_build") or {}, meta.get("last_verify") or {}
+        if lb:
+            self.state.update(build_hash=lb.get("hash"), build_ok=bool(lb.get("ok")), build_version=lb.get("version"))
+        if lv:
+            self.state.update(verify_hash=lv.get("hash"), verify_ok=bool(lv.get("passed")))
         self._handlers: Dict[str, Callable[..., Any]] = {
             "resolve_target": self.resolve_target, "init_project": self.init_project, "init_betaflight": self.init_betaflight,
             "web_search": self.web_search,
             "fetch_document": self.fetch_document, "read_source": self.read_source, "record_fact": self.record_fact,
-            "record_user_fact": self.record_user_fact, "list_facts": self.list_facts, "query_board": self.query_board,
+            "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
+            "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
             "write_file": self.write_file, "replace_in_file": self.replace_in_file, "read_file": self.read_file,
             "list_files": self.list_files, "build": self.build, "verify": self.verify, "set_plan": self.set_plan,
@@ -208,14 +269,22 @@ class ToolBelt:
         h = self._handlers.get(name)
         if h is None:
             return {"error": f"Unknown tool '{name}'. Available: {', '.join(self._handlers)}"}
+        import inspect
+        accepted = set(inspect.signature(h).parameters)
+        ignored = sorted(k for k in args if k not in accepted)
+        call_args = {k: v for k, v in args.items() if k in accepted}
+        limit = 14000 if name == "query_board" else 7000
         try:
-            return _truncate(h(**args), limit=14000 if name == "query_board" else 7000)
+            res = _truncate(h(**call_args), limit=limit)
         except TypeError as e:
             spec = next((t["function"]["parameters"] for t in TOOL_SPECS if t["function"]["name"] == name), {})
             params = ", ".join(f"{k}{'' if k in spec.get('required', []) else '?'}" for k in spec.get("properties", {}))
             return {"error": f"Bad arguments for {name}: {e}. Its parameters are: ({params or 'none'})."}
         except Exception as e:  # tools must never crash the loop
             return {"error": f"{type(e).__name__}: {e}"}
+        if ignored and isinstance(res, dict):
+            res["ignored_args"] = ignored  # harmless extras (e.g. build(project_dir='.')) are dropped, not fatal
+        return res
 
     def source_hash(self) -> str:
         h = hashlib.sha256()
@@ -319,8 +388,11 @@ class ToolBelt:
             if not st["ok"]:
                 return {"error": f"Betaflight setup failed: {st['error'][-800:]}"}
         targets = betaflight.available_targets()
-        if target not in targets:
+        mapped = betaflight.target_for_part(target, targets)
+        mapped_note = f"'{target}' is built with the in-tree {mapped} target." if mapped and mapped != target else ""
+        if not mapped:
             return {"error": f"'{target}' is not an in-tree Betaflight {betaflight.BF_TAG} target. Available: {', '.join(targets)}"}
+        target = mapped
         meta = self.project.meta()
         existing = meta.get("board") if meta.get("kind") == "betaflight" else None
         if existing and (self.project.root / "betaflight" / "configs" / betaflight.MANUFACTURER_ID / existing).is_dir() \
@@ -346,12 +418,14 @@ class ToolBelt:
         self.session.emit("project", meta=self.project.meta())
         rel_dir = f"betaflight/configs/{betaflight.MANUFACTURER_ID}/{board}"
         return {
+            **({"note": mapped_note} if mapped_note else {}),
             "ok": True, "config_path": f"{rel_dir}/config.h", "target": target, "board_name": board,
             "manufacturer_id": betaflight.MANUFACTURER_ID, "betaflight_version": betaflight.BF_TAG,
             "generated": [f"{rel_dir}/{g}" for g in generated],
             "reference_configs": betaflight.reference_configs(target),
-            "next": ("Read one or two reference configs (read_framework_file) to copy the exact define names and structure; "
-                     "look up every function's pin with query_board and record it with record_fact; then write config.h with "
+            "next": ("Read one reference config (read_framework_file) for define names and syntax only — never its pins or "
+                     "devices; look up every function's pin with query_board('U1') and record them in one record_board_pins "
+                     "call with {define, line}; then write config.h with "
                      f"'#define FC_TARGET_MCU {target}', '#define BOARD_NAME {board}', '#define MANUFACTURER_ID "
                      f"{betaflight.MANUFACTURER_ID}' and each pin tagged /* FACT-nnn */; then build and verify (verify also "
                      "checks every pin against the MCU's peripheral pin tables)."),
@@ -389,6 +463,11 @@ class ToolBelt:
                         "record_fact now with a verbatim quote copied from it; use read_source(source_id, query) for other passages."}
 
     def fetch_document(self, url: str) -> Dict[str, Any]:
+        if not str(url).lower().startswith(("http://", "https://")):
+            board_sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
+            return {"error": "fetch_document only downloads http(s) URLs."
+                             + (f" The imported schematic is already stored as {board_sid}: use query_board for its wiring."
+                                if board_sid else " Project files are read with read_file.")}
         src = self.store.fetch(url)
         self.session.emit("source", source_id=src.id, title=src.title, url=src.url, tier=src.tier, chars=src.chars)
         return {"source_id": src.id, "url": src.url, "tier": src.tier, "chars": src.chars, "kind": src.kind,
@@ -416,6 +495,10 @@ class ToolBelt:
         res = self.ledger.record(subject, property, value, source_id, quote, unit)
         if res.get("ok"):
             self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
+        elif self.store.get(source_id) is None:
+            res["error"] = (f"Unknown source_id '{source_id}'. Stored sources: "
+                            + ", ".join(f"{s.id} ({s.title[:40]})" for s in list(self.store.sources.values())[:12])
+                            + ". Wiring facts cite the board source returned by query_board.")
         else:
             cands = self._candidate_quotes(source_id, str(value))
             if cands:
@@ -456,6 +539,114 @@ class ToolBelt:
             self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
         return res
 
+    _BOARD_LINE = re.compile(r"^\s*(\S+) pin (\S+) \(([^)]*)\)")
+
+    _DEFINE_NAME = re.compile(r"^[A-Z][A-Z0-9_]*_PIN$")
+
+    def record_board_pins(self, pins: List[Dict[str, Any]], tag_config: bool = True) -> Dict[str, Any]:
+        """Batch pin facts from board lines. The value is read from the quoted line, and the ledger still checks the line is
+        verbatim board-source text, so this cannot record anything the schematic does not say. With `define` items in a
+        Betaflight project, matching config.h lines get their FACT tag (only where the define's pin equals the fact)."""
+        sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
+        if not sid:
+            return {"error": "No schematic is imported for this project, so there are no board lines to record."}
+        if not isinstance(pins, list) or not pins:
+            return {"error": "`pins` must be a non-empty list of {define, line}."}
+        recorded: List[str] = []
+        rejected: List[Dict[str, Any]] = []
+        retired: List[str] = []
+        to_tag: Dict[str, tuple] = {}
+        any_new = False
+        for item in pins[:60]:
+            item = item if isinstance(item, dict) else {}
+            define = str(item.get("define") or "").strip().upper()
+            fn = re.sub(r"[^a-z0-9_]+", "_", str(item.get("function") or "").strip().lower()).strip("_")
+            label = define or fn
+            line = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(item.get("line") or "").strip())
+            m = self._BOARD_LINE.match(line)
+            g = re.search(r"(?<![A-Z0-9])(?:GPIO(\d+)|P([A-K])(\d{1,2}))(?![0-9])", m.group(3).upper()) if m else None
+            why = ("give `define` (e.g. 'GYRO_1_CS_PIN')" if not label else
+                   f"`define` must be a pin define name like 'MOTOR1_PIN', not '{define}'" if define and not self._DEFINE_NAME.match(define) else
+                   "`line` must start like 'U1 pin 21 (GPIO14) -> …' (a pin line of a part, copied exactly)" if not m else
+                   f"pin name '{m.group(3)}' has no GPIO number, so it is not a signal pin" if not g else
+                   f"{m.group(3)} is not connected on the schematic; remove any define that uses it"
+                   if line.rstrip().endswith("not connected") else "")
+            if why:
+                rejected.append({"define": label or item.get("function"), "error": why})
+                continue
+            value = f"GPIO{int(g.group(1))}" if g.group(1) else f"P{g.group(2)}{int(g.group(3))}"
+            prop = define or (f"{fn}_pin" if not fn.endswith("_pin") else fn)
+            clash = next((f for f in self.ledger.facts.values() if f.subject == m.group(1) and f.property.upper() == prop.upper()
+                          and str(f.value).upper() != value), None)
+            if clash and item.get("replace") in (True, "true", "True", 1):
+                self.ledger.retire(clash.id, f"{prop} re-recorded as {value} from: {line}")
+                retired.append(f"{clash.id} ({prop}={clash.value})")
+            elif clash:
+                rejected.append({"define": label, "error": f"{prop} is already recorded as {clash.value} ({clash.id}); one define "
+                                 f"has one pin. If {clash.id} was bound to the wrong define, repeat this item with replace: true "
+                                 f"to retire it."})
+                continue
+            res = self.ledger.record(m.group(1), prop, value, sid, line)
+            if not res.get("ok"):
+                rejected.append({"define": label, "error": str(res.get("error"))[:200]})
+                continue
+            fid = res["fact"]["id"]
+            if not any("Duplicate" in str(w) for w in res.get("warnings") or []):
+                any_new = True
+                self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
+            recorded.append(f"{label}={value} {fid}")
+            if define:
+                to_tag[define] = (fid, value)
+        out: Dict[str, Any] = {"ok": bool(recorded), "recorded": recorded}
+        if retired:
+            out["retired"] = retired
+        if to_tag and tag_config and self._is_betaflight():
+            tagging = self._tag_config(to_tag)
+            out.update(tagging)
+            any_new = any_new or bool(tagging.get("tagged"))
+        if recorded and not any_new:
+            out["all_duplicates"] = True
+        if rejected:
+            out["rejected"] = rejected
+            out["hint"] = "Copy each line exactly from a query_board result (query 'U1' lists every MCU pin)."
+        return out
+
+    def _tag_config(self, tags: Dict[str, tuple]) -> Dict[str, Any]:
+        """Put /* FACT-nnn */ on `#define NAME PAn` lines whose GPIO equals the recorded fact. Never changes a pin."""
+        board = self.project.meta().get("board")
+        rel = f"betaflight/configs/{betaflight.MANUFACTURER_ID}/{board}/config.h"
+        path = self.project.root / rel
+        if not board or not path.exists():
+            return {"note": "config.h does not exist yet: write it with these defines and their FACT ids."}
+        lines = path.read_text(encoding="utf-8").split("\n")
+        tagged, mismatched, seen = [], [], set()
+        for i, raw in enumerate(lines):
+            m = re.match(r"^(\s*#\s*define\s+(\w+)\s+)(PA(\d{1,2}))\b(.*)$", raw)
+            if not m or m.group(2) not in tags:
+                continue
+            define, (fid, value) = m.group(2), tags[m.group(2)]
+            seen.add(define)
+            if f"GPIO{int(m.group(4))}" != value:
+                mismatched.append(f"{define} is {m.group(3)} in config.h but the schematic line gives {value} — fix the define")
+                continue
+            code = re.split(r"/\*|//", m.group(5), maxsplit=1)[0].rstrip()
+            new = f"{m.group(1)}{m.group(3)}{code} /* {fid} */"
+            if new != raw:
+                lines[i] = new
+                tagged.append(f"{define} line {i + 1}")
+        out: Dict[str, Any] = {}
+        if tagged:
+            text = "\n".join(lines)
+            self.project.write_file(rel, text)
+            self.session.emit("file", path=rel, content=text)
+            out.update(tagged=tagged, **self._config_feedback(rel, text))
+        if mismatched:
+            out["mismatched"] = mismatched
+        missing = [d for d in tags if d not in seen]
+        if missing:
+            out["not_in_config"] = missing
+        return out
+
     def query_board(self, query: str = "") -> Dict[str, Any]:
         board = eda.load_board(self.project.root)
         if board is None:
@@ -465,9 +656,8 @@ class ToolBelt:
         res = board.query(query or "")
         res["source_id"] = sid
         if res.get("lines"):
-            res["how_to_record"] = (f"For a pin used in code: record_fact(subject='U1', property='<function>_pin', "
-                                    f"value='GPIO<n>' (the GPIO in the line), source_id='{sid}', quote='<that line, verbatim>'), "
-                                    "then tag the define with the FACT id.")
+            res["how_to_record"] = ("For the pins used in code: record_board_pins(pins=[{define:'GYRO_1_CS_PIN', line:'<a line "
+                                    "above, exact>'}, ...]) in one call; it tags existing config.h defines for you.")
         return res
 
     def list_facts(self) -> Dict[str, Any]:
@@ -513,10 +703,24 @@ class ToolBelt:
                            "ESP-IDF gpio_*/i2c_*). Search a shorter fragment such as the peripheral name.")
         return out
 
-    def read_framework_file(self, path: str, start: int = 1, end: int = 160) -> Dict[str, Any]:
-        if str(path).startswith("bf:"):
-            res = betaflight.read_file(path, int(start or 1), int(end or 160))
-            return res or {"error": "Not a readable Betaflight file (use a 'bf:src/...' path from search_framework or init_betaflight)."}
+    def read_framework_file(self, path: str, start: int = 1, end: int = 0) -> Dict[str, Any]:
+        path = re.sub(r"^betaflight-src:", "bf:", str(path))  # the form build diagnostics use
+        if path.startswith("bf:"):
+            start = max(1, int(start or 1))
+            res = betaflight.read_file(path, start, int(end) if end else start + 240)
+            if not res:
+                return {"error": "Not a readable Betaflight file (use a 'bf:src/...' path from search_framework or init_betaflight)."}
+            rows, size = [], 0
+            for row in res["text"].split("\n"):  # same ~5.5k window as project files, with a 'more' note
+                if size + len(row) > 5500:
+                    break
+                rows.append(row)
+                size += len(row) + 1
+            last = start + len(rows) - 1
+            res.update(text="\n".join(rows), end=last)
+            if last < res["total_lines"]:
+                res["note"] = f"Lines {start}-{last} of {res['total_lines']}; read_framework_file(path, start={last + 1}) for more."
+            return res
         if (self.project.root / str(path)).is_file():  # a project file passed to the SDK reader
             return self.read_file(path, start or 1, end or 0)
         pk = (pio.core_dir() / "packages").resolve()
@@ -530,31 +734,52 @@ class ToolBelt:
                 "text": "\n".join(f"{i}: {lines[i-1]}" for i in range(start, end + 1))}
 
     # ------------------------------------------------------------ files
+    def _config_feedback(self, path: str, content: str) -> Dict[str, Any]:
+        """For a Betaflight config: lint problems and the pin map, so the model needn't re-read what it just wrote."""
+        rel = path.replace("\\", "/")
+        if not re.fullmatch(r"betaflight/configs/(?:CUST/)?[^/]+/config\.h", rel):
+            return {}
+        meta = self.project.meta()
+        lint = betaflight.lint_config(content, rel.split("/")[-2], meta.get("bf_target") or "")
+        out: Dict[str, Any] = {"pins": betaflight.pin_summary(content)}
+        if lint["errors"] or lint["warnings"]:
+            out["lint"] = lint["errors"] + [f"warning: {w}" for w in lint["warnings"]]
+        return out
+
     def write_file(self, path: str, content: str) -> Dict[str, Any]:
         problem = check_agent_write(path, content)
         if problem:
             return {"error": problem}
+        try:
+            unchanged = self.project.read_file(path) == content
+        except (FileNotFoundError, ValueError):
+            unchanged = False
         res = self.project.write_file(path, content)
         self.session.emit("file", path=res["path"], content=content)
-        return res
+        return {**res, **({"unchanged": True} if unchanged else {}), **self._config_feedback(path, content)}
 
     def replace_in_file(self, path: str, old: str, new: str) -> Dict[str, Any]:
         text = self.project.read_file(path)
         n = text.count(old)
         if n != 1:
-            return {"error": f"'old' text must match exactly once; found {n} occurrences."}
+            hint = ""
+            if n == 0:  # show where the text probably is, so the model can retry without re-reading the whole file
+                first = next((ln for ln in old.splitlines() if ln.strip()), "").strip()
+                hits = [f"{i}: {ln}" for i, ln in enumerate(text.splitlines(), 1) if first and first[:40] in ln][:3]
+                hint = (" Lines containing its first line: " + " | ".join(hits)) if hits else " Read the lines with read_file(path, start=…) first."
+            return {"error": f"'old' text must match exactly once; found {n} occurrences.{hint}"}
         updated = text.replace(old, new)
         problem = check_agent_write(path, updated)
         if problem:
             return {"error": problem}
         res = self.project.write_file(path, updated)
         self.session.emit("file", path=res["path"], content=updated)
-        return res
+        return {**res, **self._config_feedback(path, updated)}
 
     def read_file(self, path: str, start: int = 1, end: int = 0) -> Dict[str, Any]:
         """Numbered lines; long files are windowed so the reply never collapses into an unreadable preview."""
-        if str(path).startswith("bf:"):
-            return self.read_framework_file(path, start or 1, end or (start or 1) + 160)
+        if str(path).startswith(("bf:", "betaflight-src:")):
+            return self.read_framework_file(path, start or 1, end or 0)
         lines = self.project.read_file(path).splitlines()
         start = max(1, int(start or 1))
         out, size, last = [], 0, start - 1
@@ -571,24 +796,60 @@ class ToolBelt:
             res["note"] = f"Showing lines {start}-{last} of {len(lines)}. Call read_file(path, start={last + 1}) for more."
         return res
 
-    def list_files(self) -> Dict[str, Any]:
-        return {"files": self.project.list_files()}
+    def list_files(self, path: str = "") -> Dict[str, Any]:
+        files = self.project.list_files()
+        prefix = (path or "").replace("\\", "/").lstrip("./")
+        return {"files": [f for f in files if f["path"].startswith(prefix)] if prefix else files}
+
+    def _with_context(self, diags: List[Dict[str, Any]], limit: int = 8) -> List[Dict[str, Any]]:
+        """Deduplicated diagnostics; project-file ones carry their ±2 numbered source lines."""
+        out, seen = [], set()
+        for d in diags:
+            key = (d.get("file"), d.get("line"), d.get("message"))
+            if key in seen:
+                continue
+            seen.add(key)
+            d = dict(d)
+            f, ln = str(d.get("file") or ""), int(d.get("line") or 0)
+            p = self.project.root / f
+            if ln and not f.startswith(("<", "betaflight-src:")) and p.is_file():
+                lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+                d["context"] = "\n".join(f"{'>' if i == ln else ' '}{i}: {lines[i - 1]}" for i in range(max(1, ln - 2), min(len(lines), ln + 2) + 1))
+            out.append(d)
+            if len(out) >= limit:
+                break
+        return out
 
     # ------------------------------------------------------------ build / verify
     def build(self) -> Dict[str, Any]:
+        h = self.source_hash()
+        prev = self.project.meta().get("last_build") or {}
+        if prev.get("hash") == h and prev.get("ok") is False and prev.get("source_errors"):  # infra failures may be retried
+            first = (prev.get("diagnostics") or ["see the previous build result"])[0]
+            return {"error": "No source changes since the last failed build, so it would fail the same way. Fix the first error "
+                             f"({first}) with replace_in_file, then build.", "unchanged": True}
         self.session.emit("build_start")
-        counter = {"n": 0}
 
         def on_line(line: str) -> None:
-            counter["n"] += 1
             if line.strip():
                 self.session.emit("build_log", line=line)
 
         res = (betaflight.build(self.project.root, on_line=on_line, board_hint=self.project.meta().get("board", ""))
                if self._is_betaflight() else pio.build(self.project.root, on_line=on_line))
-        h = self.source_hash()
         self.state.update(build_hash=h, build_ok=res.ok, last_build=res.public())
         out = res.public()
+        out["diagnostics"] = self._with_context(out.get("diagnostics") or [])
+        if not res.ok:
+            if out["diagnostics"]:
+                out.pop("log_tail", None)
+                out["next"] = "Fix the FIRST error (later ones are often consequences), then build again."
+            else:
+                out["log_tail"] = "\n".join((out.get("log_tail") or "").splitlines()[-25:])
+        self.project.update_meta(last_build={
+            "hash": h, "ok": res.ok, "source_errors": bool(out["diagnostics"]),
+            "diagnostics": [f"{d.get('file')}:{d.get('line')}: {str(d.get('message'))[:160]}" for d in out["diagnostics"][:5]]
+                           or ([out.get("error")] if out.get("error") else []),
+        })
         if res.ok and res.artifacts:
             meta = self.project.meta()
             manifest = {
@@ -600,6 +861,7 @@ class ToolBelt:
             mf = self.project.register_build(res.artifacts, manifest)
             self.state["build_version"] = mf["version"]
             out["version"] = mf["version"]
+            self.project.update_meta(last_build={**(self.project.meta().get("last_build") or {}), "version": mf["version"]})
             out["hex_available"] = "hex" in res.artifacts
             self.session.emit("build_result", result=out, manifest=mf)
         else:
@@ -614,10 +876,28 @@ class ToolBelt:
         if self._is_betaflight():
             from embedforge.truth import betaflight_rp2350
             from embedforge.truth.verifier import Finding
+            board = eda.load_board(self.project.root)
             for cfg in betaflight.config_files(self.project.root):
                 rel = str(cfg.relative_to(self.project.root)).replace("\\", "/")
-                for f in betaflight_rp2350.check_config(cfg.read_text(encoding="utf-8", errors="ignore"), meta.get("bf_target") or ""):
+                text = cfg.read_text(encoding="utf-8", errors="ignore")
+                for f in betaflight_rp2350.check_config(text, meta.get("bf_target") or ""):
                     rep.findings.append(Finding(f["severity"], f["code"], rel, f["line"], f["message"], suggestion=f["suggestion"]))
+                for sev, code, ln, msg, sug in betaflight.board_consistency(text, board):
+                    rep.findings.append(Finding(sev, code, rel, ln, msg, suggestion=sug))
+                own = {}  # name -> line; names the config itself tests (#ifdef X) are its own switches
+                for i, raw in enumerate(text.split("\n"), start=1):
+                    dm = re.match(r"\s*#\s*define\s+([A-Z][A-Z0-9_]+)", raw)
+                    if dm:
+                        own.setdefault(dm.group(1), i)
+                tested = set(re.findall(r"#\s*(?:if|ifdef|ifndef|elif)\b[^\n]*?\b([A-Z][A-Z0-9_]+)", text))
+                for name in betaflight.unknown_defines([n for n in own if n not in tested]) or []:
+                    pin_like = name.endswith(("_PIN", "_INSTANCE"))
+                    rep.findings.append(Finding(
+                        "ERROR" if pin_like else "WARNING", "UNKNOWN_DEFINE", rel, own[name],
+                        f"{name} is not used anywhere in Betaflight {betaflight.BF_TAG}, so it has no effect"
+                        + (" — that function is not configured." if pin_like else "."),
+                        suggestion=(f"Use the define name Betaflight reads (search_framework('{name.split('_')[0]}_') or a reference "
+                                    "config); e.g. motors are MOTOR1_PIN..MOTOR8_PIN, gyros USE_ACCGYRO_<CHIP> or USE_GYRO_SPI_<CHIP>.")))
             rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
         h = self.source_hash()
         self.state.update(verify_hash=h, verify_ok=rep.passed)
@@ -633,7 +913,54 @@ class ToolBelt:
                 self.session.emit("build_manifest", manifest=mf)
         pub = rep.public()
         self.session.emit("verify", report=pub, summary=rep.summary())
-        return {"passed": rep.passed, "summary": rep.summary(), "findings": pub["findings"][:25], "stats": rep.stats}
+        prev_hash = (meta.get("last_verify") or {}).get("hash")
+        findings = self._compact_findings(pub["findings"])
+        self.project.update_meta(last_verify={
+            "hash": h, "passed": rep.passed, "summary": rep.summary(),
+            "findings": [f"{x.get('code')} {x.get('file')}:{x.get('line') or x.get('lines')} {str(x.get('message'))[:140]}"
+                         for x in findings[:5]],
+        })
+        out: Dict[str, Any] = {"passed": rep.passed, "summary": rep.summary(), "findings": findings}
+        if prev_hash == h:
+            out["unchanged"] = True  # same sources as the last verify: same answer, not progress
+        shown = sum(len(x.get("lines") or [1]) for x in findings)
+        if len(pub["findings"]) > shown:
+            out["note"] = f"{len(pub['findings']) - shown} more findings not shown; fix these first."
+        return out
+
+    def _compact_findings(self, findings: List[Dict[str, Any]], cap: int = 12) -> List[Dict[str, Any]]:
+        """Errors first; 3+ findings with the same code and message pattern collapse into one entry with their lines;
+        untraced pins get the schematic line(s) that could justify them."""
+        order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
+        findings = sorted(findings, key=lambda f: order.get(f.get("severity"), 3))
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for f in findings:  # only findings that say the same thing collapse (pin numbers, line numbers and fact ids ignored)
+            shape = re.sub(r"\b(?:PA|GPIO|FACT-)?\d+\b", "#", str(f.get("message") or ""))
+            groups.setdefault((f.get("severity"), f.get("code"), f.get("file"), shape), []).append(f)
+        board = eda.load_board(self.project.root) if (self.project.root / "board.json").exists() else None
+        sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
+        out: List[Dict[str, Any]] = []
+        for (sev, code, file, _shape), fs in groups.items():
+            if len(fs) >= 3 and code not in ("UNSOURCED_CONSTANT", "FACT_VALUE_MISMATCH"):
+                out.append({"severity": sev, "code": code, "file": file, "lines": [f.get("line") for f in fs][:30],
+                            "message": f"{len(fs)}x: {str(fs[0].get('message'))[:200]}",
+                            "suggestion": str(fs[0].get("suggestion") or "")[:200]})
+                continue
+            for f in fs:
+                g = {k: v for k, v in f.items() if k in ("severity", "code", "file", "line", "message", "literal")}
+                g["suggestion"] = str(f.get("suggestion") or "")[:200]
+                m = re.fullmatch(r"PA?(\d{1,2})|GPIO(\d{1,2})", str(f.get("literal") or ""))
+                if board is not None and m and code in ("UNSOURCED_CONSTANT", "UNTAGGED_CONSTANT", "FACT_VALUE_MISMATCH"):
+                    gpio = int(next(x for x in m.groups() if x))
+                    lines = board.mcu_pin_lines(gpio)[:2]
+                    if lines and all(ln.rstrip().endswith("not connected") for ln in lines):
+                        g["suggestion"] = f"GPIO{gpio} is not connected on the schematic: remove this define."
+                    elif lines:
+                        g["board_lines"] = lines
+                        g["suggestion"] = (f"Only if this net is what the define drives: record_board_pins(pins=[{{define:"
+                                           f"'<DEFINE>', line:<a board_lines entry>}}]) (source {sid}); otherwise fix the pin.")
+                out.append(g)
+        return out[:cap]
 
     # ------------------------------------------------------------ control
     def set_plan(self, markdown: str) -> Dict[str, Any]:

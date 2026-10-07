@@ -1,6 +1,7 @@
 """Tool-calling LLM client for OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM) used by the agent loop."""
 
 import json
+import os
 import re
 import threading
 import time
@@ -99,15 +100,38 @@ class AgentLLM:
         self.base_url = p.base_url
         self.api_key = p.api_key
 
+    def sampling(self) -> Dict[str, float]:
+        """Nemotron reasoning models loop and repeat when run near-greedy. The Nemotron 3 model card samples at
+        temperature 1.0 / top_p 0.95; older Nemotron reasoning models at 0.6 / 0.95. Other models keep a low temperature.
+        EMBEDFORGE_TEMPERATURE / EMBEDFORGE_TOP_P override."""
+        mid = self.model.lower()
+        nemotron = "nemotron" in mid
+        default_t = (1.0 if re.search(r"nemotron-?3", mid) else 0.6) if nemotron else 0.1
+        out = {"temperature": config.agent_temperature if config.agent_temperature is not None else default_t}
+        top_p = config.agent_top_p if config.agent_top_p is not None else (0.95 if nemotron else None)
+        if top_p is not None:
+            out["top_p"] = top_p
+        return out
+
+    def default_max_tokens(self) -> int:
+        """Reasoning models spend thousands of tokens thinking before a config rewrite; give them room."""
+        if getattr(self, "_max_tokens_cap", None):
+            return self._max_tokens_cap
+        env = os.getenv("EMBEDFORGE_MAX_TOKENS")
+        if env and env.isdigit():
+            return int(env)
+        return 16384 if re.search(r"nemotron|reason|r1|qwq|thinking", self.model.lower()) else 8192
+
     def chat(
         self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None,
-        temperature: float = 0.1, max_tokens: int = 8192, retries: int = 4,
+        temperature: Optional[float] = None, max_tokens: Optional[int] = None, retries: int = 4,
     ) -> Dict[str, Any]:
         if not self.api_key:
             raise LLMError(f"{self.provider.name} API key is not configured; the agent cannot reason without an LLM.")
-        payload: Dict[str, Any] = {
-            "model": self.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
-        }
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages,
+                                   "max_tokens": max_tokens or self.default_max_tokens(), **self.sampling()}
+        if temperature is not None:
+            payload["temperature"] = temperature
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -121,14 +145,31 @@ class AgentLLM:
                     last = f"HTTP {r.status_code}: {r.text[:200]}"
                     time.sleep(min(2 ** attempt * 1.5, 20))
                     continue
+                if r.status_code == 400 and "max_tokens" in r.text and payload["max_tokens"] > 8192:
+                    self._max_tokens_cap = payload["max_tokens"] = 8192  # provider limit: remember it for this model
+                    continue
                 if r.status_code >= 400:
                     raise LLMError(f"LLM request failed ({self.model}): HTTP {r.status_code}: {r.text[:500]}")
                 data = r.json()
                 msg = data["choices"][0]["message"]
+                content = (msg.get("content") or "").strip()
+                reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                if "</think>" in content:  # some served models put their reasoning inline instead of a separate field
+                    head, _, content = content.rpartition("</think>")
+                    reasoning = (reasoning + "\n" + head.replace("<think>", "")).strip()
+                    content = content.strip()
+                elif content.startswith("<think>"):  # cut off mid-thought: all of it is reasoning, none of it an answer
+                    reasoning, content = (reasoning + "\n" + content[len("<think>"):]).strip(), ""
+                calls = []
+                for i, tc in enumerate(msg.get("tool_calls") or []):
+                    fn = tc.get("function") or {}
+                    a = fn.get("arguments")
+                    calls.append({"id": tc.get("id") or f"call_{int(time.time() * 1000)}_{i}", "type": "function",
+                                  "function": {"name": fn.get("name") or "", "arguments": a if isinstance(a, str) else json.dumps(a or {})}})
                 return {
-                    "content": (msg.get("content") or "").strip(),
-                    "reasoning": (msg.get("reasoning_content") or msg.get("reasoning") or "").strip(),
-                    "tool_calls": msg.get("tool_calls") or [],
+                    "content": content,
+                    "reasoning": reasoning,
+                    "tool_calls": calls,
                     "finish_reason": data["choices"][0].get("finish_reason"),
                     "usage": data.get("usage", {}),
                 }

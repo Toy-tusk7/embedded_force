@@ -36,6 +36,13 @@ class EmbedForgeConfig(BaseModel):
     agent_max_steps: int = Field(
         default_factory=lambda: int(os.getenv("EMBEDFORGE_MAX_STEPS", "60"))
     )
+    # Sampling for the agent LLM; empty = per-model default (reasoning models loop and repeat when run near-greedy)
+    agent_temperature: Optional[float] = Field(
+        default_factory=lambda: float(os.environ["EMBEDFORGE_TEMPERATURE"]) if os.getenv("EMBEDFORGE_TEMPERATURE") else None
+    )
+    agent_top_p: Optional[float] = Field(
+        default_factory=lambda: float(os.environ["EMBEDFORGE_TOP_P"]) if os.getenv("EMBEDFORGE_TOP_P") else None
+    )
     workspace_root: Path = Field(
         default_factory=lambda: Path(os.getenv("EMBEDFORGE_WORKSPACE", Path.cwd()))
     )

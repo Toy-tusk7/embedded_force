@@ -31,9 +31,13 @@ class ScriptedLLM:
         self.turns = list(turns)
         self.model = "test/scripted"
         self.provider = type("P", (), {"id": "test", "name": "Test"})()
+        self.seen: List[List[Dict[str, Any]]] = []   # the exact message lists the model was given
 
     def chat(self, messages, tools=None, **_):
+        self.seen.append(messages)
         turn = self.turns.pop(0) if self.turns else "done"
+        if isinstance(turn, dict):  # a full response (e.g. finish_reason='length')
+            return {"content": "", "reasoning": "", "tool_calls": [], "finish_reason": "stop", "usage": {}, **turn}
         if isinstance(turn, str):
             return {"content": turn, "reasoning": "", "tool_calls": [], "finish_reason": "stop", "usage": {}}
         return {"content": "", "reasoning": "", "tool_calls": turn, "finish_reason": "tool_calls", "usage": {}}
@@ -44,7 +48,7 @@ def project(tmp_path: Path) -> Project:
     return Project("t1", tmp_path / "t1")
 
 
-def _run(project: Project, turns: List[Any], monkeypatch) -> RunSession:
+def _run(project: Project, turns: List[Any], monkeypatch, message: str = "STM32F401 with an MPU6050 on I2C") -> RunSession:
     def fake_search(self, query, domains=None, max_results=3):
         src = self.add(f"https://invensense.tdk.com/{abs(hash(query))}.html", "MPU6050 map", DATASHEET)
         return [{"source_id": src.id, "title": src.title, "url": src.url, "tier": src.tier, "chars": src.chars, "snippet": ""}]
@@ -53,7 +57,8 @@ def _run(project: Project, turns: List[Any], monkeypatch) -> RunSession:
     session = RunSession("r1", project.id)
     runner = loop_mod.AgentRunner.__new__(loop_mod.AgentRunner)
     runner.project, runner.session, runner.llm = project, session, ScriptedLLM(turns)
-    runner.run("STM32F401 with an MPU6050 on I2C")
+    runner.run(message)
+    session.llm = runner.llm
     return session
 
 
@@ -113,8 +118,12 @@ def test_code_in_chat_without_a_build_is_sent_back(project, monkeypatch):
     msgs = [e["text"] for e in _events(session, "message")]
     assert len(msgs) == 2                                      # the run continued after the nudge
     assert any(g["kind"] == "unbuilt_code" for g in _events(session, "guard"))
-    convo = project.load_conversation()
-    assert any("[System Notice]" in m.get("content", "") and "code in chat" in m["content"] for m in convo if m["role"] == "user")
+    second_view = session.llm.seen[1]
+    assert any("[System Notice]" in str(m.get("content")) and "code in chat" in m["content"] for m in second_view if m["role"] == "user")
+    # harness notices are shown to the model but never saved, and never become 'user statements'
+    assert not any("[System Notice]" in str(m.get("content")) for m in project.load_conversation())
+    user_src = SourceStore(project.root).get(SourceStore(project.root)._by_url["user://conversation"])
+    assert "System Notice" not in user_src.text and "MPU6050" in user_src.text
 
 
 def test_identical_read_only_calls_are_stopped(project, monkeypatch):
@@ -133,7 +142,9 @@ def test_read_file_is_windowed_for_long_files(project):
     assert first["start"] == 1 and first["end"] < 400 and "start=" in first["note"]
     nxt = belt.read_file("src/big.h", start=first["end"] + 1)
     assert nxt["text"].startswith(f"{first['end'] + 1}: #define X{first['end']}")
-    assert belt.call("read_file", {"path": "src/big.h", "line": 3})["error"].endswith("Its parameters are: (path, start?, end?).")
+    tolerant = belt.call("read_file", {"path": "src/big.h", "line": 3})   # unknown extras are dropped and reported
+    assert tolerant["start"] == 1 and tolerant["ignored_args"] == ["line"]
+    assert belt.call("read_file", {"line": 3})["error"].endswith("Its parameters are: (path, start?, end?).")
 
 
 def test_unbuilt_code_problem_rules():

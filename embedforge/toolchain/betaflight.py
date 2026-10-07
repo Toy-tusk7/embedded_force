@@ -8,10 +8,11 @@ CMake is fetched into the user's home so no sudo is needed. Nothing is installed
 
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from embedforge.core.logger import logger
 from embedforge.toolchain import wsl
@@ -32,6 +33,21 @@ def available_targets() -> List[str]:
     """In-tree MCU targets of the pinned checkout (what FC_TARGET_MCU may name), e.g. RP2350B, STM32F405."""
     code, lines, _ = wsl.run(targets_script(), None, 120)
     return sorted({ln.strip() for ln in lines if _TARGET_RE.match(ln.strip())}) if code == 0 else []
+
+
+def target_for_part(part: str, targets: List[str]) -> Optional[str]:
+    """The in-tree target for an MCU name or full part number: exact target, RP2354A/B (RP2350 with stacked flash)
+    -> RP2350A/B, or the longest target that prefixes the part (STM32F405RGT6 -> STM32F405)."""
+    p = re.sub(r"[^A-Z0-9]", "", (part or "").upper())
+    if not p:
+        return None
+    if p in targets:
+        return p
+    rp = re.fullmatch(r"RP235([04])([AB])\w*", p)
+    if rp and f"RP2350{rp.group(2)}" in targets:
+        return f"RP2350{rp.group(2)}"
+    pref = [t for t in targets if p.startswith(t) and len(t) >= 6]
+    return max(pref, key=len) if pref else None
 
 
 def setup_script() -> str:
@@ -202,8 +218,256 @@ def _bytes(n: str, unit: str) -> int:
     return int(n) * {"B": 1, "KB": 1024, "MB": 1024 * 1024, "GB": 1024 ** 3}[unit.upper()]
 
 
+_LINT_DEFINE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\b[ \t]*(.*?)\s*$")
+_LINT_TAG = re.compile(r"FACT-[^\s*/,;)]+")
+
+
+def _strip_c_comments(text: str) -> List[str]:
+    """Per-line code with /* */ and // comments removed (keeps line numbering)."""
+    out, in_block = [], False
+    for raw in text.split("\n"):
+        code, i = "", 0
+        while i < len(raw):
+            if in_block:
+                end = raw.find("*/", i)
+                if end < 0:
+                    i = len(raw)
+                else:
+                    in_block, i = False, end + 2
+            elif raw.startswith("/*", i):
+                in_block, i = True, i + 2
+            elif raw.startswith("//", i):
+                break
+            else:
+                code += raw[i]
+                i += 1
+        out.append(code)
+    return out
+
+
+def lint_config(text: str, board: str, target: str) -> Dict[str, List[str]]:
+    """Cheap checks on a Betaflight config.h before running make. 'errors' would certainly fail the build."""
+    errors: List[str] = []
+    warnings: List[str] = []
+    code = _strip_c_comments(text)
+    depth, opened = 0, []
+    defines: Dict[str, Tuple[str, int]] = {}
+    gpio_users: Dict[str, List[str]] = {}
+    for n, line in enumerate(code, start=1):
+        s = line.strip()
+        if re.match(r"#\s*if(n?def)?\b", s):
+            depth += 1
+            opened.append(n)
+        elif re.match(r"#\s*endif\b", s):
+            if depth == 0:
+                errors.append(f"line {n}: #endif without a matching #if (configs use '#pragma once', not include guards)")
+            else:
+                depth -= 1
+                opened.pop()
+        m = _LINT_DEFINE.match(line)
+        if m:
+            name, value = m.group(1), m.group(2).strip()
+            if name in defines and defines[name][0] != value:
+                warnings.append(f"line {n}: {name} redefined ('{defines[name][0]}' on line {defines[name][1]}, now '{value}')")
+            defines[name] = (value, n)
+            pm = re.fullmatch(r"PA(\d{1,2})", value)
+            if name.endswith("_PIN") and pm:
+                gpio_users.setdefault(pm.group(1), []).append(name)
+    for n in opened:
+        errors.append(f"line {n}: #if/#ifdef without a matching #endif")
+    if "HSE_VALUE" in defines:
+        errors.append(f"line {defines['HSE_VALUE'][1]}: do not define HSE_VALUE in a config (the target's build sets it"
+                      + ("" if (target or "").startswith("RP") else "; an external crystal is declared with SYSTEM_HSE_MHZ") + ")")
+    if "ADC_ESC_CURRENT_PIN" in defines:
+        errors.append(f"line {defines['ADC_ESC_CURRENT_PIN'][1]}: ADC_ESC_CURRENT_PIN is not a Betaflight define; the "
+                      "current-sensor ADC input is ADC_CURR_PIN")
+    for name, (value, n) in defines.items():  # an instance needs that bus's pins
+        im = re.fullmatch(r"\(?(SPI|I2CDEV_)(\d)\)?", value)
+        if not im or not name.endswith(("_SPI_INSTANCE", "_I2C_INSTANCE")):
+            continue
+        bus = f"SPI{im.group(2)}" if im.group(1) == "SPI" else f"I2C{im.group(2)}"
+        need = ["SCK", "SDI", "SDO"] if bus.startswith("SPI") else ["SDA", "SCL"]
+        missing = [f"{bus}_{p}_PIN" for p in need if f"{bus}_{p}_PIN" not in defines]
+        if missing:
+            errors.append(f"line {n}: {name} is {value}, but {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not "
+                          f"defined — use the bus whose pins you defined")
+    tgt = defines.get("FC_TARGET_MCU", ("", 0))[0]
+    if not tgt:
+        errors.append(f"missing '#define FC_TARGET_MCU {target}'")
+    elif target and tgt != target:
+        errors.append(f"line {defines['FC_TARGET_MCU'][1]}: FC_TARGET_MCU is {tgt}, but this project's target is {target}")
+    bn = defines.get("BOARD_NAME", ("", 0))[0]
+    if not bn:
+        errors.append(f"missing '#define BOARD_NAME {board}'")
+    elif board and bn != board:
+        errors.append(f"line {defines['BOARD_NAME'][1]}: BOARD_NAME is {bn}, but the config directory is {board}")
+    if not defines.get("MANUFACTURER_ID"):
+        errors.append(f"missing '#define MANUFACTURER_ID {MANUFACTURER_ID}'")
+    for name, (value, n) in defines.items():  # bus instances are enum values, not peripheral names
+        if name.endswith("_I2C_INSTANCE") and not re.fullmatch(r"\(?I2CDEV_\d\)?", value):
+            fix = re.sub(r"^\(?I2C(\d)\)?$", r"I2CDEV_\1", value)
+            errors.append(f"line {n}: {name} is '{value}', but I2C instances are I2CDEV_n" + (f" (here {fix})" if fix != value else ""))
+        elif name.endswith("_SPI_INSTANCE") and not re.fullmatch(r"\(?SPI\d\)?", value):
+            errors.append(f"line {n}: {name} is '{value}', but SPI instances are SPIn (e.g. SPI0)")
+    if not re.search(r"^\s*#\s*pragma\s+once\b", text, re.M):
+        warnings.append("no '#pragma once' at the top (every Betaflight config starts with it)")
+    bad_tags: Dict[str, List[int]] = {}
+    for n, raw in enumerate(text.split("\n"), start=1):
+        for tag in _LINT_TAG.findall(raw):
+            tag = tag.rstrip(":;,.")
+            if not re.fullmatch(r"FACT-\d{3,}", tag):
+                bad_tags.setdefault(tag, []).append(n)
+    for tag, lines in bad_tags.items():  # compiles fine, but verify rejects it: warn now, don't block the build
+        where = ", ".join(map(str, lines[:8])) + (f" (+{len(lines) - 8} more)" if len(lines) > 8 else "")
+        warnings.append(f"line{'s' if len(lines) > 1 else ''} {where}: '{tag}' is not a fact id — use the FACT-nnn ids "
+                        "record_board_pins/record_fact returned (verify fails on it)")
+    for gpio, names in gpio_users.items():
+        if len(names) > 1:
+            warnings.append(f"PA{gpio} is used by {', '.join(names)}")
+    return {"errors": errors, "warnings": warnings}
+
+
+_KNOWN_NAMES: Dict[str, bool] = {}   # define name -> referenced by the pinned Betaflight source (fixed per release)
+_ALWAYS_KNOWN = {"FC_TARGET_MCU", "BOARD_NAME", "MANUFACTURER_ID"}
+
+
+def unknown_defines(names: List[str]) -> Optional[List[str]]:
+    """Names that no Betaflight source file references (so defining them has no effect), e.g. MOTOR0_PIN or
+    USE_GYRO_BMI270. None when the source cannot be searched."""
+    todo = sorted({n for n in names if n not in _KNOWN_NAMES and n not in _ALWAYS_KNOWN
+                   and re.fullmatch(r"[A-Z][A-Z0-9_]{2,63}", n)})
+    if todo:
+        args = " ".join(f"-e {n}" for n in todo)
+        # src/main + src/platform + mk: the code that consumes config defines (not src/config, other boards' configs)
+        code, lines, _ = wsl.run(f"cd {BF_DIR} && grep -rhowF --include=*.c --include=*.h --include=*.mk {args} "
+                                 f"src/main src/platform mk 2>/dev/null | sort -u", None, 180)
+        if code not in (0, 1):
+            return None
+        found = {ln.strip() for ln in lines}
+        for n in todo:
+            _KNOWN_NAMES[n] = n in found
+    return [n for n in names if n not in _ALWAYS_KNOWN and _KNOWN_NAMES.get(n) is False]
+
+
+_FLASH_PART = re.compile(r"W25|GD25|M25P|IS25|MX25|AT25|XT25|BY25|ZD25", re.I)
+_SD_PART = re.compile(r"\bSD\b|SD-?CARD|MICRO\s*SD|\bTF\b|TF-?CARD", re.I)
+
+
+def board_consistency(text: str, board: Any) -> List[Tuple[str, str, int, str, str]]:
+    """Config claims the schematic contradicts (verify ERRORs): one GPIO driving two defines, and storage devices the
+    board does not have (typical when a reference config's hardware is copied)."""
+    out: List[Tuple[str, str, int, str, str]] = []
+    users: Dict[str, List[Tuple[str, int]]] = {}
+    defines: Dict[str, int] = {}
+    for n, line in enumerate(_strip_c_comments(text), start=1):
+        m = re.match(r"\s*#\s*define\s+(\w+)(?:\s+(\S+))?", line)
+        if not m:
+            continue
+        defines.setdefault(m.group(1), n)
+        pm = re.fullmatch(r"PA(\d{1,2})", m.group(2) or "")
+        if m.group(1).endswith("_PIN") and pm:
+            users.setdefault(pm.group(1), []).append((m.group(1), n))
+    for gpio, names in users.items():
+        if len({x for x, _ in names}) > 1:
+            out.append(("ERROR", "PIN_USED_TWICE", names[1][1], f"PA{gpio} is used by {', '.join(x for x, _ in names)}.",
+                        "One GPIO drives one function: keep the define its schematic net belongs to and remove the others."))
+    if board is None:
+        return out
+    parts = " ".join(f"{p.value} {p.mpn} {p.footprint}" for p in board.parts.values())
+    norm_parts = re.sub(r"[^A-Z0-9 ]", "", parts.upper())
+    flash = [d for d in defines if d.startswith("USE_FLASH_") or d == "FLASH_CS_PIN"]
+    if flash and not _FLASH_PART.search(parts):
+        out.append(("ERROR", "DEVICE_NOT_ON_BOARD", defines[flash[0]], f"{flash[0]} enables an SPI flash chip, but the schematic has none.",
+                    "Remove the flash defines (and BLACKBOX_DEVICE_FLASH); they were probably copied from a reference config."))
+    if "BLACKBOX_DEVICE_SDCARD" in text and not _SD_PART.search(parts):
+        out.append(("ERROR", "DEVICE_NOT_ON_BOARD", 0, "BLACKBOX_DEVICE_SDCARD is set, but the schematic has no SD socket.",
+                    "Remove the SD card blackbox setting."))
+    # chip drivers: USE_ACCGYRO_BMI270, USE_BARO_BMP388, USE_GYRO_SPI_ICM42688P, USE_MAX7456 ... need that chip on the board
+    for d, n in defines.items():
+        m = re.fullmatch(r"USE_(?:ACCGYRO|ACC|GYRO|BARO|MAG|FLASH)(?:_SPI|_I2C)?_([A-Z][A-Z0-9]{3,})", d)
+        chip = m.group(1) if m else ("MAX7456" if d == "USE_MAX7456" else "")
+        if not chip or chip in ("CHIP", "SPI", "I2C") or (m and d.startswith("USE_FLASH")):
+            continue
+        alts = {chip[:6]} | ({"AT7456"} if chip == "MAX7456" else set())
+        if not any(a in norm_parts.replace(" ", "") for a in alts):
+            out.append(("ERROR", "DEVICE_NOT_ON_BOARD", n, f"{d} enables a {chip}, but no such chip is on the schematic.",
+                        "Enable only drivers for chips on this board (check the Parts list); remove this define."))
+    # bus <-> device: a device's chip select and its bus clock must reach the same chip
+    def gpio_of(name: str) -> Optional[int]:
+        m = re.search(rf"^\s*#\s*define\s+{name}\s+PA(\d{{1,2}})\b", text, re.M)
+        return int(m.group(1)) if m else None
+
+    def devices(gpio: Optional[int]) -> set:
+        if gpio is None:
+            return set()
+        _, refs = board.gpio_net(gpio)
+        return {r for r in refs if not re.match(r"^(R|C|L|FB|TP)\d", r, re.I)}
+
+    for dev, cs_name, inst_name in (("gyro", "GYRO_1_CS_PIN", "GYRO_1_SPI_INSTANCE"), ("gyro 2", "GYRO_2_CS_PIN", "GYRO_2_SPI_INSTANCE"),
+                                    ("SD card", "SDCARD_SPI_CS_PIN", "SDCARD_SPI_INSTANCE"),
+                                    ("OSD", "MAX7456_SPI_CS_PIN", "MAX7456_SPI_INSTANCE"), ("flash", "FLASH_CS_PIN", "FLASH_SPI_INSTANCE")):
+        im = re.search(rf"^\s*#\s*define\s+{inst_name}\s+\(?SPI(\d)\)?", text, re.M)
+        if not im:
+            continue
+        cs = gpio_of(cs_name)
+        if cs is None:
+            if dev == "SD card" or dev == "gyro":
+                out.append(("ERROR", "BUS_DEVICE_MISMATCH", defines.get(inst_name, 0), f"{inst_name} is set but {cs_name} is not defined.",
+                            f"Define {cs_name} with the {dev}'s chip-select pin from the schematic, or remove the {dev}."))
+            continue
+        on_cs, on_sck = devices(cs), devices(gpio_of(f"SPI{im.group(1)}_SCK_PIN"))
+        if on_cs and not (on_cs & on_sck):
+            out.append(("ERROR", "BUS_DEVICE_MISMATCH", defines.get(inst_name, 0),
+                        f"{cs_name} PA{cs} goes to {', '.join(sorted(on_cs))}, but SPI{im.group(1)}_SCK_PIN does not reach that part.",
+                        f"Use the SPI bus whose SCK/SDI/SDO pins are wired to {', '.join(sorted(on_cs))} for {inst_name}."))
+    if "USE_SDCARD" in defines and "SDCARD_SPI_INSTANCE" not in defines:
+        out.append(("ERROR", "BUS_DEVICE_MISMATCH", defines["USE_SDCARD"], "USE_SDCARD is set without SDCARD_SPI_INSTANCE and SDCARD_SPI_CS_PIN.",
+                    "Give the SD card its bus and chip select from the schematic, or remove USE_SDCARD."))
+    # wired MCU pins the config does not use (a warning: the finish summary must say what was left out and why)
+    used = {int(g) for g in users}
+    unused = []
+    for m in board.mcus()[:1]:
+        for pin in m.pins.values():
+            g = re.match(r"GPIO(\d+)", pin.name or "", re.I)
+            if g and pin.net and int(g.group(1)) not in used:
+                net, refs = board.gpio_net(int(g.group(1)))
+                real = [r for r in refs if not re.match(r"^(R|C|L|FB)\d", r, re.I)]
+                if real:
+                    unused.append(f"GPIO{int(g.group(1))} ({net} -> {', '.join(real[:3])})")
+    if unused:
+        out.append(("WARNING", "WIRED_PIN_UNUSED", 0, f"Wired MCU pins not used by the config: {'; '.join(sorted(unused)[:16])}.",
+                    "Configure each function the board wires (e.g. GYRO_1_EXTI_PIN, ADC_CURR_PIN, SD card pins), or say in the "
+                    "finish summary why it is left out."))
+    return out
+
+
+def pin_summary(text: str) -> List[str]:
+    """'NAME = PAn [FACT-nnn]' for each pin define, so the model can see its pin map without re-reading the file."""
+    out = []
+    for raw in text.split("\n"):
+        m = re.match(r"\s*#\s*define\s+(\w+_PIN)\s+(PA\d+|NONE)\b(.*)", raw)
+        if m:
+            tags = re.findall(r"FACT-\d{3,}", m.group(3))
+            out.append(f"{m.group(1)} = {m.group(2)}" + (f" [{', '.join(tags)}]" if tags else " [untagged]"))
+    return out
+
+
+_BUILD_LOCK = threading.Lock()  # one checkout: concurrent makes would share obj/ and the config symlinks
+
+
 def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 3600, board_hint: str = "") -> BFResult:
-    """Build the project's Betaflight config in WSL and copy the outputs into the project."""
+    """Build the project's Betaflight config in WSL and copy the outputs into the project (serialised)."""
+    if not _BUILD_LOCK.acquire(blocking=False):
+        if on_line:
+            on_line("Another Betaflight build is running — waiting for it to finish…")
+        _BUILD_LOCK.acquire()
+    try:
+        return _build(project_dir, on_line, timeout_s, board_hint)
+    finally:
+        _BUILD_LOCK.release()
+
+
+def _build(project_dir: Path, on_line: LineSink, timeout_s: int, board_hint: str) -> BFResult:
     t0 = time.time()
     project_dir = Path(project_dir).resolve()
     files = config_files(project_dir)
@@ -214,6 +478,16 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 3600, bo
     if not wsl.safe_name(board):
         return BFResult(ok=False, board=board, error="Board name must be letters, digits, '_' or '-'.")
     target = config_target(files[0])
+    lint = lint_config(files[0].read_text(encoding="utf-8", errors="ignore"), board, target)
+    if lint["errors"]:
+        from embedforge.toolchain.pio import Diagnostic
+        rel = str(files[0].relative_to(project_dir)).replace("\\", "/")
+        diags = []
+        for e in lint["errors"]:
+            m = re.match(r"line (\d+): (.*)", e)
+            diags.append(Diagnostic("error", rel, int(m.group(1)) if m else 0, m.group(2) if m else e))
+        return BFResult(ok=False, board=board, target=target, diagnostics=diags,
+                        error="Config check failed before make (no build was run).")
     ok, detail = wsl.available()
     if not ok:
         return BFResult(ok=False, board=board, target=target, error=detail)

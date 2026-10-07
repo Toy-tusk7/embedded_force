@@ -21,6 +21,7 @@ GENERIC_OK = {0x00, 0x01, 0x02, 0x03, 0x04, 0x07, 0x0F, 0x10, 0x1F, 0x3F, 0x7F, 
 
 _HEX_RE = re.compile(r"\b0[xX][0-9A-Fa-f]+[uUlL]*\b")
 _FACT_TAG_RE = re.compile(r"FACT-\d{3,}")
+_BAD_TAG_RE = re.compile(r"\bFACT(?:[-_]|(?=\d))[A-Za-z0-9_-]*[A-Za-z0-9]")  # anything shaped like a tag attempt
 _DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$")
 _HW_NAME_RE = re.compile(r"(ADDR|REG|WHO_?AM_?I|CHIP_?ID|DEVICE_?ID|_ID\b|OPCODE|_CMD\b)", re.I)
 # Pin assignments are wiring claims: they must trace to the schematic or the user (e.g. #define GYRO_CS_PIN 14).
@@ -196,6 +197,12 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                 fact = ledger.get(fid)
                 if fact is None:
                     report.findings.append(Finding("ERROR", "UNKNOWN_FACT_TAG", rel, ln, f"{fid} is not in the Fact Ledger.", suggestion="Record the fact with record_fact first."))
+            for bad in _BAD_TAG_RE.findall(comment):
+                if not _FACT_TAG_RE.fullmatch(bad):  # e.g. FACT-SRC001, FACT_12, FACT-7: looks like a tag, cites nothing
+                    report.findings.append(Finding(
+                        "ERROR", "MALFORMED_FACT_TAG", rel, ln,
+                        f"'{bad}' is not a fact id. Fact ids look like FACT-001 and come from record_fact results.",
+                        suggestion="Replace it with the FACT-nnn id that record_fact returned (list_facts shows them)."))
 
             for lit, n, name, is_pin in candidates:
                 # small "generic" values (masks, 0/1) are skipped unless they name hardware (e.g. #define CTRL_REG 0x01)
@@ -233,10 +240,28 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                         "ERROR", "UNSOURCED_CONSTANT", rel, ln,
                         f"Constant {lit}" + (f" ({name})" if name else "") + " has no supporting fact in the ledger.",
                         literal=lit,
-                        suggestion="Research it (web_search/fetch_document/read_source), record_fact with a verbatim quote, "
-                        "then annotate the line with /* FACT-nnn */. If it is unknown, ask the user.",
+                        suggestion=("Find the pin in the schematic (query_board), record_fact with the exact board line as "
+                                    "the quote and value='GPIO<n>', then add /* FACT-nnn */ on this line. If the schematic "
+                                    "does not have it, remove the line or ask the user." if is_pin else
+                                    "Research it (web_search/fetch_document/read_source), record_fact with a verbatim quote, "
+                                    "then annotate the line with /* FACT-nnn */. If it is unknown, ask the user."),
                     ))
                     continue
+                if is_pin:
+                    qp = quote_pins(match.quote)
+                    if qp and n not in qp:  # the quote is about another pin (e.g. value GPIO4 quoted from a GPIO41 line)
+                        report.findings.append(Finding(
+                            "ERROR", "FACT_QUOTE_PIN_MISMATCH", rel, ln,
+                            f"{lit} is {n}, but the quote of {match.id} names {', '.join(sorted(qp))}.", literal=lit,
+                            suggestion="Cite a fact whose board line is for this pin."))
+                        continue
+                    if re.fullmatch(r"[A-Z][A-Z0-9_]*_PIN", match.property) and name and match.property != name:
+                        report.findings.append(Finding(
+                            "ERROR", "FACT_DEFINE_MISMATCH", rel, ln,
+                            f"{name} cites {match.id}, which was recorded for {match.property}.", literal=lit,
+                            suggestion=f"record_board_pins with define='{name}' and this pin's board line (add replace: true if "
+                                       f"{name} was recorded for another pin), or cite the right fact."))
+                        continue
                 justified += 1
                 used_facts[match.id] = used_facts.get(match.id, 0) + 1
                 report.traceability.append({
