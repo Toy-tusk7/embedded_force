@@ -430,3 +430,10 @@ def test_replace_retires_a_pin_fact_bound_to_the_wrong_define(project):
     assert int(new.split("-")[1]) > int(old.split("-")[1])                       # ids are never reused
     retired = json.loads((project.root / "ledger_retired.json").read_text(encoding="utf-8"))
     assert retired[0]["id"] == old and "re-recorded" in retired[0]["retired_reason"]
+
+def test_build_script_isolates_projects_that_share_a_board_name():
+    s = betaflight.build_script("/mnt/c/p2/betaflight", "RP2354B", "RP2350B")
+    guard = s.index("built from another project")
+    assert s.index("rm -rf obj/main/RP2350B_RP2354B") > guard and s.index("make CONFIG=") > s.index(".embedforge_config_dir")
+    assert "rm -f obj/main/betaflight_RP2350B_RP2354B.elf" in s                     # always relink: fresh outputs only
+    assert f"obj/betaflight_{betaflight.BF_TAG}_RP2350B_RP2354B.uf2" in s and "obj/*_RP2354B.uf2" not in s

@@ -35,6 +35,40 @@ def available_targets() -> List[str]:
     return sorted({ln.strip() for ln in lines if _TARGET_RE.match(ln.strip())}) if code == 0 else []
 
 
+def explain_undefined(symbols: List[str], limit: int = 3) -> Dict[str, str]:
+    """For linker 'undefined reference to X': where X is defined in the Betaflight source and which #if guards it,
+    e.g. 'pico_msc_active is defined in src/platform/PICO/usb/usb_msc_pico.c:135 only under #ifdef USE_USB_MSC'."""
+    syms = [s for s in dict.fromkeys(symbols) if re.fullmatch(r"[A-Za-z_]\w{2,80}", s)][:limit]
+    if not syms:
+        return {}
+    pat = "|".join(syms)
+    code, lines, _ = wsl.run(f"cd {BF_DIR} && grep -rnwE --include=*.c '({pat})' src/main src/platform 2>/dev/null "
+                             f"| grep -vE ':[0-9]+:\\s*(extern|//|\\*)' | head -40", None, 120)
+    out: Dict[str, str] = {}
+    for ln in lines if code in (0, 1) else []:
+        m = re.match(r"([^:]+):(\d+):(.*)$", ln)
+        if not m:
+            continue
+        path, num, src = m.group(1), int(m.group(2)), m.group(3)
+        sym = next((s for s in syms if s not in out and re.match(rf"^\w[\w\s\*]*\b{s}\s*(\(|=|;|\[)", src.strip())), None)
+        if not sym:
+            continue
+        c2, head, _ = wsl.run(f"cd {BF_DIR} && sed -n '1,{num}p' {wsl.q(path)}", None, 60)
+        stack: List[str] = []
+        for h in head if c2 == 0 else []:
+            hs = h.strip()
+            if re.match(r"#\s*if", hs):
+                stack.append(hs)
+            elif re.match(r"#\s*endif", hs) and stack:
+                stack.pop()
+            elif re.match(r"#\s*el(se|if)", hs) and stack:
+                stack[-1] = f"{stack[-1]} … {hs}"
+        guard = " and ".join(stack[-2:])  # the innermost conditions are the ones a config switches
+        out[sym] = (f"{sym} is defined in {path}:{num}" + (f" only under {guard}" if guard else "")
+                    + (" — your config must not #undef/omit that" if guard else ""))
+    return out
+
+
 def target_for_part(part: str, targets: List[str]) -> Optional[str]:
     """The in-tree target for an MCU name or full part number: exact target, RP2354A/B (RP2350 with stacked flash)
     -> RP2350A/B, or the longest target that prefixes the part (STM32F405RGT6 -> STM32F405)."""
@@ -125,14 +159,31 @@ def read_file(path: str, start: int = 1, end: int = 160) -> Optional[Dict[str, A
             "text": "\n".join(f"{start + i}: {t}" for i, t in enumerate(body))}
 
 
-def build_script(config_dir_wsl: str, board: str) -> str:
+def build_script(config_dir_wsl: str, board: str, target: str = "") -> str:
+    """One shared checkout serves every project, and its objects are keyed by board name only. So: objects built from
+    another project's config are wiped first (make's dependency files point at THAT project's config.h and would
+    happily reuse them), and previous firmware outputs are deleted so only this make's results can be copied back."""
+    objdir = f"obj/main/{target}_{board}" if target else ""
+    stamp = f"{objdir}/.embedforge_config_dir" if objdir else ""
+    guard = (f"""if [ -d {wsl.q(objdir)} ] && [ "$(cat {wsl.q(stamp)} 2>/dev/null)" != {wsl.q(config_dir_wsl)} ]; then
+  echo "== Objects for {board} were built from another project: cleaning them"
+  rm -rf {wsl.q(objdir)}
+fi
+rm -f obj/main/betaflight_{target}_{board}.elf obj/main/betaflight_{target}_{board}.map obj/betaflight_{BF_TAG}_{target}_{board}.*
+mkdir -p {wsl.q(objdir)} && printf %s {wsl.q(config_dir_wsl)} > {wsl.q(stamp)}
+""" if objdir else "")
+    # exact output names: a glob like obj/*_RP2354B.uf2 would also match another project's ..._CUSTOM_RP2354B.uf2
+    outs = (f'"$PWD"/obj/betaflight_{BF_TAG}_{target}_{board}.uf2 "$PWD"/obj/betaflight_{BF_TAG}_{target}_{board}.hex '
+            f'"$PWD"/obj/betaflight_{BF_TAG}_{target}_{board}.bin' if target else
+            f'"$PWD"/obj/*_{board}.uf2 "$PWD"/obj/*_{board}.hex "$PWD"/obj/*_{board}.bin')
+    elf = f'"$PWD"/obj/main/betaflight_{target}_{board}.elf' if target else f'"$PWD"/obj/main/*_{board}.elf'
     return f"""set -e
 export PATH={TOOLS}/cmake-{CMAKE_VERSION}-linux-x86_64/bin:$PATH
 cd {BF_DIR}
-make CONFIG={wsl.q(board)} CONFIG_DIR={wsl.q(config_dir_wsl)} -j"$(nproc)"
+{guard}make CONFIG={wsl.q(board)} CONFIG_DIR={wsl.q(config_dir_wsl)} -j"$(nproc)"
 echo "== OUTPUTS"
-ls -1 "$PWD"/obj/*_{board}.uf2 "$PWD"/obj/*_{board}.hex "$PWD"/obj/*_{board}.bin 2>/dev/null || true
-ls -1 "$PWD"/obj/main/*_{board}.elf 2>/dev/null || true
+ls -1 {outs} 2>/dev/null || true
+ls -1 {elf} 2>/dev/null || true
 """
 
 
@@ -309,6 +360,10 @@ def lint_config(text: str, board: str, target: str) -> Dict[str, List[str]]:
             errors.append(f"line {n}: {name} is '{value}', but I2C instances are I2CDEV_n" + (f" (here {fix})" if fix != value else ""))
         elif name.endswith("_SPI_INSTANCE") and not re.fullmatch(r"\(?SPI\d\)?", value):
             errors.append(f"line {n}: {name} is '{value}', but SPI instances are SPIn (e.g. SPI0)")
+    undefs = re.findall(r"^\s*#\s*undef\s+(USE_\w+)", text, re.M)
+    if undefs:
+        warnings.append(f"#undef {', '.join(sorted(set(undefs))[:8])}: removing features the target enables often breaks the "
+                        "link (e.g. USE_USB_MSC). Only #undef what a reference config for this target also removes.")
     if not re.search(r"^\s*#\s*pragma\s+once\b", text, re.M):
         warnings.append("no '#pragma once' at the top (every Betaflight config starts with it)")
     bad_tags: Dict[str, List[int]] = {}
@@ -498,7 +553,7 @@ def _build(project_dir: Path, on_line: LineSink, timeout_s: int, board_hint: str
                               + (", ".join(known) or "(run Betaflight setup first)"))
     if on_line:
         on_line(f"$ make CONFIG={board}   (Betaflight {BF_TAG}, target {target}, in WSL)")
-    code, lines, timed_out = wsl.run(build_script(wsl.to_wsl_path(str(project_dir / "betaflight")), board), on_line, timeout_s)
+    code, lines, timed_out = wsl.run(build_script(wsl.to_wsl_path(str(project_dir / "betaflight")), board, target), on_line, timeout_s)
     res = BFResult(ok=code == 0 and not timed_out, board=board, target=target, duration_s=round(time.time() - t0, 1))
     res.diagnostics = parse_diagnostics(lines)
     proj_wsl = wsl.to_wsl_path(str(project_dir)).rstrip("/") + "/"
@@ -516,6 +571,13 @@ def _build(project_dir: Path, on_line: LineSink, timeout_s: int, board_hint: str
             elif not res.ram_total:
                 res.ram_used, res.ram_total = used, total
     res.log_tail = "\n".join(lines[-60:])
+    undefined = [m.group(1) for d in res.diagnostics for m in [re.search(r"undefined reference to `([^']+)'", d.message)] if m]
+    if undefined:  # linker errors have no source line: say where the symbol lives and what guards it
+        why = explain_undefined(undefined)
+        for d in res.diagnostics:
+            m = re.search(r"undefined reference to `([^']+)'", d.message)
+            if m and m.group(1) in why:
+                d.message = f"{d.message} [{why[m.group(1)]}]"
     if timed_out:
         res.error = f"Build timed out after {timeout_s}s."
     if res.ok:
