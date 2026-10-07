@@ -117,6 +117,25 @@ def test_code_in_chat_without_a_build_is_sent_back(project, monkeypatch):
     assert any("[System Notice]" in m.get("content", "") and "code in chat" in m["content"] for m in convo if m["role"] == "user")
 
 
+def test_identical_read_only_calls_are_stopped(project, monkeypatch):
+    turns = [[_call(i, "list_files", {})] for i in range(4)] + ["ok"]
+    session = _run(project, turns, monkeypatch)
+    oks = [r["ok"] for r in _events(session, "tool_result")]
+    assert oks == [True, True, False, False]
+    assert any(g["kind"] == "identical_call" for g in _events(session, "guard"))
+
+
+def test_read_file_is_windowed_for_long_files(project):
+    store = SourceStore(project.root)
+    belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
+    belt.write_file("src/big.h", "\n".join(f"#define X{i} {i}  /* padding padding padding padding */" for i in range(400)))
+    first = belt.read_file("src/big.h")
+    assert first["start"] == 1 and first["end"] < 400 and "start=" in first["note"]
+    nxt = belt.read_file("src/big.h", start=first["end"] + 1)
+    assert nxt["text"].startswith(f"{first['end'] + 1}: #define X{first['end']}")
+    assert belt.call("read_file", {"path": "src/big.h", "line": 3})["error"].endswith("Its parameters are: (path, start?, end?).")
+
+
 def test_unbuilt_code_problem_rules():
     assert loop_mod.unbuilt_code_problem("```bash\ncmake -B build\nninja -C build\n```", built=False)
     assert loop_mod.unbuilt_code_problem("```bash\ncmake -B build\n```", built=True) is None

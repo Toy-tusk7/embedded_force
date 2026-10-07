@@ -86,7 +86,8 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         {"path": S, "content": S}, ["path", "content"]),
     _fn("replace_in_file", "Replace an exact text snippet in a project file (must match exactly once).",
         {"path": S, "old": S, "new": S}, ["path", "old", "new"]),
-    _fn("read_file", "Read a project file.", {"path": S}, ["path"]),
+    _fn("read_file", "Read a project file as numbered lines (long files come in windows; pass start/end for more).",
+        {"path": S, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
     _fn("list_files", "List project files.", {}, []),
     _fn("build",
         "Run a REAL PlatformIO compile + link for the project. Returns structured compiler diagnostics, flash/RAM "
@@ -208,9 +209,11 @@ class ToolBelt:
         if h is None:
             return {"error": f"Unknown tool '{name}'. Available: {', '.join(self._handlers)}"}
         try:
-            return _truncate(h(**args))
+            return _truncate(h(**args), limit=14000 if name == "query_board" else 7000)
         except TypeError as e:
-            return {"error": f"Bad arguments for {name}: {e}"}
+            spec = next((t["function"]["parameters"] for t in TOOL_SPECS if t["function"]["name"] == name), {})
+            params = ", ".join(f"{k}{'' if k in spec.get('required', []) else '?'}" for k in spec.get("properties", {}))
+            return {"error": f"Bad arguments for {name}: {e}. Its parameters are: ({params or 'none'})."}
         except Exception as e:  # tools must never crash the loop
             return {"error": f"{type(e).__name__}: {e}"}
 
@@ -318,6 +321,16 @@ class ToolBelt:
         targets = betaflight.available_targets()
         if target not in targets:
             return {"error": f"'{target}' is not an in-tree Betaflight {betaflight.BF_TAG} target. Available: {', '.join(targets)}"}
+        meta = self.project.meta()
+        existing = meta.get("board") if meta.get("kind") == "betaflight" else None
+        if existing and (self.project.root / "betaflight" / "configs" / betaflight.MANUFACTURER_ID / existing).is_dir() \
+                and meta.get("bf_target") == target:
+            rel = f"betaflight/configs/{betaflight.MANUFACTURER_ID}/{existing}"
+            return {"ok": True, "already_initialised": True, "board_name": existing, "config_path": f"{rel}/config.h",
+                    "target": target,
+                    "note": f"This project's board is already set up as {existing} (one board per project) — do not call "
+                            "init_betaflight again. Next: record_fact for each pin (query_board lines), write/fix config.h, "
+                            "build, verify."}
         board_dir = self.project.root / "betaflight" / "configs" / betaflight.MANUFACTURER_ID / board
         board_dir.mkdir(parents=True, exist_ok=True)
         generated: List[str] = []
@@ -395,6 +408,11 @@ class ToolBelt:
         return {"source_id": source_id, "url": src.url, "tier": src.tier, "chars": src.chars, "excerpts": ex, "note": note}
 
     def record_fact(self, subject: str, property: str, value: Any, source_id: str, quote: str, unit: str = "") -> Dict[str, Any]:
+        # a quote copied from a clipped line may end in an ellipsis; the text before it is still verbatim
+        quote = re.sub(r"\s*(…|\.\.\.)\s*$", "", quote or "")
+        m = re.fullmatch(r"\s*SRC[-_ ]?0*(\d+)\s*", str(source_id or ""), re.I)   # 'SRC001', 'src-1' -> 'SRC-001'
+        if m:
+            source_id = f"SRC-{int(m.group(1)):03d}"
         res = self.ledger.record(subject, property, value, source_id, quote, unit)
         if res.get("ok"):
             self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
@@ -447,8 +465,9 @@ class ToolBelt:
         res = board.query(query or "")
         res["source_id"] = sid
         if res.get("lines"):
-            res["how_to_record"] = (f"record_fact(subject='<ref>', property='<e.g. PA8_net>', value='<net or pin>', "
-                                    f"source_id='{sid}', quote='<one line above, verbatim>')")
+            res["how_to_record"] = (f"For a pin used in code: record_fact(subject='U1', property='<function>_pin', "
+                                    f"value='GPIO<n>' (the GPIO in the line), source_id='{sid}', quote='<that line, verbatim>'), "
+                                    "then tag the define with the FACT id.")
         return res
 
     def list_facts(self) -> Dict[str, Any]:
@@ -498,6 +517,8 @@ class ToolBelt:
         if str(path).startswith("bf:"):
             res = betaflight.read_file(path, int(start or 1), int(end or 160))
             return res or {"error": "Not a readable Betaflight file (use a 'bf:src/...' path from search_framework or init_betaflight)."}
+        if (self.project.root / str(path)).is_file():  # a project file passed to the SDK reader
+            return self.read_file(path, start or 1, end or 0)
         pk = (pio.core_dir() / "packages").resolve()
         p = (pk / path).resolve()
         if pk not in p.parents or not p.is_file():
@@ -530,9 +551,25 @@ class ToolBelt:
         self.session.emit("file", path=res["path"], content=updated)
         return res
 
-    def read_file(self, path: str) -> Dict[str, Any]:
-        t = self.project.read_file(path)
-        return {"path": path, "content": t[:20000], "truncated": len(t) > 20000}
+    def read_file(self, path: str, start: int = 1, end: int = 0) -> Dict[str, Any]:
+        """Numbered lines; long files are windowed so the reply never collapses into an unreadable preview."""
+        if str(path).startswith("bf:"):
+            return self.read_framework_file(path, start or 1, end or (start or 1) + 160)
+        lines = self.project.read_file(path).splitlines()
+        start = max(1, int(start or 1))
+        out, size, last = [], 0, start - 1
+        stop = min(len(lines), int(end)) if end else len(lines)
+        for i in range(start, stop + 1):
+            row = f"{i}: {lines[i - 1]}"
+            if size + len(row) > 5500:
+                break
+            out.append(row)
+            size += len(row) + 1
+            last = i
+        res: Dict[str, Any] = {"path": path, "start": start, "end": last, "total_lines": len(lines), "text": "\n".join(out)}
+        if last < len(lines) and (not end or last < int(end)):
+            res["note"] = f"Showing lines {start}-{last} of {len(lines)}. Call read_file(path, start={last + 1}) for more."
+        return res
 
     def list_files(self) -> Dict[str, Any]:
         return {"files": self.project.list_files()}
@@ -547,7 +584,8 @@ class ToolBelt:
             if line.strip():
                 self.session.emit("build_log", line=line)
 
-        res = betaflight.build(self.project.root, on_line=on_line) if self._is_betaflight() else pio.build(self.project.root, on_line=on_line)
+        res = (betaflight.build(self.project.root, on_line=on_line, board_hint=self.project.meta().get("board", ""))
+               if self._is_betaflight() else pio.build(self.project.root, on_line=on_line))
         h = self.source_hash()
         self.state.update(build_hash=h, build_ok=res.ok, last_build=res.public())
         out = res.public()

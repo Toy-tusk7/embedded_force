@@ -21,12 +21,17 @@ MAX_CONTEXT_CHARS = 45_000
 KEEP_RECENT = 6
 
 # Tools whose success means the run moved forward (resets the research / SDK budgets).
-PROGRESS_TOOLS = {"record_fact", "record_user_fact", "init_project", "write_file", "replace_in_file", "build", "verify"}
+PROGRESS_TOOLS = {"record_fact", "record_user_fact", "init_project", "init_betaflight", "query_board",
+                  "write_file", "replace_in_file", "build", "verify"}
 RESEARCH_TOOLS = {"web_search", "fetch_document"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10
 MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
+MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments, back to back
+READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_framework", "query_board", "list_facts",
+                   "read_source", "init_betaflight", "init_project", "resolve_target", "set_plan"}
+ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
 MAX_UNBUILT_CODE_NUDGES = 2
 _CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 _BUILD_CMD = re.compile(r"\b(cmake|ninja|make\s+\w|pio\s+run|platformio\s+run|dfu-util|picotool|openocd|st-flash|esptool)\b", re.I)
@@ -117,8 +122,21 @@ class ProgressGuard:
         self.fail_name = ""
         self.fail_streak = 0
         self.code_nudges = 0
+        self.seen_queries: set = set()
+        self.reads_since_change: List[str] = []
 
-    def before(self, name: str, n_sources: int) -> Optional[Dict[str, Any]]:
+    def before(self, name: str, n_sources: int, args: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        key = name + json.dumps(args or {}, sort_keys=True)
+        if name in READ_ONLY_TOOLS:
+            # identical reads since the last change to the project (edits/builds reset this) return nothing new
+            seen = self.reads_since_change.count(key)
+            self.reads_since_change.append(key)
+            if seen >= MAX_IDENTICAL_READS:
+                return {"error": (f"You already made this exact {name} call {seen} times since the project last changed, and "
+                                  "its result is above. Act on what you have (edit, build, record facts) or read something else."),
+                        "guard": "identical_call"}
+        else:
+            self.reads_since_change.clear()
         if name == self.fail_name and self.fail_streak >= MAX_CONSECUTIVE_FAILURES:
             return {"error": (
                 f"{name} has failed {self.fail_streak} times in a row. Retrying with variations will not help. "
@@ -141,7 +159,7 @@ class ProgressGuard:
             ), "guard": "sdk_budget"}
         return None
 
-    def after(self, name: str, ok: bool, result: Any = None) -> None:
+    def after(self, name: str, ok: bool, result: Any = None, args: Optional[Dict[str, Any]] = None) -> None:
         self.calls[name] += 1
         failed = not ok or (isinstance(result, dict) and result.get("found") is False)
         if failed:
@@ -150,6 +168,12 @@ class ProgressGuard:
             self.fail_name = name
         elif name == self.fail_name:
             self.fail_name, self.fail_streak = "", 0
+        if name in ONCE_PROGRESS_TOOLS:  # lookups / setup count as progress only while they do something new
+            key = name + json.dumps(args or {}, sort_keys=True).lower()
+            fresh = ok and key not in self.seen_queries
+            self.seen_queries.add(key)
+            if not fresh:
+                return
         if name in PROGRESS_TOOLS and ok:
             self.research = self.sdk = self.steps_since_progress = 0
         elif name in RESEARCH_TOOLS:
@@ -228,8 +252,8 @@ class AgentRunner:
         return text
 
     def _state_digest(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger) -> str:
-        has_ini = (self.project.root / "platformio.ini").exists()
-        srcs = [f["path"] for f in self.project.list_files() if f["path"].startswith(("src/", "include/"))]
+        has_ini = (self.project.root / "platformio.ini").exists() or self.project.meta().get("kind") == "betaflight"
+        srcs = [f["path"] for f in self.project.list_files() if f["path"].startswith(("src/", "include/", "betaflight/")) and f["path"].endswith((".c", ".h", ".cpp"))]
         return (f"facts={len(ledger.facts)}, sources={len(store.sources)}, project_initialised={has_ini}, "
                 f"source_files={len(srcs)}, last_build_ok={belt.state['build_ok']}, verify_ok={belt.state['verify_ok']}")
 
@@ -315,7 +339,7 @@ class AgentRunner:
                     except ValueError as e:
                         args, result = {}, {"error": str(e)}
                     else:
-                        result = guard.before(name, len(store.sources))
+                        result = guard.before(name, len(store.sources), args)
                     s.emit("tool_call", id=tc["id"], name=name, args={k: (v if len(str(v)) < 400 else str(v)[:400] + "…") for k, v in args.items()})
                     if result is None:
                         tracer.start_span(f"{span}-{tc['id']}", name, run_type="tool", inputs=args)
@@ -324,7 +348,7 @@ class AgentRunner:
                     elif result.get("guard"):
                         s.emit("guard", kind=result["guard"], text=result["error"])
                     ok = not (isinstance(result, dict) and (result.get("error") or result.get("ok") is False or result.get("found") is False))
-                    guard.after(name, ok, result)
+                    guard.after(name, ok, result, args)
                     s.emit("tool_result", id=tc["id"], name=name, ok=ok, summary=_summ(result))
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, default=str)})
                     if belt.ended:

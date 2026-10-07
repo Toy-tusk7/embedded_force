@@ -202,13 +202,14 @@ def _bytes(n: str, unit: str) -> int:
     return int(n) * {"B": 1, "KB": 1024, "MB": 1024 * 1024, "GB": 1024 ** 3}[unit.upper()]
 
 
-def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 3600) -> BFResult:
+def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 3600, board_hint: str = "") -> BFResult:
     """Build the project's Betaflight config in WSL and copy the outputs into the project."""
     t0 = time.time()
     project_dir = Path(project_dir).resolve()
     files = config_files(project_dir)
     if not files:
         return BFResult(ok=False, error="No betaflight/configs/CUST/<BOARD>/config.h in this project.")
+    files = [f for f in files if f.parent.name == board_hint] or files
     board = files[0].parent.name
     if not wsl.safe_name(board):
         return BFResult(ok=False, board=board, error="Board name must be letters, digits, '_' or '-'.")
@@ -226,6 +227,12 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 3600) ->
     code, lines, timed_out = wsl.run(build_script(wsl.to_wsl_path(str(project_dir / "betaflight")), board), on_line, timeout_s)
     res = BFResult(ok=code == 0 and not timed_out, board=board, target=target, duration_s=round(time.time() - t0, 1))
     res.diagnostics = parse_diagnostics(lines)
+    proj_wsl = wsl.to_wsl_path(str(project_dir)).rstrip("/") + "/"
+    for d in res.diagnostics:  # report project files relative to the project, like PlatformIO builds do
+        if d.file.startswith(proj_wsl):
+            d.file = d.file[len(proj_wsl):]
+        elif d.file.startswith(("/home/", "./src/", "src/")):
+            d.file = "betaflight-src:" + d.file.split("/betaflight-" + BF_TAG + "/")[-1].lstrip("./")
     for ln in lines:
         m = _MEM_RE.match(ln)
         if m:

@@ -128,6 +128,14 @@ def collect_sources(project_dir: Path) -> List[Path]:
     return sorted(files)
 
 
+_QUOTE_GPIO_RE = re.compile(r"\bGPIO(\d{1,3})(?![0-9])", re.I)
+
+
+def quote_pins(quote: str) -> set:
+    """GPIO pins named in a verbatim quote, e.g. 'U1 pin 3 (GPIO6) -> net BEEPER -> Q3.1 (G)' -> {'GPIO6'}."""
+    return {f"GPIO{int(n)}" for n in _QUOTE_GPIO_RE.findall(quote or "")}
+
+
 def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) -> VerifyReport:
     """`pico`: the target is an RP2040/RP2350, so GPIO n may be written n, GPIOn, GPn or (Betaflight) PAn."""
     project_dir = Path(project_dir)
@@ -196,6 +204,9 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                 literals_checked += 1
                 tag_facts = [ledger.get(t) for t in tags if ledger.get(t)]
                 match = next((f for f in tag_facts if key_of(f.value, is_pin) == n), None)
+                if match is None and is_pin:
+                    # a fact whose value is a net name still proves the pin when its verbatim quote names exactly one GPIO
+                    match = next((f for f in tag_facts if key_of(f.value, True) is None and quote_pins(f.quote) == {n}), None)
                 if match is None and tag_facts:
                     report.findings.append(Finding(
                         "ERROR", "FACT_VALUE_MISMATCH", rel, ln,

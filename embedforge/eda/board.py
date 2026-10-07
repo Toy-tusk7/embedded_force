@@ -127,8 +127,49 @@ class Board:
         others = [self.node_label(r, n) for r, n in nets.get(pin.net, []) if not (r == part.ref and n == pin.number)]
         return f"{head} -> net {pin.net}" + (f" -> {', '.join(others)}" if others else "")
 
-    def query(self, q: str, limit: int = 60) -> Dict[str, Any]:
-        """Look up a designator (U1), a net (HIN_A), a pin name (PA8) or a part value/MPN (FD6288Q)."""
+    _STOP = {"ALL", "AND", "THE", "FOR", "WITH", "LIST", "PIN", "PINS", "NET", "NETS", "PART", "PARTS", "SHOW", "GET",
+             "CONNECTED", "CONNECTIONS", "NUMBER", "NUMBERS", "NAME", "NAMES", "WIRING", "OF", "TO", "ON", "IN", "MCU"}
+
+    def query(self, q: str, limit: int = 120) -> Dict[str, Any]:
+        """Look up designators, nets, pin names or part numbers. Sentence-style queries ('U3 BMP388 pins') are split
+        into identifier-like terms and the matches merged."""
+        res = self._query_one(q, limit)
+        if "error" not in res or not q.strip():
+            return res
+        terms = [t for t in re.findall(r"[A-Za-z0-9_+./\-]+", q)
+                 if t.upper() not in self._STOP and (re.search(r"\d|_", t) or (t.isupper() and len(t) >= 3))]
+        lines: List[str] = []
+        parts: List[Dict[str, Any]] = []
+        matched: List[str] = []
+        for t in dict.fromkeys(terms):
+            r = self._query_one(t, limit)
+            if "error" in r:
+                continue
+            matched.append(t)
+            lines += [ln for ln in r.get("lines", []) if ln not in lines]
+            parts += ([r["part"]] if "part" in r else []) + r.get("parts", [])
+        if not lines:
+            return res
+        return {"matched_terms": matched, "lines": lines[:limit], **({"parts": parts[:10]} if parts else {})}
+
+    @staticmethod
+    def _clip(line: str, width: int = 170) -> str:
+        """Shorten very long lines (power nets) at a node boundary; the kept prefix is still verbatim source text."""
+        if len(line) <= width:
+            return line
+        cut = line.rfind(", ", 0, width)
+        return line[: cut if cut > 0 else width] + " …"
+
+    def _part_lines(self, part: Part, nets: Dict[str, List[Tuple[str, str]]], limit: int) -> List[str]:
+        connected = [self._clip(self.pin_line(part, pin, nets)) for pin in self._sorted_pins(part) if pin.net]
+        loose = [f"{pin.number}" + (f" ({pin.name})" if pin.name and pin.name != pin.number else "")
+                 for pin in self._sorted_pins(part) if not pin.net]
+        out = connected[:limit]
+        if loose:
+            out.append(f"{part.ref} pins not connected: " + ", ".join(loose))
+        return out
+
+    def _query_one(self, q: str, limit: int = 120) -> Dict[str, Any]:
         nets = self.nets()
         qs = q.strip()
         qu = qs.upper()
@@ -136,7 +177,7 @@ class Board:
             return {"summary": self.summary()}
         if qs in self.parts or qu in {r.upper() for r in self.parts}:
             part = next(p for r, p in self.parts.items() if r.upper() == qu)
-            return {"part": self._part_dict(part), "lines": [self.pin_line(part, pin, nets) for pin in self._sorted_pins(part)][:limit]}
+            return {"part": self._part_dict(part), "lines": self._part_lines(part, nets, limit)}
         net = next((n for n in nets if n.upper() == qu), None)
         if net:
             return {"net": net, "lines": [f"net {net}: " + ", ".join(self.node_label(r, n) for r, n in nets[net])]}
@@ -151,9 +192,12 @@ class Board:
         if hits:
             out = []
             for part in hits[:3]:
-                out += [self.pin_line(part, pin, nets) for pin in self._sorted_pins(part)]
+                out += self._part_lines(part, nets, limit)
             return {"parts": [self._part_dict(p) for p in hits[:10]], "lines": out[:limit]}
         fuzzy = [n for n in nets if qu in n.upper()]
+        if not fuzzy and len(qu) >= 4:  # 'MOTOR' -> MOTO0..3, 'LEDS' -> LED1: match on a shared stem
+            stem = qu[:4]
+            fuzzy = [n for n in nets if stem in n.upper()]
         if fuzzy:
             return {"nets": fuzzy[:20], "lines": [f"net {n}: " + ", ".join(self.node_label(r, x) for r, x in nets[n]) for n in fuzzy[:20]]}
         return {"error": f"Nothing on the board matches '{qs}'. Try a designator (U1), net name, pin name (PA8) or part number."}

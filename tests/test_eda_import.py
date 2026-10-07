@@ -144,6 +144,27 @@ def test_easyeda_pro_protel2_keyvalue_variant_with_pin_names():
     assert b.query("GPIO42_ADC2")["lines"] == ["U1 pin 53 (GPIO42_ADC2) -> net FLASH_SCL -> U6.5 (CLK)"]
 
 
+def test_sentence_style_board_queries_are_understood():
+    b = _parse("Netlist_Schematic1.net", PROTEL2_PRO.encode())
+    r = b.query("show all pins of U6 SD-CARD and net FLASH_SCL")
+    assert "U6" in r["matched_terms"] and "FLASH_SCL" in r["matched_terms"]
+    assert "U6 pin 5 (CLK) -> net FLASH_SCL -> U1.53 (GPIO42_ADC2)" in r["lines"]
+    assert "error" in b.query("list all the nets please")
+
+
+def test_long_lines_are_clipped_but_still_quotable(tmp_path):
+    b = eda.Board(name="x")
+    for i in range(60):
+        b.connect("+3.3V", f"C{i}", "1")
+    b.connect("+3.3V", "U1", "5", "IOVDD")
+    line = b.query("U1")["lines"][0]
+    assert line.endswith(" …") and len(line) < 180
+    store = SourceStore(tmp_path)
+    src = store.add(eda.BOARD_SOURCE_URL, "board", b.report(), kind="schematic")
+    belt = ToolBelt(Project("p", tmp_path / "p"), RunSession("r", "p"), store, FactLedger(tmp_path, store))
+    assert belt.record_fact("U1", "IOVDD_net", "+3.3V", src.id, line)["ok"]   # quote up to the ellipsis is verbatim
+
+
 def test_rp2354_is_recognised_as_mcu():
     b = _parse("n.net", PROTEL2_PRO.encode())
     for i in range(10):
@@ -213,6 +234,20 @@ def test_betaflight_pico_pin_names_map_to_gpio(tmp_path):
     (cfg / "config.h").write_text(f"#define SDCARD_SPI_SCK_PIN PA42 /* {fid} */\n", encoding="utf-8")
     assert verify_project(tmp_path, ledger, pico=True).passed
     assert not verify_project(tmp_path, ledger, pico=False).passed
+
+
+def test_net_valued_fact_proves_the_pin_named_in_its_quote(tmp_path):
+    from embedforge.truth import verify_project
+    store = SourceStore(tmp_path)
+    board = _parse("n.net", PROTEL2_PRO.encode())
+    src = store.add(eda.BOARD_SOURCE_URL, "board", board.report(), kind="schematic")
+    ledger = FactLedger(tmp_path, store)
+    fid = ledger.record("U1", "net", "FLASH_SCL", src.id, board.query("GPIO42_ADC2")["lines"][0])["fact"]["id"]
+    cfg = tmp_path / "betaflight" / "configs" / "CUST" / "B"
+    cfg.mkdir(parents=True)
+    (cfg / "config.h").write_text(f"#define SPI1_SCK_PIN PA42 /* {fid} */\n#define SDCARD_SPI_CS_PIN PA46 /* {fid} */\n", encoding="utf-8")
+    rep = verify_project(tmp_path, ledger, pico=True)
+    assert [(f.code, f.line) for f in rep.findings] == [("FACT_VALUE_MISMATCH", 2)]   # PA42 proven by the quote, PA46 not
 
 
 def test_agent_cannot_plant_a_schematic():

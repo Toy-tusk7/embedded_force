@@ -16,6 +16,7 @@ TEXT_EXTS = {
     ".py", ".s", ".ld", ".cmake", ".mmd", ".csv", ".yaml", ".yml", ".toml",
     ".sch", ".kicad_sch", ".kicad_pcb", ".brd", ".net",
     ".esch", ".enet", ".asc", ".tsv",  # EasyEDA Pro sheets/netlists, PADS netlists, BOMs
+    ".mk",  # readable (generated Betaflight config.mk); the agent's write policy still forbids writing it
 }
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".bmp", ".gif", ".ico"}
 DOC_EXTS = {".pdf"}

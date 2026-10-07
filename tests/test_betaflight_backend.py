@@ -53,7 +53,8 @@ def test_build_dispatches_to_betaflight_and_registers_uf2(belt, tmp_path, monkey
     uf2 = tmp_path / "fw.uf2"
     uf2.write_bytes(b"UF2\n" * 64)
 
-    def fake_build(root, on_line=None):
+    def fake_build(root, on_line=None, board_hint=""):
+        assert board_hint == "MYFC"
         on_line and on_line("make CONFIG=MYFC")
         return betaflight.BFResult(ok=True, board="MYFC", target="RP2350B", flash_used=500_000, flash_total=4_194_304,
                                    artifacts={"uf2": str(uf2)})
