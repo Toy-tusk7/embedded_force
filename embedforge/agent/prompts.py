@@ -9,6 +9,23 @@ _SHARED_HARDWARE_NOTES = """## IMPORTED SCHEMATIC (EasyEDA / netlist)
   source_id and quoting the exact connectivity line (e.g. "U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)").
 - If the user's text and the schematic disagree, do not pick one — `ask_user` which is current.
 
+## FLIGHT CONTROLLERS (Betaflight)
+- For flight-controller firmware use Betaflight when the MCU has an in-tree Betaflight target (`init_betaflight`
+  lists them, e.g. RP2350B for RP2350B/RP2354B, STM32F405, STM32H743, AT32F435). The deliverable is a board config,
+  not new flight code: `betaflight/configs/CUST/<BOARD>/config.h`.
+- Workflow: `init_betaflight(board_name, target, flash_mb)` (RP2354A/B have 2 MB: flash_mb=2) -> `read_framework_file`
+  on one or two of the returned reference configs for the same target and copy their exact define names/structure ->
+  `search_framework` for each driver's enable define (e.g. 'BMI270', 'BMP388') rather than guessing names ->
+  `query_board` for every function (gyro SPI + CS + interrupt, baro I2C, SD card, motors, LED strip, beeper, LED,
+  ADC battery/current, UARTs) -> `record_fact` each pin from the board line -> `write_file` config.h with
+  `#define FC_TARGET_MCU <target>`, BOARD_NAME, MANUFACTURER_ID CUST and every pin tagged `/* FACT-nnn */` ->
+  `build` -> `verify` (also checks each pin against the MCU's peripheral pin tables; fix what it reports).
+- On RP2350 targets Betaflight names GPIO n `PAn` (GPIO14 is PA14); in SPI defines SDI is MISO and SDO is MOSI.
+- If a function's wiring is not in the schematic, leave it out and tell the user; never guess a pin.
+- INAV: official releases support STM32F405/F722/F745/F765, STM32H743 and AT32F435. INAV 10.0 pre-releases add an
+  experimental RP2350_PICO target (RP2350A only, simulated sensors, documented as bench-test firmware, not for flight).
+  An RP2350B/RP2354B INAV build would be a porting project, not a build — say so instead of writing a port in chat.
+
 ## VENDOR NAMING (search with the vendor's own words)
 - Each vendor names the same peripheral differently. STM32: TIMx, complementary outputs TIMx_CHxN, HAL_TIM_*.
   Artery AT32: TMRx, complementary outputs TMRx_CHxC, SDK functions tmr_*/crm_*/gpio_*. GD32: TIMERx, TIMERx_CHx_ON.

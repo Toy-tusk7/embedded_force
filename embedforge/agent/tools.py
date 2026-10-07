@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 from embedforge import eda
 from embedforge.agent.events import RunSession
 from embedforge.agent.workspace import Project
-from embedforge.toolchain import pio
+from embedforge.toolchain import betaflight, pio, wsl
 from embedforge.truth import FactLedger, SourceStore, verify_project
 from embedforge.truth.verifier import collect_sources
 
@@ -28,15 +28,17 @@ def _arr(items=S):
 
 TOOL_SPECS: List[Dict[str, Any]] = [
     _fn("resolve_target",
-        "Search the real PlatformIO board registry by MCU part number or board (e.g. 'stm32f401', 'at32f421', 'esp32 devkit'). "
-        "Official vendor platforms (e.g. ArteryTek AT32) are installed automatically. Returns board id, MCU, clock, RAM/flash "
-        "and SDK frameworks. Never guess or substitute a board.",
+        "Search the real PlatformIO board registry by MCU part number or board (e.g. 'stm32f401', 'at32f421', 'rp2354b', 'esp32 devkit'). "
+        "Allow-listed platforms not in the registry (ArteryTek AT32; RP2350/RP2354 via the community Arduino-Pico platform) are "
+        "installed automatically. Returns board id, MCU, clock, RAM/flash, SDK frameworks and, for part families without an "
+        "exact board, a `note` on which board to use. Never guess or substitute a different MCU.",
         {"query": S}, ["query"]),
     _fn("init_project",
         "Create platformio.ini for an exact board id from resolve_target and one of its frameworks, then download the "
         "toolchain and SDK so search_framework works immediately. Prefer the vendor SDK framework "
-        "(stm32cube, at32firmlib, espidf, pico) over arduino unless the user asks otherwise.",
-        {"board": S, "framework": S, "build_flags": _arr(), "lib_deps": _arr()}, ["board", "framework"]),
+        "(stm32cube, at32firmlib, espidf, picosdk) over arduino unless the user asks otherwise. `options` takes board "
+        "overrides such as 'board_upload.maximum_size = 2097152' (only board_build.*, board_upload.*, upload_protocol, build_unflags).",
+        {"board": S, "framework": S, "build_flags": _arr(), "lib_deps": _arr(), "options": _arr()}, ["board", "framework"]),
     _fn("web_search",
         "Search the web (Tavily) for official datasheets, reference manuals and register maps. Prefer `domains` with the "
         "manufacturer's site. Each result has a source_id, trust tier and an `excerpt` (the passage best matching your query); "
@@ -66,11 +68,18 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "for pins and wiring. Each returned line is verbatim text of the board source — quote one with "
         "record_fact(source_id=<returned source_id>) to turn a connection into a fact.",
         {"query": S}, []),
+    _fn("init_betaflight",
+        "Make this project a Betaflight board: a custom config built against an in-tree Betaflight target (e.g. RP2350B "
+        "for RP2350B/RP2354B, STM32F405, STM32H743, AT32F435...). Installs the pinned Betaflight release and its toolchain in "
+        "WSL on first use. For RP2350/RP2354 boards pass flash_mb (RP2354A/B: 2) so the flash size is configured. Returns "
+        "the board config path to write and real reference configs for the same target.",
+        {"board_name": S, "target": S, "flash_mb": {"type": "integer"}}, ["board_name", "target"]),
     _fn("search_framework",
-        "Regex-search the installed vendor SDK/HAL headers (real local source of truth for HAL function/macro names).",
+        "Regex-search the real SDK the project builds against: the installed vendor SDK/HAL headers, or for a Betaflight "
+        "project the Betaflight source and its board configs (define names such as GYRO_1_CS_PIN, SDCARD_SPI_INSTANCE).",
         {"pattern": S, "extension": S}, ["pattern"]),
     _fn("read_framework_file",
-        "Read lines of a header/source from the installed SDK (path as returned by search_framework).",
+        "Read lines of a file returned by search_framework (SDK header, or a Betaflight source/config file).",
         {"path": S, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
     _fn("write_file", "Create or overwrite a project file under src/, include/, lib/, test/ or docs/ (or platformio.ini). "
         "Build scripts (*.py, extra_scripts, library.json) are not allowed.",
@@ -116,7 +125,7 @@ _INI_FORBIDDEN_KEYS = {
 }
 _REGISTRY_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+(@[A-Za-z0-9_.~^<>=\-\s]+)?$")
 _LIB_DEP_RE = re.compile(r"^[A-Za-z0-9_.\-]+(/[A-Za-z0-9_.\-]+)?(\s*@\s*[A-Za-z0-9_.~^<>=\-\s]+)?$")
-_AGENT_WRITABLE_DIRS = ("src", "include", "lib", "test", "docs")
+_AGENT_WRITABLE_DIRS = ("src", "include", "lib", "test", "docs", "betaflight")
 
 
 def check_platformio_ini(text: str) -> Optional[str]:
@@ -156,8 +165,11 @@ def check_agent_write(path: str, content: str) -> Optional[str]:
     name = rel.rsplit("/", 1)[-1].lower()
     if rel == "platformio.ini":
         return check_platformio_ini(content)
-    if name in ("library.json", "extra_script.py") or name.endswith(".py"):
+    if name in ("library.json", "extra_script.py") or name.endswith((".py", ".mk", ".sh")) or name in ("makefile", "gnumakefile"):
         return f"The agent may not write '{name}' (build scripts run code on the host)."
+    if rel.startswith("betaflight/") and not re.fullmatch(r"betaflight/configs/(?:CUST/)?[A-Za-z0-9_\-]{1,40}/config\.[ch]", rel):
+        return ("Betaflight boards live at betaflight/configs/CUST/<BOARD>/config.h (and optional config.c); "
+                "flash-size files are generated by init_betaflight(flash_mb=...).")
     top = rel.split("/", 1)[0] if "/" in rel else ""
     if top not in _AGENT_WRITABLE_DIRS and not (not top and name.endswith((".md", ".txt"))):
         return f"Write firmware under {', '.join(d + '/' for d in _AGENT_WRITABLE_DIRS)} (or notes as *.md at the root)."
@@ -180,7 +192,8 @@ class ToolBelt:
         self._searches: Dict[str, List[Dict[str, Any]]] = {}  # normalized query -> results (per run)
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "last_build": None}
         self._handlers: Dict[str, Callable[..., Any]] = {
-            "resolve_target": self.resolve_target, "init_project": self.init_project, "web_search": self.web_search,
+            "resolve_target": self.resolve_target, "init_project": self.init_project, "init_betaflight": self.init_betaflight,
+            "web_search": self.web_search,
             "fetch_document": self.fetch_document, "read_source": self.read_source, "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
@@ -219,13 +232,20 @@ class ToolBelt:
     def resolve_target(self, query: str) -> Dict[str, Any]:
         boards = pio.list_boards(query, limit=12)
         vp = pio.vendor_platform_for(query)
-        if not boards and vp and not pio.platform_installed(vp):
-            spec = pio.VENDOR_PLATFORMS[vp]
-            self.session.emit("status", text=f"Installing the official {spec['vendor']} PlatformIO platform ({vp}) — one-time download…")
+        spec = pio.VENDOR_PLATFORMS.get(vp or "", {})
+        if vp and (not boards or spec.get("family")) and not pio.platform_installed(vp):
+            kind = "official" if spec.get("official") else "community"
+            self.session.emit("status", text=f"Installing the {kind} {spec['vendor']} PlatformIO platform ({vp}) — one-time download…")
             inst = pio.install_platform(vp, on_line=self._log("platform"))
             if not inst["ok"]:
                 return {"found": False, "error": f"Installing vendor platform '{vp}' failed: {inst['error'][-600:]}"}
             boards = pio.list_boards(query, limit=12)
+        if vp and not boards and spec.get("family"):
+            boards = pio.list_boards(spec["family"], limit=40)
+            if boards:
+                return {"found": True, "boards": boards, "platform_source": spec["url"],
+                        "official_platform": bool(spec.get("official")),
+                        "note": spec.get("note", "No board for this exact part; these boards use the same MCU family.")}
         if not boards:
             return {
                 "found": False,
@@ -238,7 +258,8 @@ class ToolBelt:
         return {"found": True, "boards": boards,
                 "note": "Pick the board whose MCU exactly matches the user's part number; if several fit and it matters, ask_user."}
 
-    def init_project(self, board: str, framework: str, build_flags: Optional[List[str]] = None, lib_deps: Optional[List[str]] = None) -> Dict[str, Any]:
+    def init_project(self, board: str, framework: str, build_flags: Optional[List[str]] = None, lib_deps: Optional[List[str]] = None,
+                     options: Optional[List[str]] = None) -> Dict[str, Any]:
         match = [b for b in pio.list_boards(board, limit=50) if b["id"] == board]
         if not match:
             return {"error": f"Unknown board id '{board}'. Call resolve_target and use an exact board id it returned."}
@@ -246,7 +267,15 @@ class ToolBelt:
         if framework not in (b.get("frameworks") or []):
             return {"error": f"Framework '{framework}' not supported by {board}. Supported: {b.get('frameworks')}"}
         platform = b["platform"]
+        vp = pio.vendor_platform_for(b.get("mcu") or "")
+        if vp and pio.VENDOR_PLATFORMS[vp].get("use_url"):
+            platform = pio.VENDOR_PLATFORMS[vp]["url"]  # pin the exact platform (its name collides with another)
         lines = [f"[env:{board}]", f"platform = {platform}", f"board = {board}", f"framework = {framework}", "monitor_speed = 115200"]
+        for opt in options or []:
+            key = opt.split("=", 1)[0].strip()
+            if "=" not in opt or "\n" in opt or "\r" in opt or not key.startswith(("board_build.", "board_upload.", "upload_protocol", "build_unflags")):
+                return {"error": f"Option '{opt}' not allowed; use 'board_build.* = …', 'board_upload.* = …', upload_protocol or build_unflags."}
+            lines.append(f"{key} = {opt.split('=', 1)[1].strip()}")
         if build_flags:
             lines.append("build_flags =\n    " + "\n    ".join(build_flags))
         if lib_deps:
@@ -269,6 +298,50 @@ class ToolBelt:
             "sdk_ready": bool(pk["ok"] and roots), "sdk_packages": [r.name for r in roots],
             "next": "Use search_framework to find the SDK's real function and macro names for each peripheral, then write the firmware.",
             **({"sdk_error": pk["error"][-600:]} if not pk["ok"] else {}),
+        }
+
+    def _is_betaflight(self) -> bool:
+        return self.project.meta().get("kind") == "betaflight"
+
+    def init_betaflight(self, board_name: str, target: str, flash_mb: int = 0) -> Dict[str, Any]:
+        board = re.sub(r"[^A-Za-z0-9_]", "_", (board_name or "").strip().upper()).strip("_")[:40]
+        if not board:
+            return {"error": "board_name is required (letters, digits, underscores)."}
+        ok, detail = wsl.available()
+        if not ok:
+            return {"error": f"Betaflight builds run in WSL, which is not usable here: {detail}"}
+        if not betaflight.is_ready():
+            self.session.emit("status", text=f"Preparing Betaflight {betaflight.BF_TAG} and its toolchain in WSL — first time takes several minutes…")
+            st = betaflight.setup(on_line=self._log("betaflight"))
+            if not st["ok"]:
+                return {"error": f"Betaflight setup failed: {st['error'][-800:]}"}
+        targets = betaflight.available_targets()
+        if target not in targets:
+            return {"error": f"'{target}' is not an in-tree Betaflight {betaflight.BF_TAG} target. Available: {', '.join(targets)}"}
+        board_dir = self.project.root / "betaflight" / "configs" / betaflight.MANUFACTURER_ID / board
+        board_dir.mkdir(parents=True, exist_ok=True)
+        generated: List[str] = []
+        if flash_mb:
+            if not target.startswith("RP2350"):
+                return {"error": "flash_mb is only for RP2350/RP2354 targets (other MCUs have fixed internal flash)."}
+            try:
+                generated = betaflight.write_flash_override(board_dir, int(flash_mb))
+            except ValueError as e:
+                return {"error": str(e)}
+        self.project.update_meta(kind="betaflight", board=board, mcu=target, bf_target=target, platform="betaflight",
+                                 framework=f"betaflight {betaflight.BF_TAG}")
+        self.session.emit("project", meta=self.project.meta())
+        rel_dir = f"betaflight/configs/{betaflight.MANUFACTURER_ID}/{board}"
+        return {
+            "ok": True, "config_path": f"{rel_dir}/config.h", "target": target, "board_name": board,
+            "manufacturer_id": betaflight.MANUFACTURER_ID, "betaflight_version": betaflight.BF_TAG,
+            "generated": [f"{rel_dir}/{g}" for g in generated],
+            "reference_configs": betaflight.reference_configs(target),
+            "next": ("Read one or two reference configs (read_framework_file) to copy the exact define names and structure; "
+                     "look up every function's pin with query_board and record it with record_fact; then write config.h with "
+                     f"'#define FC_TARGET_MCU {target}', '#define BOARD_NAME {board}', '#define MANUFACTURER_ID "
+                     f"{betaflight.MANUFACTURER_ID}' and each pin tagged /* FACT-nnn */; then build and verify (verify also "
+                     "checks every pin against the MCU's peripheral pin tables)."),
         }
 
     # ------------------------------------------------------------ research
@@ -384,6 +457,10 @@ class ToolBelt:
 
     # ------------------------------------------------------------ framework
     def search_framework(self, pattern: str, extension: str = "h") -> Dict[str, Any]:
+        if self._is_betaflight():
+            hits = betaflight.search(pattern)
+            return {"matches": hits, "framework": f"betaflight {betaflight.BF_TAG}",
+                    **({} if hits else {"note": "No matches in the Betaflight source/configs. Try a shorter fragment, e.g. 'SDCARD_SPI'."})}
         meta_fw = self.project.meta().get("framework", "")
         roots = pio.framework_roots(meta_fw)
         if not roots and (self.project.root / "platformio.ini").exists():
@@ -418,6 +495,9 @@ class ToolBelt:
         return out
 
     def read_framework_file(self, path: str, start: int = 1, end: int = 160) -> Dict[str, Any]:
+        if str(path).startswith("bf:"):
+            res = betaflight.read_file(path, int(start or 1), int(end or 160))
+            return res or {"error": "Not a readable Betaflight file (use a 'bf:src/...' path from search_framework or init_betaflight)."}
         pk = (pio.core_dir() / "packages").resolve()
         p = (pk / path).resolve()
         if pk not in p.parents or not p.is_file():
@@ -467,7 +547,7 @@ class ToolBelt:
             if line.strip():
                 self.session.emit("build_log", line=line)
 
-        res = pio.build(self.project.root, on_line=on_line)
+        res = betaflight.build(self.project.root, on_line=on_line) if self._is_betaflight() else pio.build(self.project.root, on_line=on_line)
         h = self.source_hash()
         self.state.update(build_hash=h, build_ok=res.ok, last_build=res.public())
         out = res.public()
@@ -490,7 +570,17 @@ class ToolBelt:
         return out
 
     def verify(self) -> Dict[str, Any]:
-        rep = verify_project(self.project.root, self.ledger)
+        meta = self.project.meta()
+        pico = bool(re.search(r"RP2[03]", f"{meta.get('mcu') or ''} {meta.get('bf_target') or ''}", re.I))
+        rep = verify_project(self.project.root, self.ledger, pico=pico)
+        if self._is_betaflight():
+            from embedforge.truth import betaflight_rp2350
+            from embedforge.truth.verifier import Finding
+            for cfg in betaflight.config_files(self.project.root):
+                rel = str(cfg.relative_to(self.project.root)).replace("\\", "/")
+                for f in betaflight_rp2350.check_config(cfg.read_text(encoding="utf-8", errors="ignore"), meta.get("bf_target") or ""):
+                    rep.findings.append(Finding(f["severity"], f["code"], rel, f["line"], f["message"], suggestion=f["suggestion"]))
+            rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
         h = self.source_hash()
         self.state.update(verify_hash=h, verify_ok=rep.passed)
         # stamp the matching build manifest

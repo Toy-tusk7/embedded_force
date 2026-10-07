@@ -14,7 +14,7 @@ from typing import Dict, List, Any, Optional
 from embedforge.truth.ledger import FactLedger, parse_int
 
 SRC_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc", ".ino", ".s", ".S"}
-SRC_DIRS = ("src", "include", "lib")
+SRC_DIRS = ("src", "include", "lib", "betaflight")
 
 # Generic literals that carry no hardware claim (masks, sentinels).
 GENERIC_OK = {0x00, 0x01, 0x02, 0x03, 0x04, 0x07, 0x0F, 0x10, 0x1F, 0x3F, 0x7F, 0x80, 0xF0, 0xFF, 0xFFFF, 0xFFFFFFFF}
@@ -23,6 +23,29 @@ _HEX_RE = re.compile(r"\b0[xX][0-9A-Fa-f]+[uUlL]*\b")
 _FACT_TAG_RE = re.compile(r"FACT-\d{3,}")
 _DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s+(.+?)\s*$")
 _HW_NAME_RE = re.compile(r"(ADDR|REG|WHO_?AM_?I|CHIP_?ID|DEVICE_?ID|_ID\b|OPCODE|_CMD\b)", re.I)
+# Pin assignments are wiring claims: they must trace to the schematic or the user (e.g. #define GYRO_CS_PIN 14).
+_PIN_NAME_RE = re.compile(r"(_PIN\b|^PIN_|_GPIO\b|_GPIO_NUM\b|_IO_NUM\b)", re.I)
+_PIN_VALUE_RE = re.compile(r"^(?:GPIO|GP|IO|P)?(\d{1,3})$", re.I)
+
+
+def fact_int(value: str) -> Optional[int]:
+    """Numeric value of a fact; pin facts like 'GPIO14' / 'GP14' / 'P14' count as 14."""
+    n = parse_int(value)
+    if n is not None:
+        return n
+    m = _PIN_VALUE_RE.match(str(value).strip())
+    return int(m.group(1)) if m else None
+
+
+def pin_key(token: str, pico: bool = False) -> Optional[str]:
+    """Canonical pin identity. On RP2xxx every spelling of GPIO n (14, GPIO14, GP14, P14 and Betaflight's PA14) is
+    'GPIO14'; elsewhere port pins stay port pins (STM32 PA14 is not GPIO14)."""
+    t = str(token).strip().strip("()").upper()
+    m = re.fullmatch(r"P([A-Z])(\d{1,2})", t)
+    if m:
+        return f"GPIO{int(m.group(2))}" if pico and m.group(1) == "A" else f"P{m.group(1)}{int(m.group(2))}"
+    m = re.fullmatch(r"(?:GPIO|GP|IO|P)?(\d{1,3})", t)
+    return f"GPIO{int(m.group(1))}" if m else None
 
 
 @dataclass
@@ -105,10 +128,20 @@ def collect_sources(project_dir: Path) -> List[Path]:
     return sorted(files)
 
 
-def verify_project(project_dir: Path, ledger: FactLedger) -> VerifyReport:
+def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) -> VerifyReport:
+    """`pico`: the target is an RP2040/RP2350, so GPIO n may be written n, GPIOn, GPn or (Betaflight) PAn."""
     project_dir = Path(project_dir)
     report = VerifyReport(passed=True)
-    int_values = ledger.int_values()
+
+    def key_of(value: str, is_pin: bool) -> Any:
+        return pin_key(value, pico) if is_pin else parse_int(value)
+
+    known: Dict[Any, List[str]] = {}
+    for f in ledger.facts.values():
+        for is_pin in (False, True):
+            k = key_of(f.value, is_pin)
+            if k is not None:
+                known.setdefault((is_pin, k), []).append(f.id)
     literals_checked = justified = tagged_ok = 0
     used_facts: Dict[str, int] = {}
     files = collect_sources(project_dir)
@@ -133,31 +166,36 @@ def verify_project(project_dir: Path, ledger: FactLedger) -> VerifyReport:
             if not stripped or stripped.startswith(("#include", "#pragma", "#if", "#endif", "#else")):
                 continue
 
-            candidates: List[tuple] = []  # (literal text, int value, macro name)
+            candidates: List[tuple] = []  # (literal text, key, macro name, is_pin)
             m = _DEFINE_RE.match(code)
             define_name = m.group(1) if m else ""
-            for hm in _HEX_RE.finditer(code):
-                lit = hm.group(0)
-                n = parse_int(lit.rstrip("uUlL"))
-                if n is not None:
-                    candidates.append((lit, n, define_name))
-            if m and _HW_NAME_RE.search(define_name):
-                dm = re.fullmatch(r"\(?\s*(\d+)[uUlL]*\s*\)?", m.group(2).split("//")[0].split("/*")[0].strip())
-                if dm:
-                    candidates.append((dm.group(1), int(dm.group(1)), define_name))
+            is_pin_define = bool(m and _PIN_NAME_RE.search(define_name))
+            raw = m.group(2).split("//")[0].split("/*")[0].strip() if m else ""
+            if is_pin_define and pin_key(raw, pico):
+                candidates.append((raw.strip("() "), pin_key(raw, pico), define_name, True))
+            else:
+                for hm in _HEX_RE.finditer(code):
+                    lit = hm.group(0)
+                    n = parse_int(lit.rstrip("uUlL"))
+                    if n is not None:
+                        candidates.append((lit, n, define_name, False))
+                if m and _HW_NAME_RE.search(define_name):
+                    dm = re.fullmatch(r"\(?\s*(\d+)[uUlL]*\s*\)?", raw)
+                    if dm:
+                        candidates.append((dm.group(1), int(dm.group(1)), define_name, False))
 
             for fid in tags:
                 fact = ledger.get(fid)
                 if fact is None:
                     report.findings.append(Finding("ERROR", "UNKNOWN_FACT_TAG", rel, ln, f"{fid} is not in the Fact Ledger.", suggestion="Record the fact with record_fact first."))
 
-            for lit, n, name in candidates:
+            for lit, n, name, is_pin in candidates:
                 # small "generic" values (masks, 0/1) are skipped unless they name hardware (e.g. #define CTRL_REG 0x01)
-                if n in GENERIC_OK and not tags and not (name and _HW_NAME_RE.search(name)):
+                if not is_pin and n in GENERIC_OK and not tags and not (name and _HW_NAME_RE.search(name)):
                     continue
                 literals_checked += 1
                 tag_facts = [ledger.get(t) for t in tags if ledger.get(t)]
-                match = next((f for f in tag_facts if parse_int(f.value) == n), None)
+                match = next((f for f in tag_facts if key_of(f.value, is_pin) == n), None)
                 if match is None and tag_facts:
                     report.findings.append(Finding(
                         "ERROR", "FACT_VALUE_MISMATCH", rel, ln,
@@ -169,7 +207,7 @@ def verify_project(project_dir: Path, ledger: FactLedger) -> VerifyReport:
                 if match is None and not tags:
                     # A fact with the same number is not proof this constant means the same thing (0x68 can be an
                     # I2C address in one fact and a WHO_AM_I value in another). Require an explicit tag.
-                    ids = int_values.get(n, [])
+                    ids = known.get((is_pin, n), [])
                     if ids:
                         hints = ", ".join(f"{i} ({ledger.get(i).subject}.{ledger.get(i).property})" for i in ids[:3])
                         report.findings.append(Finding(

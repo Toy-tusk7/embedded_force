@@ -181,6 +181,40 @@ def test_upload_builds_board_and_agent_can_quote_it(tmp_path, monkeypatch):
     assert fact["ok"] and fact["fact"]["tier"] == "USER" and fact["fact"]["authoritative"]
 
 
+def test_pin_defines_must_trace_to_the_schematic(tmp_path):
+    """A pin number in code is a wiring claim: verify it against a fact quoted from the imported board."""
+    from embedforge.truth import verify_project
+    store = SourceStore(tmp_path)
+    board = _parse("Netlist_Schematic1.net", PROTEL2_PRO.encode())
+    src = store.add(eda.BOARD_SOURCE_URL, "board", board.report(), kind="schematic")
+    ledger = FactLedger(tmp_path, store)
+    line = board.query("GPIO42_ADC2")["lines"][0]
+    fid = ledger.record("U1", "SD_CLK_gpio", "GPIO42", src.id, line)["fact"]["id"]
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "pins.h").write_text(
+        f"#define SD_CLK_PIN 42 /* {fid} */\n#define SD_CMD_PIN 43 /* {fid} */\n#define LED_PIN 12\n", encoding="utf-8")
+    rep = verify_project(tmp_path, ledger)
+    codes = [(f.code, f.line) for f in rep.findings]
+    assert ("FACT_VALUE_MISMATCH", 2) in codes        # 43 is not the GPIO the cited schematic line says
+    assert ("UNSOURCED_CONSTANT", 3) in codes         # an untraced pin assignment
+    assert rep.traceability[0]["fact_id"] == fid and rep.traceability[0]["line"] == 1
+
+
+def test_betaflight_pico_pin_names_map_to_gpio(tmp_path):
+    """Betaflight's RP2350 platform names GPIO n 'PAn'; on STM32 'PA14' is a different pin than GPIO14."""
+    from embedforge.truth import verify_project
+    store = SourceStore(tmp_path)
+    board = _parse("n.net", PROTEL2_PRO.encode())
+    src = store.add(eda.BOARD_SOURCE_URL, "board", board.report(), kind="schematic")
+    ledger = FactLedger(tmp_path, store)
+    fid = ledger.record("U1", "SD_CLK_gpio", "GPIO42", src.id, board.query("GPIO42_ADC2")["lines"][0])["fact"]["id"]
+    cfg = tmp_path / "betaflight" / "configs" / "MYFC"
+    cfg.mkdir(parents=True)
+    (cfg / "config.h").write_text(f"#define SDCARD_SPI_SCK_PIN PA42 /* {fid} */\n", encoding="utf-8")
+    assert verify_project(tmp_path, ledger, pico=True).passed
+    assert not verify_project(tmp_path, ledger, pico=False).passed
+
+
 def test_agent_cannot_plant_a_schematic():
     assert check_agent_write("schematics/fake.net", "[\nU1\n]\n") is not None
 

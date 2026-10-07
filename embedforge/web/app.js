@@ -177,7 +177,7 @@
     { id: 'deliver', label: 'Deliver', icon: 'download', hint: 'Flashable .hex' },
   ];
   const TOOL_STAGE = {
-    resolve_target: 'target', init_project: 'target', web_search: 'research', fetch_document: 'research', read_source: 'research',
+    resolve_target: 'target', init_project: 'target', init_betaflight: 'target', web_search: 'research', fetch_document: 'research', read_source: 'research',
     record_fact: 'facts', record_user_fact: 'facts', list_facts: 'facts', query_board: 'facts', search_framework: 'code', read_framework_file: 'code',
     write_file: 'code', replace_in_file: 'code', read_file: 'code', list_files: 'code', build: 'build', verify: 'verify', finish: 'deliver',
   };
@@ -228,13 +228,13 @@
   // ------------------------------------------------------------------ run health
   const TOOL_LABEL = {
     web_search: 'Search', fetch_document: 'Download', read_source: 'Read source', record_fact: 'Record fact',
-    record_user_fact: 'Record your fact', list_facts: 'List facts', query_board: 'Read schematic', resolve_target: 'Find board', init_project: 'Create project',
+    record_user_fact: 'Record your fact', list_facts: 'List facts', query_board: 'Read schematic', resolve_target: 'Find board', init_project: 'Create project', init_betaflight: 'Betaflight board',
     search_framework: 'Search SDK', read_framework_file: 'Read SDK file', write_file: 'Write file', replace_in_file: 'Edit file',
     read_file: 'Read file', list_files: 'List files', build: 'Build', verify: 'Verify', set_plan: 'Update plan', ask_user: 'Ask you', finish: 'Finish',
   };
   const TOOL_ICON = {
     web_search: 'search', fetch_document: 'download', read_source: 'book', record_fact: 'shield', record_user_fact: 'shield',
-    list_facts: 'list', query_board: 'board', resolve_target: 'target', init_project: 'cpu', search_framework: 'search', read_framework_file: 'file',
+    list_facts: 'list', query_board: 'board', resolve_target: 'target', init_project: 'cpu', init_betaflight: 'cpu', search_framework: 'search', read_framework_file: 'file',
     write_file: 'edit', replace_in_file: 'edit', read_file: 'file', list_files: 'list', build: 'chip', verify: 'check',
     set_plan: 'list', ask_user: 'help', finish: 'flag',
   };
@@ -366,6 +366,7 @@
       case 'record_user_fact': return `${a.subject || ''}.${a.property || ''} = ${a.value ?? ''}`;
       case 'resolve_target': return a.query || '';
       case 'init_project': return `${a.board || ''} · ${a.framework || ''}`;
+      case 'init_betaflight': return `${a.board_name || ''} · ${a.target || ''}`;
       case 'search_framework': return a.pattern || '';
       case 'read_framework_file': return a.path || '';
       case 'write_file': case 'replace_in_file': case 'read_file': return a.path || '';

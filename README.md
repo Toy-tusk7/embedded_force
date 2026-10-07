@@ -193,6 +193,15 @@ The **Board** tab shows the MCU pin map; the agent reads it with the `query_boar
 on as a Fact Ledger entry quoting the exact connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`),
 so wiring in the firmware is traceable to your schematic. The agent cannot write to `schematics/`.
 
+### Build targets
+
+| Firmware | How it builds | Notes |
+|---|---|---|
+| Custom firmware (STM32, ESP32, AT32, RP2040, …) | PlatformIO, project-local core | Boards from the PlatformIO registry; ArteryTek AT32 platform auto-installed |
+| Custom firmware for RP2350 / RP2354 | PlatformIO + community platform [`maxgerhardt/platform-raspberrypi`](https://github.com/maxgerhardt/platform-raspberrypi) (Arduino-Pico core) | Not official PlatformIO support. RP2354A/B = RP2350A/B with 2 MB stacked flash: use an RP2350B board such as `weact_rp2350b` with `board_upload.maximum_size = 2097152` |
+| Betaflight board configs | Betaflight `2026.6.2` checkout + its own toolchain, built in **WSL** (`make CONFIG=<BOARD>`) | One-time setup in `~/.embedforge` (no sudo): Betaflight, Arm GCC 13.3.1, portable CMake, Pico SDK, picotool, official reference configs. The agent writes `betaflight/configs/CUST/<BOARD>/config.h` from the imported schematic; every pin is verified against the schematic **and** against the RP2350 peripheral pin tables. RP2354 flash size (2 MB) is set by a generated `config.mk` / `pico_flash_mem.ld` |
+| INAV | not supported here | Official INAV targets are STM32F4/F7/H7 and AT32F435; INAV 10.0 pre-releases add an experimental, bench-test-only RP2350A target. An RP2350B/RP2354B port is a separate engineering project |
+
 ### Agent guard-rails
 
 * **No fake targets.** MCUs are resolved against the real PlatformIO registry. Official vendor platforms that are

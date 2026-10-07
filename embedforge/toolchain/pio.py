@@ -46,20 +46,37 @@ def _pio_cmd(args: List[str]) -> List[str]:
     return [sys.executable, "-m", "platformio", *args]
 
 
-# Official vendor PlatformIO platforms that are not in the default registry. Only these URLs are ever
-# installed automatically; MCU part-number prefixes map to the platform that supports them.
+# PlatformIO platforms that are not in the default registry. Only these URLs are ever installed
+# automatically; MCU part-number prefixes map to the platform that supports them. `family` is the registry
+# MCU name to list boards by when the exact part (e.g. RP2354B) has no board of its own.
 VENDOR_PLATFORMS: Dict[str, Dict[str, Any]] = {
     "arterytekat32": {
         "url": "https://github.com/ArteryTek/platform-arterytekat32.git",
         "prefixes": ("AT32",),
         "vendor": "ArteryTek",
         "framework": "at32firmlib",
+        "official": True,
+    },
+    # RP2350 / RP2354 are not supported by PlatformIO's official raspberrypi platform (RP2040 only). This fork with
+    # Earle Philhower's Arduino-Pico core is the de-facto PlatformIO route; enabled at the user's request.
+    "rp2350": {
+        "url": "https://github.com/maxgerhardt/platform-raspberrypi.git",
+        "prefixes": ("RP2350", "RP2354", "PICO2"),
+        "vendor": "community (maxgerhardt / Arduino-Pico)",
+        "framework": "arduino",
+        "family": "rp2350",
+        "official": False,
+        "use_url": True,  # its installed name 'raspberrypi' collides with the official RP2040-only platform
+        "note": ("RP2354A/RP2354B are the RP2350A (QFN-60, 30 GPIO) / RP2350B (QFN-80, 48 GPIO) with 2 MB of in-package "
+                 "flash (https://www.raspberrypi.com/news/rp2350-a4-rp2354-and-a-new-hacking-challenge/). There is no "
+                 "RP2354 board definition: pick an RP2350B board for an RP2354B (e.g. weact_rp2350b) or an RP2350A board "
+                 "for an RP2354A, and pass options=['board_upload.maximum_size = 2097152'] to init_project."),
     },
 }
 
 
 def vendor_platform_for(query: str) -> Optional[str]:
-    """Return the vendor platform name whose MCU prefixes match `query` (e.g. 'AT32F421' -> 'arterytekat32')."""
+    """Return the vendor platform key whose MCU prefixes match `query` (e.g. 'AT32F421' -> 'arterytekat32')."""
     q = re.sub(r"[^A-Z0-9]", "", query.upper())
     for name, spec in VENDOR_PLATFORMS.items():
         if any(q.startswith(p) or p in q for p in spec["prefixes"]):
@@ -67,8 +84,56 @@ def vendor_platform_for(query: str) -> Optional[str]:
     return None
 
 
+def _platform_source(d: Path) -> str:
+    """Where an installed platform came from: git origin, PlatformIO's install record, or its manifest."""
+    gitcfg = d / ".git" / "config"
+    if gitcfg.is_file():
+        m = re.search(r'\[remote "origin"\][^\[]*?url\s*=\s*(\S+)', gitcfg.read_text(encoding="utf-8", errors="ignore"))
+        if m:
+            return m.group(1)
+    for rec, getter in ((d / ".piopm", lambda j: (j.get("spec") or {}).get("uri", "")),
+                        (d / "platform.json", lambda j: (j.get("repository") or {}).get("url", ""))):
+        if rec.is_file():
+            try:
+                src = getter(json.loads(rec.read_text(encoding="utf-8")))
+            except Exception:
+                src = ""
+            if src:
+                return src
+    return ""
+
+
+def _norm_url(u: str) -> str:
+    return re.sub(r"^git\+", "", u.strip().lower()).removesuffix("/").removesuffix(".git")
+
+
+def _installed_platform_dir(spec: Dict[str, Any]) -> Optional[Path]:
+    """Installed platform that came from the spec URL (names can collide: the RP2350 fork is also 'raspberrypi')."""
+    base = core_dir() / "platforms"
+    if not base.is_dir():
+        return None
+    want = _norm_url(spec["url"])
+    for d in base.iterdir():
+        if d.is_dir() and _norm_url(_platform_source(d)) == want:
+            return d
+    return None
+
+
 def platform_installed(name: str) -> bool:
-    return (core_dir() / "platforms" / name).is_dir()
+    spec = VENDOR_PLATFORMS.get(name)
+    return _installed_platform_dir(spec) is not None if spec else (core_dir() / "platforms" / name).is_dir()
+
+
+def vendor_platform_name(name: str) -> Optional[str]:
+    """PlatformIO's own name for an installed vendor platform (what `pio boards` reports as `platform`)."""
+    spec = VENDOR_PLATFORMS.get(name)
+    d = _installed_platform_dir(spec) if spec else None
+    if d is None:
+        return None
+    try:
+        return json.loads((d / "platform.json").read_text(encoding="utf-8")).get("name")
+    except Exception:
+        return None
 
 
 def _run_streaming(cmd: List[str], cwd: Optional[Path], on_line: LineSink, timeout_s: int) -> tuple:

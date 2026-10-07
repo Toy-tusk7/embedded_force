@@ -159,7 +159,36 @@ def test_agent_write_policy():
 def test_vendor_platform_detection():
     assert pio.vendor_platform_for("AT32F421G8U7") == "arterytekat32"
     assert pio.vendor_platform_for("custom ESC at32f421") == "arterytekat32"
-    assert pio.vendor_platform_for("STM32F401") is None
+    assert pio.vendor_platform_for("RP2354B") == "rp2350"
+    assert pio.vendor_platform_for("RP2040") is None and pio.vendor_platform_for("STM32F401") is None
+
+
+RP2350B_BOARD = {"id": "weact_rp2350b", "name": "Studio RP2350B Core Board", "vendor": "WeAct", "platform": "raspberrypi",
+                 "mcu": "RP2350", "fcpu_hz": 150_000_000, "ram_bytes": 524288, "flash_bytes": 16777216, "frameworks": ["arduino", "picosdk"]}
+
+
+def test_rp2354b_resolves_to_rp2350_family_with_note(project, monkeypatch):
+    monkeypatch.setattr(pio, "platform_installed", lambda name: True)
+    monkeypatch.setattr(pio, "list_boards", lambda q, limit=25: [RP2350B_BOARD] if q == "rp2350" else [])
+    store = SourceStore(project.root)
+    belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
+    res = belt.resolve_target("RP2354B")
+    assert res["found"] and res["boards"][0]["id"] == "weact_rp2350b"
+    assert "2 MB" in res["note"] and res["official_platform"] is False
+
+
+def test_init_project_pins_fork_url_and_board_options(project, monkeypatch):
+    monkeypatch.setattr(pio, "list_boards", lambda q, limit=25: [RP2350B_BOARD])
+    monkeypatch.setattr(pio, "install_project_packages", lambda root, on_line=None: {"ok": True, "error": ""})
+    monkeypatch.setattr(pio, "framework_roots", lambda fw="": [])
+    store = SourceStore(project.root)
+    belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
+    res = belt.init_project("weact_rp2350b", "arduino", options=["board_upload.maximum_size = 2097152"])
+    ini = res["platformio_ini"]
+    assert "platform = https://github.com/maxgerhardt/platform-raspberrypi.git" in ini
+    assert "board_upload.maximum_size = 2097152" in ini
+    assert "error" in belt.init_project("weact_rp2350b", "arduino", options=["extra_scripts = pre:x.py"])
+    assert "error" in belt.init_project("weact_rp2350b", "arduino", options=["board_build.x = 1\nextra_scripts = x.py"])
 
 
 def test_model_description_from_id():
