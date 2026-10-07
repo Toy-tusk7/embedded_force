@@ -152,7 +152,8 @@ def verify_project(project_dir: Path, ledger: FactLedger) -> VerifyReport:
                     report.findings.append(Finding("ERROR", "UNKNOWN_FACT_TAG", rel, ln, f"{fid} is not in the Fact Ledger.", suggestion="Record the fact with record_fact first."))
 
             for lit, n, name in candidates:
-                if n in GENERIC_OK and not tags:
+                # small "generic" values (masks, 0/1) are skipped unless they name hardware (e.g. #define CTRL_REG 0x01)
+                if n in GENERIC_OK and not tags and not (name and _HW_NAME_RE.search(name)):
                     continue
                 literals_checked += 1
                 tag_facts = [ledger.get(t) for t in tags if ledger.get(t)]
@@ -165,10 +166,19 @@ def verify_project(project_dir: Path, ledger: FactLedger) -> VerifyReport:
                         literal=lit, suggestion="Use the exact value from the cited fact, or cite the correct fact.",
                     ))
                     continue
-                if match is None:
+                if match is None and not tags:
+                    # A fact with the same number is not proof this constant means the same thing (0x68 can be an
+                    # I2C address in one fact and a WHO_AM_I value in another). Require an explicit tag.
                     ids = int_values.get(n, [])
                     if ids:
-                        match = ledger.get(ids[0])
+                        hints = ", ".join(f"{i} ({ledger.get(i).subject}.{ledger.get(i).property})" for i in ids[:3])
+                        report.findings.append(Finding(
+                            "ERROR", "UNTAGGED_CONSTANT", rel, ln,
+                            f"Constant {lit}" + (f" ({name})" if name else "") + f" is not tagged. Ledger facts with this value: {hints}.",
+                            literal=lit,
+                            suggestion=f"If it means the same thing, add /* {ids[0]} */ on this line; otherwise record the correct fact.",
+                        ))
+                        continue
                 if match is None:
                     report.findings.append(Finding(
                         "ERROR", "UNSOURCED_CONSTANT", rel, ln,

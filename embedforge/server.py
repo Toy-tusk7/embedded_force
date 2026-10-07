@@ -16,8 +16,11 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import time
+
 from embedforge.core.config import config
 from embedforge.agent import AgentRunner, ProjectManager, RunSession
+from embedforge.agent.llm import default_provider, list_models, providers
 from embedforge.agent.workspace import (
     HIDDEN_DIRS, TEXT_EXTS, IMAGE_EXTS, DOC_EXTS, ARCHIVE_EXTS, ALLOWED_EXTS
 )
@@ -88,6 +91,11 @@ class SelectPromptRequest(BaseModel):
     id: str
 
 
+class SelectModelRequest(BaseModel):
+    model: str
+    provider: str = "nebius"
+
+
 class EditPromptRequest(BaseModel):
     text: str
 
@@ -121,17 +129,58 @@ def serve_js():
 
 
 # ------------------------------------------------------------------ status
+_PIO_STATUS: Dict[str, Any] = {"t": 0.0, "ok": False}
+
+
+def _pio_available() -> bool:
+    """`pio --version` spawns a Python process; cache it so the UI's periodic status poll stays cheap."""
+    if time.time() - _PIO_STATUS["t"] > 300:
+        _PIO_STATUS.update(t=time.time(), ok=pio.is_available())
+    return _PIO_STATUS["ok"]
+
+
 @app.get("/api/config")
 def get_system_config():
     return {
         "nebius_model": config.agent_model,
         "nebius_active": config.has_nebius,
+        "llm_active": config.has_llm,
+        "default_provider": default_provider(),
         "tavily_active": config.has_tavily,
         "langsmith_active": bool(os.getenv("LANGCHAIN_API_KEY")),
         "langsmith_project": os.getenv("LANGCHAIN_PROJECT", "EmbedForge"),
-        "platformio_available": pio.is_available(),
+        "platformio_available": _pio_available(),
         "toolchains": sorted(p.name for p in (pio.core_dir() / "packages").glob("*")) if (pio.core_dir() / "packages").is_dir() else [],
     }
+
+
+# ------------------------------------------------------------------ models
+@app.get("/api/models")
+def get_models(refresh: bool = False):
+    models: List[Dict[str, Any]] = []
+    errors: Dict[str, str] = {}
+    provs = []
+    for pid, p in providers().items():
+        provs.append({"id": pid, "name": p.name, "configured": p.configured})
+        if p.configured:
+            res = list_models(pid, force=refresh)
+            models += res["models"]
+            if res["error"]:
+                errors[pid] = res["error"]
+    return {"default": {"provider": default_provider(), "model": config.agent_model},
+            "providers": provs, "models": models, "errors": errors}
+
+
+@app.post("/api/projects/{project_id}/model")
+def set_project_model(project_id: str, req: SelectModelRequest):
+    p = _project(project_id)
+    prov = providers().get(req.provider)
+    if prov is None or not prov.configured:
+        raise HTTPException(status_code=400, detail=f"Provider '{req.provider}' is not configured.")
+    listed = {m["id"] for m in list_models(req.provider)["models"]}
+    if listed and req.model not in listed:
+        raise HTTPException(status_code=400, detail=f"Model '{req.model}' is not offered by {prov.name}.")
+    return p.update_meta(model=req.model, provider=req.provider)
 
 
 # ------------------------------------------------------------------ prompts
@@ -410,6 +459,9 @@ def _start_run(project_id: str, message: str) -> Dict[str, Any]:
     def work():
         try:
             AgentRunner(project, session).run(message)
+        except Exception as e:  # e.g. the project's saved provider was removed from .env
+            session.emit("error", message=f"{type(e).__name__}: {e}")
+            session.finish("failed")
         finally:
             with _LOCK:
                 if _ACTIVE.get(project_id) == run_id:
@@ -424,8 +476,8 @@ def chat(project_id: str, req: ChatRequest):
     msg = req.message.strip()
     if not msg:
         raise HTTPException(status_code=400, detail="Empty message")
-    if not config.has_nebius:
-        raise HTTPException(status_code=503, detail="NEBIUS_API_KEY not configured")
+    if not config.has_llm:
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set NEBIUS_API_KEY or NVIDIA_API_KEY)")
     if req.attachments:
         msg += f"\n\n[User uploaded attachments: {', '.join(req.attachments)}]"
     return _start_run(project_id, msg)
@@ -444,8 +496,8 @@ def debug(project_id: str, req: DebugRequest):
         parts.append(f"Scope/logic analyzer: {req.scope_notes}")
     parts.append("Diagnose using the existing project and ledger, research the datasheet/errata as needed, "
                  "fix the firmware if it is a software cause, rebuild and verify; otherwise tell me exactly what to check.")
-    if not config.has_nebius:
-        raise HTTPException(status_code=503, detail="NEBIUS_API_KEY not configured")
+    if not config.has_llm:
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set NEBIUS_API_KEY or NVIDIA_API_KEY)")
     return _start_run(project_id, "\n".join(parts))
 
 

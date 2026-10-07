@@ -76,10 +76,14 @@ class EmbedForgePipeline:
 
         # 4. KNOWLEDGE (Provenance store & conflict checks)
         self.state.transition_to(WorkflowState.KNOWLEDGE, "Promoting approved resources to trusted Knowledge Base")
-        target_subjects = list({gap.target_subject for gap in req_set.information_gaps if gap.target_subject} | {
-            r.explicit_facts.get("target_component") for r in req_set.requirements if r.explicit_facts.get("target_component")
-        })
-        primary_subject = target_subjects[0] if target_subjects else "MPU6050"
+        # Facts are keyed on the peripheral being driven (e.g. MPU6050), not the MCU; keep first-mention order.
+        target_subjects = list(dict.fromkeys(
+            [r.explicit_facts["target_component"] for r in req_set.requirements if r.explicit_facts.get("target_component")]
+            + [gap.target_subject for gap in req_set.information_gaps if gap.target_subject]
+        ))
+        mcu_prefixes = ("STM32", "AT32", "GD32", "ESP32", "ESP8266", "RP2040", "RP2350", "NRF5", "ATMEGA", "ATSAM", "CH32", "MSP430")
+        peripherals = [t for t in target_subjects if not str(t).upper().startswith(mcu_prefixes)]
+        primary_subject = (peripherals or target_subjects or ["MPU6050"])[0]
         kb = self.knowledge_engine.ingest_approved_sources(approved_sources, target_subject=primary_subject)
         self.evidence_engine.record_node("KNOW-001", "KNOWLEDGE_BASE", ["RES-001"], f"Stored {len(kb.items)} proven facts with {len(kb.conflicts)} conflicts.")
 

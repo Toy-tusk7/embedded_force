@@ -46,6 +46,92 @@ def _pio_cmd(args: List[str]) -> List[str]:
     return [sys.executable, "-m", "platformio", *args]
 
 
+# Official vendor PlatformIO platforms that are not in the default registry. Only these URLs are ever
+# installed automatically; MCU part-number prefixes map to the platform that supports them.
+VENDOR_PLATFORMS: Dict[str, Dict[str, Any]] = {
+    "arterytekat32": {
+        "url": "https://github.com/ArteryTek/platform-arterytekat32.git",
+        "prefixes": ("AT32",),
+        "vendor": "ArteryTek",
+        "framework": "at32firmlib",
+    },
+}
+
+
+def vendor_platform_for(query: str) -> Optional[str]:
+    """Return the vendor platform name whose MCU prefixes match `query` (e.g. 'AT32F421' -> 'arterytekat32')."""
+    q = re.sub(r"[^A-Z0-9]", "", query.upper())
+    for name, spec in VENDOR_PLATFORMS.items():
+        if any(q.startswith(p) or p in q for p in spec["prefixes"]):
+            return name
+    return None
+
+
+def platform_installed(name: str) -> bool:
+    return (core_dir() / "platforms" / name).is_dir()
+
+
+def _run_streaming(cmd: List[str], cwd: Optional[Path], on_line: LineSink, timeout_s: int) -> tuple:
+    """Run a command, stream merged stdout/stderr lines, and kill it if it exceeds `timeout_s` even when silent."""
+    import threading
+
+    lines: List[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd) if cwd else None, env=_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+    except Exception as e:
+        return -1, [f"Could not launch: {e}"], False
+    timed_out = {"v": False}
+
+    def _kill() -> None:
+        timed_out["v"] = True
+        proc.kill()
+
+    watchdog = threading.Timer(timeout_s, _kill)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            lines.append(line)
+            if on_line:
+                on_line(line)
+        proc.wait()
+    finally:
+        watchdog.cancel()
+    if timed_out["v"]:
+        lines.append(f"Timed out after {timeout_s}s.")
+    return proc.returncode, lines, timed_out["v"]
+
+
+def install_platform(name: str, on_line: LineSink = None, timeout_s: int = 1800) -> Dict[str, Any]:
+    """Install an allow-listed vendor platform into the project-local PlatformIO core."""
+    spec = VENDOR_PLATFORMS.get(name)
+    if spec is None:
+        return {"ok": False, "error": f"'{name}' is not an allow-listed vendor platform."}
+    if platform_installed(name):
+        return {"ok": True, "already_installed": True}
+    code, lines, timed_out = _run_streaming(_pio_cmd(["pkg", "install", "-g", "-p", spec["url"]]), None, on_line, timeout_s)
+    ok = code == 0 and not timed_out
+    if ok:
+        cache = core_dir() / "boards_cache.json"
+        if cache.exists():
+            cache.unlink()
+    logger.log_event("PIO_PLATFORM", f"install {name}: ok={ok}")
+    return {"ok": ok, "error": "" if ok else "\n".join(lines[-15:])}
+
+
+def install_project_packages(project_dir: Path, on_line: LineSink = None, timeout_s: int = 1800) -> Dict[str, Any]:
+    """Download the project's platform, toolchain and SDK framework without compiling (so SDK headers are searchable)."""
+    code, lines, timed_out = _run_streaming(_pio_cmd(["pkg", "install", "-d", str(project_dir)]), project_dir, on_line, timeout_s)
+    ok = code == 0 and not timed_out
+    logger.log_event("PIO_PKG", f"install for {project_dir.name}: ok={ok}")
+    return {"ok": ok, "error": "" if ok else "\n".join(lines[-15:])}
+
+
 def is_available() -> bool:
     try:
         r = subprocess.run(_pio_cmd(["--version"]), capture_output=True, text=True, timeout=60, env=_env())
@@ -90,6 +176,11 @@ def list_boards(query: str = "", limit: int = 25) -> List[Dict[str, Any]]:
             "mcu": b.get("mcu"), "fcpu_hz": b.get("fcpu"), "ram_bytes": b.get("ram"), "flash_bytes": b.get("rom"),
             "frameworks": b.get("frameworks", []), "_score": score,
         })
+    if not out and len(q) > 1:
+        # e.g. "AT32F421 custom ESC": fall back to the tokens that look like part numbers
+        parts = [t for t in q if re.search(r"\d", t) and re.search(r"[a-z]", t)]
+        if parts and len(parts) < len(q):
+            return list_boards(" ".join(parts), limit)
     out.sort(key=lambda x: (-x["_score"], len(x["id"] or "")))
     for o in out:
         o.pop("_score", None)
@@ -187,27 +278,12 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 1500) ->
     env_name = _parse_env_name(project_dir)
     if not env_name:
         return BuildResult(ok=False, error="platformio.ini missing or has no [env:...] section. Call init_project first.")
-    lines: List[str] = []
-    try:
-        proc = subprocess.Popen(
-            _pio_cmd(["run", "-d", str(project_dir)]), cwd=str(project_dir), env=_env(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
-    except Exception as e:
-        return BuildResult(ok=False, env=env_name, error=f"Could not launch PlatformIO: {e}")
-    assert proc.stdout is not None
-    deadline = t0 + timeout_s
-    for raw in proc.stdout:
-        line = raw.rstrip("\r\n")
-        lines.append(line)
-        if on_line:
-            on_line(line)
-        if time.time() > deadline:
-            proc.kill()
-            lines.append("Build timed out.")
-            break
-    proc.wait()
-    res = BuildResult(ok=proc.returncode == 0, env=env_name, duration_s=round(time.time() - t0, 1))
+    code, lines, timed_out = _run_streaming(_pio_cmd(["run", "-d", str(project_dir)]), project_dir, on_line, timeout_s)
+    if code == -1:
+        return BuildResult(ok=False, env=env_name, error=lines[0] if lines else "Could not launch PlatformIO")
+    res = BuildResult(ok=code == 0 and not timed_out, env=env_name, duration_s=round(time.time() - t0, 1))
+    if timed_out:
+        res.error = f"Build timed out after {timeout_s}s."
     res.diagnostics = parse_diagnostics(lines)
     for ln in lines:
         m = _MEM_RE.match(ln.strip())
@@ -244,6 +320,15 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def framework_roots() -> List[Path]:
+def framework_roots(framework: str = "") -> List[Path]:
+    """Installed SDK package roots; narrowed to the project's framework when one is given and installed."""
     pk = core_dir() / "packages"
-    return sorted(pk.glob("framework-*")) if pk.is_dir() else []
+    if not pk.is_dir():
+        return []
+    roots = sorted(pk.glob("framework-*"))
+    fw = re.sub(r"[^a-z0-9]", "", (framework or "").lower())
+    if fw:
+        mine = [r for r in roots if re.sub(r"[^a-z0-9]", "", r.name.lower()).startswith("framework" + fw)]
+        if mine:
+            return mine
+    return roots

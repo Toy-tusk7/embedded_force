@@ -126,17 +126,28 @@ pip install -e .
 
 ### Environment Configuration
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env` and fill in your keys (`.env` is git-ignored — never commit it):
 
 ```ini
 # Nebius AI Cloud / Token Factory
 NEBIUS_API_KEY=your_nebius_api_key_here
 NEBIUS_BASE_URL=https://api.studio.nebius.ai/v1
-NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B
+NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B   # default; change per project in the UI
 
-# Tavily AI Search (Optional: uses high-fidelity technical fixtures if unset)
+# Optional second provider: NVIDIA API catalog / NIM (https://build.nvidia.com)
+NVIDIA_API_KEY=
+
+# Tavily AI Search (required for live datasheet research)
 TAVILY_API_KEY=your_tavily_api_key_here
 ```
+
+### Choosing the model
+
+The model picker in the top bar lists every chat model your provider(s) offer, NVIDIA Nemotron models first,
+with their size parsed from the model id (e.g. `30B · 3B active`). The choice is saved per project.
+Small active-parameter models (such as Nemotron 3 Nano, 3B active) tend to loop in research on long
+firmware tasks; larger ones (Nemotron 3 Super / Ultra) follow the research → code → build → verify loop
+more reliably.
 
 ---
 
@@ -158,12 +169,26 @@ Run the local FastAPI dashboard:
 ```bash
 python -m embedforge.server
 ```
-Then navigate to **`http://localhost:8000`** in your browser to interact with:
-* Real-time pipeline execution & live Tavily search stream.
-* Interactive Human Approval Gate.
-* C Code viewer with syntax highlighting and patch diffs.
-* Physical Hardware Boundary & Errata Diagnostic Engine.
-* Benchmark Scorecard with live metrics.
+Then navigate to **`http://localhost:8000`** in your browser:
+* **Pipeline stepper** — Understand → Target → Research → Facts → Code → Build → Verify → Deliver, live per run.
+* **Run health** — tool-call breakdown and a plain-language diagnosis of where a run stalled
+  (e.g. "Stuck in research: 9 searches but no facts recorded").
+* **Conversation** with tool calls grouped into readable activity blocks, guard warnings and ask-user cards.
+* **Workspace** — files with FACT-tag links and error-line marks, the fact ledger, sources with trust tiers,
+  versioned builds (.hex/.bin/.elf), checks (compiler + datasheet verification + traceability) and a terminal.
+* Model picker, Strict / Fast / Custom prompt modes, light & dark themes, responsive down to phone width.
+
+### Agent guard-rails
+
+* **No fake targets.** MCUs are resolved against the real PlatformIO registry. Official vendor platforms that are
+  not in the default registry (currently ArteryTek AT32 → `arterytekat32` / `at32firmlib`) are installed
+  automatically from an allow-list; anything else is reported as unsupported rather than built for another chip.
+* **SDK first.** `init_project` downloads the toolchain and SDK immediately so the agent can look up real SDK
+  function names before writing code.
+* **Progress guard.** More than 6 searches (or 10 SDK lookups) without recording a fact or changing code blocks
+  further searching with a concrete next step; 14 idle steps trigger a nudge and 28 pause the run for your input.
+* **Build sandbox policy.** The agent cannot write `extra_scripts`, `platform_packages`, `!command` flags,
+  URL `lib_deps`, `*.py` or `library.json` — the ways a PlatformIO build can execute code on your machine.
 
 ---
 

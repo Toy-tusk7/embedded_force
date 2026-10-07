@@ -38,10 +38,11 @@ class VerificationEngine:
         # ==================== Plugin 1: I2C Device Address Verification ====================
         rules_checked += 1
         addr_fact = kb.find_fact(target_sensor, "i2c_primary_address")
-        expected_addr = addr_fact.value if addr_fact else "0x68"
+        # Zero-invention: without an approved fact there is no expected value to compare against.
+        expected_addr = addr_fact.value if addr_fact else None
 
         for proto in behavior.all_protocol_calls:
-            if proto.bus == "I2C" and proto.target_address:
+            if expected_addr is not None and proto.bus == "I2C" and proto.target_address:
                 if proto.target_address.lower() != str(expected_addr).lower():
                     f = Finding(
                         id=f"FIND-{finding_id:03d}",
@@ -65,10 +66,10 @@ class VerificationEngine:
         # ==================== Plugin 2: WHO_AM_I Register Verification ====================
         rules_checked += 1
         whoami_fact = kb.find_fact(target_sensor, "who_am_i_reg")
-        expected_whoami = whoami_fact.value if whoami_fact else "0x75"
+        expected_whoami = whoami_fact.value if whoami_fact else None
 
         for reg in behavior.all_register_accesses:
-            if "WHO_AM_I" in (reg.register_name or ""):
+            if expected_whoami is not None and "WHO_AM_I" in (reg.register_name or ""):
                 if reg.address_or_offset.lower() != str(expected_whoami).lower():
                     f = Finding(
                         id=f"FIND-{finding_id:03d}",
@@ -120,9 +121,9 @@ class VerificationEngine:
                 min_dt_fact = item
                 break
 
-        min_dt_val = int(min_dt_fact.value) if min_dt_fact else 200
+        min_dt_val = int(min_dt_fact.value) if min_dt_fact else None
 
-        dt_calls = [p for p in behavior.all_protocol_calls if p.bus == "PWM" and p.operation == "DEADTIME_CONFIG"]
+        dt_calls = [p for p in behavior.all_protocol_calls if p.bus == "PWM" and p.operation == "DEADTIME_CONFIG"] if min_dt_val is not None else []
         for dt in dt_calls:
             actual_dt = dt.timeout_ms or 0
             if actual_dt < min_dt_val:

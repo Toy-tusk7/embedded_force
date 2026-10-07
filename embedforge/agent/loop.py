@@ -2,11 +2,12 @@
 
 import json
 import time
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from embedforge.agent.events import RunSession
 from embedforge.agent.llm import AgentLLM, LLMError, parse_tool_args
-from embedforge.agent.prompts import SYSTEM_PROMPT, get_active_prompt_text
+from embedforge.agent.prompts import get_active_prompt_text
 from embedforge.agent.tools import TOOL_SPECS, ToolBelt
 from embedforge.agent.workspace import Project
 from embedforge.core.config import config
@@ -17,6 +18,15 @@ from embedforge.truth import FactLedger, SourceStore
 MAX_CONTEXT_CHARS = 45_000
 KEEP_RECENT = 6
 
+# Tools whose success means the run moved forward (resets the research / SDK budgets).
+PROGRESS_TOOLS = {"record_fact", "record_user_fact", "init_project", "write_file", "replace_in_file", "build", "verify"}
+RESEARCH_TOOLS = {"web_search", "fetch_document"}
+SDK_TOOLS = {"search_framework", "read_framework_file"}
+MAX_RESEARCH_WITHOUT_PROGRESS = 6
+MAX_SDK_WITHOUT_PROGRESS = 10
+STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
+STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
+
 
 def _summ(result: Any, limit: int = 500) -> str:
     s = json.dumps(result, default=str)
@@ -26,7 +36,7 @@ def _summ(result: Any, limit: int = 500) -> str:
 def _compact(messages: List[Dict[str, Any]]) -> None:
     """Shrink old messages safely while preserving turn integrity and valid tool-call pairs."""
     if len(messages) > 20:
-        # Walk back to find a clean cut point that is not in the middle of tool responses
+        # Walk forward to a clean cut point that is not in the middle of tool responses
         cut_idx = max(1, len(messages) - 16)
         while cut_idx < len(messages) and messages[cut_idx].get("role") == "tool":
             cut_idx += 1
@@ -50,6 +60,10 @@ def _compact(messages: List[Dict[str, Any]]) -> None:
                             data["excerpts"] = data["excerpts"][:1]
                         if "preview" in data and len(data["preview"]) > 200:
                             data["preview"] = data["preview"][:200] + "…"
+                        if isinstance(data.get("results"), list):
+                            for r in data["results"]:
+                                if isinstance(r, dict) and len(r.get("excerpt", "")) > 200:
+                                    r["excerpt"] = r["excerpt"][:200] + "…"
                         m["content"] = json.dumps(data)
                     else:
                         m["content"] = c[:300] + " …[truncated]"
@@ -57,11 +71,53 @@ def _compact(messages: List[Dict[str, Any]]) -> None:
                     m["content"] = c[:300] + " …[truncated]"
 
 
+class ProgressGuard:
+    """Stops unproductive loops (endless searching / SDK grepping) with tool-agnostic budgets.
+
+    Budgets reset whenever a progress tool succeeds, so a run that keeps recording facts or editing
+    code is never blocked; a run that only searches is told exactly what to do instead.
+    """
+
+    def __init__(self) -> None:
+        self.research = 0
+        self.sdk = 0
+        self.steps_since_progress = 0
+        self.calls: Counter = Counter()
+        self.failures: Counter = Counter()
+
+    def before(self, name: str, n_sources: int) -> Optional[Dict[str, Any]]:
+        if name in RESEARCH_TOOLS and self.research >= MAX_RESEARCH_WITHOUT_PROGRESS:
+            return {"error": (
+                f"Research budget reached: {self.research} searches/fetches since your last recorded fact or code change "
+                f"({n_sources} sources already stored). Searching is blocked until you make progress. Next: read_source on "
+                "the best datasheet you have and record_fact, record_user_fact for what the user stated, write the code with "
+                "SDK symbols, or ask_user for the specific value you cannot find."
+            ), "guard": "research_budget"}
+        if name in SDK_TOOLS and self.sdk >= MAX_SDK_WITHOUT_PROGRESS:
+            return {"error": (
+                f"SDK search budget reached ({self.sdk} lookups without writing code). Write the firmware with the "
+                "functions you have found, then build — compiler errors will tell you exactly which names are wrong."
+            ), "guard": "sdk_budget"}
+        return None
+
+    def after(self, name: str, ok: bool) -> None:
+        self.calls[name] += 1
+        if not ok:
+            self.failures[name] += 1
+        if name in PROGRESS_TOOLS and ok:
+            self.research = self.sdk = self.steps_since_progress = 0
+        elif name in RESEARCH_TOOLS:
+            self.research += 1
+        elif name in SDK_TOOLS:
+            self.sdk += 1
+
+
 class AgentRunner:
-    def __init__(self, project: Project, session: RunSession, model: Optional[str] = None):
+    def __init__(self, project: Project, session: RunSession, model: Optional[str] = None, provider: Optional[str] = None):
         self.project = project
         self.session = session
-        self.llm = AgentLLM(model)
+        meta = project.meta()
+        self.llm = AgentLLM(model or meta.get("model"), provider or meta.get("provider"))
 
     # ------------------------------------------------------------------ helpers
     def _requirement_context(self, text: str) -> str:
@@ -87,7 +143,8 @@ class AgentRunner:
         meta = self.project.meta()
         builds = self.project.builds()
         lines = [f"# Walkthrough — {meta.get('name')}", "",
-                 f"- **Target:** {meta.get('board')} ({meta.get('mcu')}), framework `{meta.get('framework')}`", ""]
+                 f"- **Target:** {meta.get('board')} ({meta.get('mcu')}), framework `{meta.get('framework')}`",
+                 f"- **Model:** `{self.llm.model}` via {self.llm.provider.name}", ""]
         lines += ["## Facts used (each with verbatim quote & source)", "", "| ID | Subject | Property | Value | Tier | Source |", "|---|---|---|---|---|---|"]
         for f in ledger.facts.values():
             lines.append(f"| {f.id} | {f.subject} | {f.property} | `{f.value}` | {f.tier} | {f.source_url} |")
@@ -105,6 +162,12 @@ class AgentRunner:
         self.session.emit("artifact", name="walkthrough.md", markdown=text)
         return text
 
+    def _state_digest(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger) -> str:
+        has_ini = (self.project.root / "platformio.ini").exists()
+        srcs = [f["path"] for f in self.project.list_files() if f["path"].startswith(("src/", "include/"))]
+        return (f"facts={len(ledger.facts)}, sources={len(store.sources)}, project_initialised={has_ini}, "
+                f"source_files={len(srcs)}, last_build_ok={belt.state['build_ok']}, verify_ok={belt.state['verify_ok']}")
+
     # ------------------------------------------------------------------ run
     def run(self, user_message: str) -> None:
         s = self.session
@@ -112,9 +175,11 @@ class AgentRunner:
         store = SourceStore(project.root)
         ledger = FactLedger(project.root, store)
         belt = ToolBelt(project, s, store, ledger)
+        guard = ProgressGuard()
         span = f"agent-{s.run_id}"
         tracer.start_span(span, "EmbedForge Agent Run", run_type="chain", inputs={"user_message": user_message, "project": project.id})
         status = "failed"
+        steps = 0
         messages: List[Dict[str, Any]] = []
         try:
             messages = project.load_conversation()
@@ -126,9 +191,9 @@ class AgentRunner:
                 project.update_meta(name=user_message.strip().split("\n")[0][:48] or project.id, title_set=True)
                 s.emit("project", meta=project.meta())
 
-            s.emit("status", text="Agent started", model=self.llm.model)
-            consecutive_searches = 0
+            s.emit("status", text="Agent started", model=self.llm.model, provider=self.llm.provider.id)
             for step in range(config.agent_max_steps):
+                steps = step + 1
                 if s.cancel_requested:
                     status = "cancelled"
                     s.emit("status", text="Cancelled by user")
@@ -150,7 +215,7 @@ class AgentRunner:
                     amsg["tool_calls"] = tool_calls
                 messages.append(amsg)
                 project.trace({"step": step, "llm_seconds": dt, "usage": resp["usage"], "content": resp["content"][:2000],
-                               "tool_calls": [tc["function"]["name"] for tc in tool_calls]})
+                               "model": self.llm.model, "tool_calls": [tc["function"]["name"] for tc in tool_calls]})
                 if resp["content"]:
                     s.emit("message", text=resp["content"], final=not tool_calls)
 
@@ -165,42 +230,26 @@ class AgentRunner:
 
                 if not tool_calls:
                     # Model gave a conversational response or asked for input without calling tools.
-                    # Pause cleanly and wait for the real user.
                     status = "needs_input"
                     break
 
                 for tc in tool_calls:
                     name = tc["function"]["name"]
-                    if name in ("web_search", "fetch_document"):
-                        consecutive_searches += 1
-                    elif name not in ("read_source", "search_framework", "read_framework_file", "list_facts", "list_files", "read_file"):
-                        consecutive_searches = 0
-
-                    if name in ("web_search", "fetch_document") and consecutive_searches > 5:
-                        result = {
-                            "error": (
-                                "Web search limit reached (5 consecutive queries). Standard MCUs (STM32, AT32, GD32, ESP32, RP2040) "
-                                "use standard vendor CMSIS/HAL definitions (e.g. TIM1/TMR1 complementary PWM on PA8..PA10/PA7..PB1). "
-                                "Discrete peripherals (gate drivers like FD6288/IR2101) have NO register map — drive them with complementary PWM and GPIO. "
-                                "DO NOT ask the user for architectural trivia. Call init_project, write_file, and build now."
-                            )
-                        }
+                    try:
+                        args = parse_tool_args(tc["function"].get("arguments"))
+                    except ValueError as e:
+                        args, result = {}, {"error": str(e)}
                     else:
-                        try:
-                            args = parse_tool_args(tc["function"].get("arguments"))
-                            s.emit("tool_call", id=tc["id"], name=name, args={k: (v if len(str(v)) < 400 else str(v)[:400] + "…") for k, v in args.items()})
-                            tracer.start_span(f"{span}-{tc['id']}", name, run_type="tool", inputs=args)
-                            result = belt.call(name, args)
-                            if isinstance(result, dict) and consecutive_searches >= 3:
-                                result["_guidance"] = (
-                                    "Notice: Discrete ICs (e.g. FD6288) have no register map. Standard MCU timers (TIM1/TMR1) have standard pinouts "
-                                    "(PA8..PA10 CH1..3, PA7/PB0/PB1 CH1N..3N). Do NOT search endlessly; proceed to init_project and write_file."
-                                )
-                        except ValueError as e:
-                            result = {"error": str(e)}
-                            s.emit("tool_call", id=tc["id"], name=name, args={})
-                    tracer.end_span(f"{span}-{tc['id']}", outputs={"summary": _summ(result, 300)})
-                    ok = not (isinstance(result, dict) and result.get("error"))
+                        result = guard.before(name, len(store.sources))
+                    s.emit("tool_call", id=tc["id"], name=name, args={k: (v if len(str(v)) < 400 else str(v)[:400] + "…") for k, v in args.items()})
+                    if result is None:
+                        tracer.start_span(f"{span}-{tc['id']}", name, run_type="tool", inputs=args)
+                        result = belt.call(name, args)
+                        tracer.end_span(f"{span}-{tc['id']}", outputs={"summary": _summ(result, 300)})
+                    elif result.get("guard"):
+                        s.emit("guard", kind=result["guard"], text=result["error"])
+                    ok = not (isinstance(result, dict) and (result.get("error") or result.get("ok") is False))
+                    guard.after(name, ok)
                     s.emit("tool_result", id=tc["id"], name=name, ok=ok, summary=_summ(result))
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result, default=str)})
                     if belt.ended:
@@ -216,6 +265,22 @@ class AgentRunner:
                     s.emit("done", status=fin["status"], summary=fin["summary"])
                     status = "completed" if fin["status"] == "success" else "failed"
                     break
+
+                guard.steps_since_progress += 1
+                if guard.steps_since_progress == STALL_NUDGE_STEPS:
+                    digest = self._state_digest(belt, store, ledger)
+                    text = (f"No progress in the last {STALL_NUDGE_STEPS} steps ({digest}). Change approach now: record facts from "
+                            "the sources you already have, write the code and build, or ask_user for what is missing.")
+                    s.emit("guard", kind="stall_nudge", text=text)
+                    messages.append({"role": "user", "content": f"[System Notice]: {text}"})
+                elif guard.steps_since_progress >= STALL_STOP_STEPS:
+                    digest = self._state_digest(belt, store, ledger)
+                    text = (f"Paused: {STALL_STOP_STEPS} steps without recording a fact, editing code or building ({digest}). "
+                            "Reply with the missing detail (e.g. a datasheet link or the value) or try a stronger model.")
+                    s.emit("guard", kind="stalled", text=text)
+                    s.emit("error", message=text)
+                    status = "needs_input"
+                    break
             else:
                 s.emit("error", message=f"Step budget ({config.agent_max_steps}) exhausted before completion. Send a message to continue.")
                 status = "failed"
@@ -225,9 +290,12 @@ class AgentRunner:
             status = "failed"
         finally:
             try:
-                project.save_conversation(messages)  # type: ignore[possibly-undefined]
+                project.save_conversation(messages)
             except Exception:
                 pass
             tracer.end_span(span, outputs={"status": status})
+            s.emit("run_stats", steps=steps, tools=dict(guard.calls), failures=dict(guard.failures),
+                   facts=len(ledger.facts), sources=len(store.sources), builds=len(project.builds()),
+                   build_ok=belt.state["build_ok"], verify_ok=belt.state["verify_ok"], model=self.llm.model)
             s.emit("state", ledger=[f.public() for f in ledger.facts.values()], builds=project.builds(), files=project.list_files())
             s.finish(status)
