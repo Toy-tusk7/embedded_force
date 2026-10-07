@@ -24,26 +24,37 @@ def _summ(result: Any, limit: int = 500) -> str:
 
 
 def _compact(messages: List[Dict[str, Any]]) -> None:
-    """Shrink old messages so long sessions stay fast while preserving user requests."""
+    """Shrink old messages safely while preserving turn integrity and valid tool-call pairs."""
     if len(messages) > 20:
-        user_msgs = [m for m in messages if m.get("role") == "user"]
-        recent = messages[-14:]
-        selected = []
-        seen = set()
-        for m in (user_msgs + recent):
-            mid = id(m)
-            if mid not in seen:
-                seen.add(mid)
-                selected.append(m)
+        # Walk back to find a clean cut point that is not in the middle of tool responses
+        cut_idx = max(1, len(messages) - 16)
+        while cut_idx < len(messages) and messages[cut_idx].get("role") == "tool":
+            cut_idx += 1
+
+        user_msgs = [m for m in messages[:cut_idx] if m.get("role") == "user"]
+        recent = messages[cut_idx:]
         messages.clear()
-        messages.extend(selected)
+        messages.extend(user_msgs + recent)
 
     total = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or [])) for m in messages)
     if total <= MAX_CONTEXT_CHARS:
         return
     for m in messages[: max(0, len(messages) - KEEP_RECENT)]:
-        if m.get("role") == "tool" and len(m.get("content") or "") > 350:
-            m["content"] = m["content"][:300] + " …[older tool output truncated]"
+        if m.get("role") == "tool":
+            c = m.get("content") or ""
+            if len(c) > 400:
+                try:
+                    data = json.loads(c)
+                    if isinstance(data, dict):
+                        if "excerpts" in data and len(data["excerpts"]) > 1:
+                            data["excerpts"] = data["excerpts"][:1]
+                        if "preview" in data and len(data["preview"]) > 200:
+                            data["preview"] = data["preview"][:200] + "…"
+                        m["content"] = json.dumps(data)
+                    else:
+                        m["content"] = c[:300] + " …[truncated]"
+                except Exception:
+                    m["content"] = c[:300] + " …[truncated]"
 
 
 class AgentRunner:

@@ -108,7 +108,28 @@ def pdf_to_text(data: bytes) -> str:
 
 
 def _tokens(s: str) -> List[str]:
-    return re.findall(r"[a-z0-9_]+", s.lower())
+    raw = re.findall(r"[a-z0-9_]+", s.lower())
+    res = []
+    for r in raw:
+        res.append(r)
+        if "_" in r:
+            res.extend([p for p in r.split("_") if p])
+    return res
+
+
+HARDWARE_SYNONYMS: Dict[str, List[str]] = {
+    "tim1": ["tmr1"], "tmr1": ["tim1"],
+    "tim2": ["tmr2"], "tmr2": ["tim2"],
+    "tim3": ["tmr3"], "tmr3": ["tim3"],
+    "tim4": ["tmr4"], "tmr4": ["tim4"],
+    "tim": ["tmr", "timer"], "tmr": ["tim", "timer"],
+    "who_am_i": ["whoami", "devid", "device_id"],
+    "whoami": ["who_am_i", "devid"],
+    "slave_addr": ["slave_address", "i2c_addr", "i2c_address", "device_address"],
+    "slave_address": ["slave_addr", "i2c_addr", "i2c_address"],
+    "fd6288": ["fd6288q", "fd6288t"],
+    "fd6288q": ["fd6288", "fd6288t"],
+}
 
 
 EXCLUDED_STORE_DOMAINS = [
@@ -210,15 +231,22 @@ class SourceStore:
         return self.add("user://conversation", "User statements", text, kind="user")
 
     # ---------- retrieval ----------
-    def excerpts(self, source_id: str, query: str, max_chunks: int = 3, chunk_chars: int = 700) -> List[Dict[str, Any]]:
+    def excerpts(self, source_id: str, query: str, max_chunks: int = 4, chunk_chars: int = 1400) -> List[Dict[str, Any]]:
         src = self.sources.get(source_id)
         if not src:
             return []
         text = src.text
-        step = chunk_chars - 150
-        terms = [t for t in set(_tokens(query)) if len(t) > 1]
-        if not terms:
+        step = max(chunk_chars - 350, 200)
+        raw_terms = [t for t in set(_tokens(query)) if len(t) > 1]
+        if not raw_terms:
             return [{"offset": 0, "text": text[:chunk_chars]}]
+
+        # Expand hardware synonyms for terms in query
+        expanded_terms = set(raw_terms)
+        for t in raw_terms:
+            if t in HARDWARE_SYNONYMS:
+                expanded_terms.update(HARDWARE_SYNONYMS[t])
+
         phrase = query.lower().strip()
         scored = []
         for off in range(0, max(len(text), 1), step):
@@ -228,9 +256,15 @@ class SourceStore:
             if not toks:
                 continue
             tokset = set(toks)
-            score = sum(1.0 + min(toks.count(t), 4) * 0.25 for t in terms if t in tokset)
+            matched_terms = [t for t in expanded_terms if t in tokset]
+            if not matched_terms:
+                continue
+            # Multi-term coverage: bonus for matching more of the query's distinct concepts
+            coverage = len(matched_terms) / max(len(raw_terms), 1)
+            score = sum(1.0 + min(toks.count(t), 4) * 0.2 for t in matched_terms)
+            score += coverage * 4.0
             if phrase and phrase in low:
-                score += 3
+                score += 5.0
             if score > 0:
                 scored.append((score, off, chunk))
         scored.sort(key=lambda x: -x[0])
