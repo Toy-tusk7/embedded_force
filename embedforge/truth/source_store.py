@@ -77,6 +77,19 @@ def html_to_text(html: str) -> str:
 
 
 def pdf_to_text(data: bytes) -> str:
+    """Datasheet text for the analyzer: Markdown (headings, tables, reconstructed equations) when PyMuPDF/pymupdf4llm are
+    installed (`pip install embedforge[pdf]`), otherwise pypdf's layout text."""
+    try:
+        from embedforge.truth.pdf_markdown import pdf_to_markdown
+        md = pdf_to_markdown(data, max_pages=MAX_PDF_PAGES)
+        if md and md.strip():
+            return md
+    except Exception:
+        pass
+    return _pypdf_text(data)
+
+
+def _pypdf_text(data: bytes) -> str:
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))
