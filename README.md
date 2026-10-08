@@ -134,7 +134,9 @@ Copy `.env.example` to `.env` and fill in your keys (`.env` is git-ignored — n
 ```ini
 # Claude API (Anthropic): when set, runs use Claude instead of Nemotron
 ANTHROPIC_API_KEY=
-# EMBEDFORGE_PROVIDER=anthropic   # or nebius / nvidia, to force one provider
+# Google Gemini API (Google AI Studio key): used when no Claude key is set
+GEMINI_API_KEY=
+# EMBEDFORGE_PROVIDER=anthropic   # or gemini / nebius / nvidia, to force one provider
 
 # Nebius AI Cloud / Token Factory
 NEBIUS_API_KEY=your_nebius_api_key_here

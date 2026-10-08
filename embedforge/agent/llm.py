@@ -1,6 +1,6 @@
 """Tool-calling LLM client used by the agent loop: the Anthropic Claude API (Messages API, official SDK) and
-OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM). The loop speaks one message format (OpenAI-style
-role/content/tool_calls); the Claude path translates it to and from the Messages API."""
+OpenAI-compatible providers (Google Gemini, Nebius Token Factory, NVIDIA NIM). The loop speaks one message format
+(OpenAI-style role/content/tool_calls); the Claude path translates it to and from the Messages API."""
 
 import json
 import os
@@ -35,28 +35,42 @@ class Provider:
 def providers() -> Dict[str, Provider]:
     return {
         "anthropic": Provider("anthropic", "Anthropic Claude API", "https://api.anthropic.com", config.anthropic_api_key),
+        "gemini": Provider("gemini", "Google Gemini API", config.gemini_base_url.rstrip("/"), config.gemini_api_key),
         "nebius": Provider("nebius", "Nebius Token Factory", config.nebius_base_url.rstrip("/"), config.nebius_api_key),
         "nvidia": Provider("nvidia", "NVIDIA API (NIM)", config.nvidia_base_url.rstrip("/"), config.nvidia_api_key),
     }
 
 
+# Providers that replace Nemotron while the Token Factory is unavailable, in order of preference
+PREFERRED = ("anthropic", "gemini")
+
+
 def default_provider() -> str:
-    """EMBEDFORGE_PROVIDER if set; otherwise Claude when its key is configured, then Nebius, then NVIDIA."""
+    """EMBEDFORGE_PROVIDER if set; otherwise Claude, then Gemini, when configured; then Nebius, then NVIDIA."""
     if config.llm_provider in providers():
         return config.llm_provider
-    if config.has_anthropic:
-        return "anthropic"
+    ps = providers()
+    for pid in PREFERRED:
+        if ps[pid].configured:
+            return pid
     return "nebius" if config.has_nebius or not config.has_nvidia else "nvidia"
 
 
+def default_model(provider_id: str) -> str:
+    return {"anthropic": config.anthropic_model, "gemini": config.gemini_model}.get(provider_id, config.agent_model)
+
+
 def resolve_provider(requested: Optional[str]) -> str:
-    """The provider a run uses: a forced EMBEDFORGE_PROVIDER wins; a project's saved choice is kept only while that
-    provider is configured and Claude is not (Claude, when configured, replaces Nemotron for now)."""
+    """The provider a run uses: a forced EMBEDFORGE_PROVIDER wins; a project's saved choice of Claude or Gemini is kept
+    while configured; a saved Nemotron provider gives way to Claude or Gemini when either is configured."""
     if config.llm_provider in providers():
         return config.llm_provider
-    if config.has_anthropic:
-        return "anthropic"
-    p = providers().get(requested or "")
+    ps = providers()
+    if requested in PREFERRED and ps[requested].configured:
+        return requested
+    if any(ps[pid].configured for pid in PREFERRED):
+        return default_provider()
+    p = ps.get(requested or "")
     return requested if p is not None and p.configured else default_provider()
 
 
@@ -64,7 +78,8 @@ def resolve_provider(requested: Optional[str]) -> str:
 _MODEL_CACHE: Dict[str, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 _MODEL_CACHE_TTL = 600
-_NON_CHAT = re.compile(r"embed|rerank|guard|reward|clip|whisper|tts|parse|retriever|-v-|vision|ocr", re.I)
+_NON_CHAT = re.compile(r"embed|rerank|guard|reward|clip|whisper|tts|parse|retriever|-v-|vision|ocr|"
+                       r"image|veo|imagen|aqa|native-audio|-live|robotics", re.I)
 
 
 def _describe(model_id: str) -> Dict[str, Any]:
@@ -108,7 +123,8 @@ def list_models(provider_id: str, force: bool = False) -> Dict[str, Any]:
         with httpx.Client(timeout=20.0) as c:
             r = c.get(f"{p.base_url}/models", headers={"Authorization": f"Bearer {p.api_key}"})
         r.raise_for_status()
-        ids = sorted({m.get("id") for m in r.json().get("data", []) if m.get("id")})
+        # Gemini's native ids carry a 'models/' prefix; requests take the bare name
+        ids = sorted({str(m.get("id")).removeprefix("models/") for m in r.json().get("data", []) if m.get("id")})
         models = [{"id": i, "provider": provider_id, **_describe(i)} for i in ids if not _NON_CHAT.search(i)]
         models.sort(key=lambda m: (not m["nvidia"], m["id"].lower()))
         out = {"provider": provider_id, "models": models, "error": ""}
@@ -126,11 +142,13 @@ class AgentLLM:
         if p is None:
             raise LLMError(f"Unknown LLM provider '{pid}'.")
         self.provider = p
+        # a project saved with another provider's model keeps working: the run uses this provider's default model
         if pid == "anthropic":
-            # a project saved with a Nemotron model keeps working: Claude runs with its own default model
             self.model = model if model and model.startswith("claude-") else config.anthropic_model
+        elif pid == "gemini":
+            self.model = model if model and model.startswith("gemini") else config.gemini_model
         else:
-            self.model = model if model and not model.startswith("claude-") else config.agent_model
+            self.model = model if model and not model.startswith(("claude-", "gemini")) else config.agent_model
         self.base_url = p.base_url
         self.api_key = p.api_key
 
@@ -140,6 +158,8 @@ class AgentLLM:
         EMBEDFORGE_TEMPERATURE / EMBEDFORGE_TOP_P override."""
         if self.provider.id == "anthropic":
             return {}   # Claude's current models take no sampling parameters (effort and adaptive thinking instead)
+        if self.provider.id == "gemini" and config.agent_temperature is None and config.agent_top_p is None:
+            return {}   # Gemini 3 is tuned for its default temperature (1.0); Google warns lower values can make it loop
         mid = self.model.lower()
         nemotron = "nemotron" in mid
         default_t = (1.0 if re.search(r"nemotron-?3", mid) else 0.6) if nemotron else 0.1
@@ -156,6 +176,8 @@ class AgentLLM:
         env = os.getenv("EMBEDFORGE_MAX_TOKENS")
         if env and env.isdigit():
             return int(env)
+        if self.provider.id == "gemini":
+            return 32768   # Gemini 3 always thinks, and its thinking counts toward the output limit
         return 16384 if re.search(r"nemotron|reason|r1|qwq|thinking", self.model.lower()) else 8192
 
     def chat(
@@ -173,6 +195,9 @@ class AgentLLM:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if self.provider.id == "gemini":   # Gemini takes minimal | low | medium | high
+            effort = config.anthropic_effort.lower()
+            payload["reasoning_effort"] = effort if effort in ("minimal", "low", "medium") else "high"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last: Optional[str] = None
         for attempt in range(retries):
@@ -202,8 +227,11 @@ class AgentLLM:
                 for i, tc in enumerate(msg.get("tool_calls") or []):
                     fn = tc.get("function") or {}
                     a = fn.get("arguments")
-                    calls.append({"id": tc.get("id") or f"call_{int(time.time() * 1000)}_{i}", "type": "function",
-                                  "function": {"name": fn.get("name") or "", "arguments": a if isinstance(a, str) else json.dumps(a or {})}})
+                    call = {"id": tc.get("id") or f"call_{int(time.time() * 1000)}_{i}", "type": "function",
+                            "function": {"name": fn.get("name") or "", "arguments": a if isinstance(a, str) else json.dumps(a or {})}}
+                    if tc.get("extra_content"):   # Gemini 3's thought signature: it must come back with the call
+                        call["extra_content"] = tc["extra_content"]
+                    calls.append(call)
                 return {
                     "content": content,
                     "reasoning": reasoning,
