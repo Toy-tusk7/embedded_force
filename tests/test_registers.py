@@ -388,6 +388,9 @@ def test_tools_record_and_verify_shows_meaning(tmp_path, monkeypatch):
     r = belt.call("record_registers", {"device": "BMPX", "source_id": "SRC-001", "registers": REGISTERS,
                                        "bursts": [{"name": "data", "start": "0x04", "end": "0x09", "quote": "read in a single burst read"}]})
     assert r["ok"] and len(r["recorded"]) == 5 and r["bursts"], r
+    import json
+    again = belt.call("record_layouts", {"device": "BMPX", "source_id": "SRC-001", "layouts": json.dumps(LAYOUTS[:1])})  # list sent as a string
+    assert again["ok"] and again["recorded"], again
     f = belt.call("record_formula", {"device": "BMPX", "source_id": "SRC-001", "name": "PAR_T1", "steps": ["PAR_T1 = NVM_PAR_T1 / 2^-8"],
                                      "quote": "PAR_T1 = NVM_PAR_T1 / 2^-8"})
     assert f["ok"], f

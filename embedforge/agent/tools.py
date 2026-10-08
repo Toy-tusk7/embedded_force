@@ -355,6 +355,19 @@ class ToolBelt:
         call_args = {k: v for k, v in args.items() if k in accepted}
         # one parameter under another name (query_board(designator='U3'), read_source(id=...)): use it for the one missing
         spec = next((t["function"]["parameters"] for t in TOOL_SPECS if t["function"]["name"] == name), {})
+        for k, v in list(call_args.items()):   # a list/object sent as a JSON (or Python-literal) string
+            want = ((spec.get("properties") or {}).get(k) or {}).get("type")
+            if want in ("array", "object") and isinstance(v, str) and v.strip()[:1] in "[{":
+                import ast
+                import json as _json
+                for parse in (_json.loads, ast.literal_eval):
+                    try:
+                        parsed = parse(v)
+                    except (ValueError, SyntaxError):
+                        continue
+                    if isinstance(parsed, list if want == "array" else dict):
+                        call_args[k] = parsed
+                        break
         missing = [k for k in (spec.get("required") or list(sig)[:1]) if k not in call_args]
         ptype = ((spec.get("properties") or {}).get(missing[0]) or {}).get("type") if len(missing) == 1 else None
         val = args[ignored[0]] if len(ignored) == 1 else None
