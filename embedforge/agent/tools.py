@@ -69,15 +69,58 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "If a define was recorded for the wrong pin, send that item with replace: true to retire the old fact.",
         {"pins": _arr({"type": "object", "properties": {"define": S, "line": S, "replace": {"type": "boolean"}},
                        "required": ["define", "line"]})}, ["pins"]),
+    _fn("record_facts",
+        "Record several facts in ONE call (each item follows the record_fact rules). facts: [{subject, property, value, quote, "
+        "unit?, source_id?}]; `source_id` is the default for items without one. Returns the FACT id per item; rejected items come "
+        "back with candidate quotes — resend only those.",
+        {"facts": _arr({"type": "object", "properties": {"subject": S, "property": S, "value": S, "quote": S, "unit": S, "source_id": S},
+                        "required": ["subject", "property", "value", "quote"]}), "source_id": S}, ["facts"]),
+    _fn("record_registers",
+        "Record the datasheet REGISTER MAP so verify checks what every value MEANS, not just that it was cited. registers: "
+        "[{name:'PWR_CTRL', addr:'0x1B', quote:<the register's table text, verbatim>, fields:[{name:'mode', bits:'5:4', "
+        "values:{sleep:'0b00', forced:['0b01','0b10'], normal:'0b11'}, quote?:<the field's rows if they are elsewhere>}, "
+        "{name:'press_en', bits:'0'}], id_value?:<FACT id or value, for an ID register>}]. bursts: [{name:'data', start:'0x04', "
+        "end:'0x09', quote:<text requiring one burst read>}]. Field names, bit numbers and each named value must be in the quote. "
+        "verify then decodes every register write into its fields, rejects bit masks on undefined bits and reads that split a "
+        "burst range. Record every register the code writes, polls or tests.",
+        {"device": S, "source_id": S,
+         "registers": _arr({"type": "object", "properties": {"name": S, "addr": S, "quote": S, "id_value": S, "source_id": S,
+                                                              "fields": _arr({"type": "object", "properties": {"name": S, "bits": S, "values": {"type": "object"}, "quote": S},
+                                                                              "required": ["name", "bits"]})},
+                            "required": ["name", "addr", "quote"]}),
+         "bursts": _arr({"type": "object", "properties": {"name": S, "start": S, "end": S, "quote": S}, "required": ["start", "end", "quote"]})},
+        ["device", "source_id", "registers"]),
+    _fn("record_layouts",
+        "Record how each MULTI-BYTE value is spread over registers (calibration coefficients, raw measurements): layouts: "
+        "[{name:'NVM_PAR_T1', bytes:['0x31','0x32'], signed:false, quote:<the rows listing those addresses>}]. `bytes` are "
+        "LEAST significant first ('0x31' = bits 7..0, '0x32' = bits 15..8); a partial byte is '0xE5[3:0]'. verify checks every "
+        "shift the code applies to those bytes (byte order, which byte belongs to which value). Layout names are the inputs of "
+        "record_formula.",
+        {"device": S, "source_id": S,
+         "layouts": _arr({"type": "object", "properties": {"name": S, "bytes": _arr(), "signed": {"type": "boolean"}, "quote": S, "source_id": S},
+                          "required": ["name", "bytes", "quote"]})},
+        ["device", "source_id", "layouts"]),
+    _fn("record_formula",
+        "Record a conversion the code must implement (coefficient scaling, compensation, unit conversion): name='PAR_T1', "
+        "steps=['PAR_T1 = NVM_PAR_T1 / 2^-8'] or several 'var = expression' lines whose last var is the result; quote = the "
+        "verbatim text that states it (the datasheet, or the manufacturer's reference code on GitHub). Inputs are layout names "
+        "or earlier formulas; operators + - * / ^ (power) // (C integer division) >> << & | and pow/sqrt/exp/log/abs; C casts "
+        "and struct prefixes (calib->par_t1) are ignored. Every constant must be in the quote. PDF text loses fraction bars and "
+        "superscripts: 'X = NVM_X' followed by '2−8' means X = NVM_X / 2^-8, and '230' is 2^30. verify runs the code on random "
+        "register bytes and requires it to compute exactly this value.",
+        {"device": S, "source_id": S, "name": S, "steps": _arr(), "quote": S, "unit": S},
+        ["device", "source_id", "name", "steps", "quote"]),
     _fn("record_sequence",
         "Record an ORDER/TIMING rule from a datasheet (power-up, soft reset, init, measurement start) so verify checks "
         "that the code follows it. Each step cites FACT ids you already recorded — never type values: "
-        "{op:'write', reg:FACT(register), value:FACT(value), mask?:FACT(bits)} | {op:'read', reg:FACT, value?:FACT(min length)} | "
+        "{op:'write', reg:FACT(register), fields:{mode:'normal', press_en:1, temp_en:1}} (register-map fields; preferred) or "
+        "{op:'write', reg:FACT, value:FACT(value), mask?:FACT(bits)} | {op:'read', reg:FACT, value?:FACT(min length)} | "
         "{op:'delay_min', value:FACT(time with unit)} | {op:'poll', reg:FACT(status register)}. `entry` = the C function "
         "that performs it; `device` = FACT id of the bus address; `order_quote` = verbatim datasheet text stating the order.",
         {"subject": S, "name": S, "entry": S, "device": S, "source_id": S, "order_quote": S,
          "steps": _arr({"type": "object", "properties": {"op": {"type": "string", "enum": ["write", "read", "delay_min", "poll"]},
-                                                          "reg": S, "value": S, "mask": S, "unit": S}, "required": ["op"]})},
+                                                          "reg": S, "value": S, "mask": S, "unit": S, "fields": {"type": "object"}},
+                        "required": ["op"]})},
         ["subject", "name", "entry", "steps", "source_id", "order_quote"]),
     _fn("list_facts", "List all facts currently in the ledger (with FACT ids).", {}, []),
     _fn("query_board",
@@ -269,7 +312,8 @@ class ToolBelt:
             "web_search": self.web_search,
             "fetch_document": self.fetch_document, "read_source": self.read_source, "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
-            "record_sequence": self.record_sequence,
+            "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
+            "record_layouts": self.record_layouts, "record_formula": self.record_formula,
             "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
             "write_file": self.write_file, "replace_in_file": self.replace_in_file, "read_file": self.read_file,
@@ -312,7 +356,7 @@ class ToolBelt:
         """Build inputs plus what verify judges them against (facts, sequences, schematic): a new fact or a re-imported
         board after verify makes the old verify stale."""
         h = hashlib.sha256(self.source_hash().encode())
-        for n in ("ledger.json", "sequences.json", "board.json"):
+        for n in ("ledger.json", "sequences.json", "registers.json", "board.json"):
             p = self.project.root / n
             h.update(n.encode())
             if p.exists():
@@ -703,6 +747,66 @@ class ToolBelt:
                            "statically and reports each step as matched, missing, out of order, wrong value or too short a delay.")
         return res
 
+    def record_facts(self, facts: List[Dict[str, Any]], source_id: str = "") -> Dict[str, Any]:
+        if not isinstance(facts, list) or not facts:
+            return {"ok": False, "error": "`facts` must be a non-empty list of {subject, property, value, quote, unit?, source_id?}"}
+        recorded: List[str] = []
+        rejected: List[Dict[str, Any]] = []
+        for item in facts[:40]:
+            item = item if isinstance(item, dict) else {}
+            label = f"{item.get('subject') or '?'}.{item.get('property') or '?'}"
+            res = self.record_fact(str(item.get("subject") or ""), str(item.get("property") or ""), item.get("value", ""),
+                                   self._sid(item.get("source_id") or source_id), str(item.get("quote") or ""), str(item.get("unit") or ""))
+            if res.get("ok"):
+                fct = res["fact"]
+                dup = any("Duplicate" in str(w) for w in res.get("warnings") or [])
+                recorded.append(f"{fct['id']} {fct['subject']}.{fct['property']}={fct['value']}" + (" (already recorded)" if dup else ""))
+            else:
+                r = {"item": label, "error": str(res.get("error"))[:220]}
+                if res.get("candidate_quotes"):
+                    r["candidate_quotes"] = res["candidate_quotes"][:2]
+                if res.get("hint"):
+                    r["hint"] = res["hint"]
+                rejected.append(r)
+        out: Dict[str, Any] = {"ok": bool(recorded), "recorded": recorded}
+        if rejected:
+            out["rejected"] = rejected
+        return out
+
+    def _register_book(self):
+        from embedforge.truth.registers import RegisterBook
+        return RegisterBook(self.project.root)
+
+    def record_registers(self, device: str, source_id: str, registers: List[Dict[str, Any]],
+                         bursts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        sid = self._sid(source_id)
+        regs = registers if isinstance(registers, list) else []
+        for r in regs:
+            if isinstance(r, dict) and r.get("source_id"):
+                r["source_id"] = self._sid(r["source_id"])
+        res = self._register_book().record_registers(self.store, self.ledger, device, sid, regs, bursts if isinstance(bursts, list) else [])
+        if res.get("recorded") or res.get("bursts"):
+            self.session.emit("registers", device=device, recorded=res.get("recorded", []), bursts=res.get("bursts", []))
+            res["next"] = ("Record every multi-byte value with record_layouts and every conversion with record_formula; in "
+                           "record_sequence, write steps can name fields: {op:'write', reg:FACT, fields:{...}}.")
+        return res
+
+    def record_layouts(self, device: str, source_id: str, layouts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        lays = layouts if isinstance(layouts, list) else []
+        for l in lays:
+            if isinstance(l, dict) and l.get("source_id"):
+                l["source_id"] = self._sid(l["source_id"])
+        res = self._register_book().record_layouts(self.store, device, self._sid(source_id), lays)
+        if res.get("recorded"):
+            self.session.emit("layouts", device=device, recorded=res["recorded"])
+        return res
+
+    def record_formula(self, device: str, source_id: str, name: str, steps: Any, quote: str, unit: str = "") -> Dict[str, Any]:
+        res = self._register_book().record_formula(self.store, device, self._sid(source_id), name, steps, quote, unit)
+        if res.get("ok"):
+            self.session.emit("formula", device=device, formula=res["formula"])
+        return res
+
     def query_board(self, query: str = "") -> Dict[str, Any]:
         board = eda.load_board(self.project.root)
         if board is None:
@@ -983,6 +1087,10 @@ class ToolBelt:
         out: Dict[str, Any] = {"passed": rep.passed, "summary": rep.summary(), "findings": findings}
         if flows:
             out["flows"] = flows  # each datasheet sequence, step by step, as found in the code
+        regs = pub.get("registers") or {}
+        if regs.get("writes") or regs.get("formulas"):
+            # what the code's register values mean, per the recorded register map, and which formulas it implements
+            out["meaning"] = {"register_writes": regs.get("writes", [])[:12], "formulas": regs.get("formulas", [])[:16]}
         if prev_inputs == inputs:
             out["unchanged"] = True  # same sources and facts as the last verify: same answer, not progress
         shown = sum(len(x.get("lines") or [1]) for x in findings)

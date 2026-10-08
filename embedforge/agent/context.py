@@ -53,6 +53,14 @@ def digest(name: str, args: Dict[str, Any], result: Any) -> str:
         s = r.get("sequence") or {}
         return (f"record_sequence -> {s.get('id')} {s.get('subject')}.{s.get('name')} in {s.get('entry')}() ({len(s.get('steps') or [])} steps)"
                 if r.get("ok") else f"record_sequence REJECTED: {str(r.get('error'))[:140]}")
+    if name in ("record_facts", "record_registers", "record_layouts"):
+        rec = [str(x).split(":")[0] for x in (r.get("recorded") or [])] + [str(x).split(":")[0] for x in (r.get("bursts") or [])]
+        rej = r.get("rejected") or []
+        return (f"{name} -> {', '.join(rec[:14]) or 'none'}" + (f" (+{len(rec) - 14})" if len(rec) > 14 else "")
+                + (f"; {len(rej)} rejected, e.g. {rej[0].get('item') or rej[0].get('register') or rej[0].get('layout') or rej[0].get('burst')}: "
+                   f"{str(rej[0].get('error'))[:90]}" if rej else ""))
+    if name == "record_formula":
+        return f"record_formula -> {str(r.get('formula'))[:150]}" if r.get("ok") else f"record_formula REJECTED: {str(r.get('error'))[:140]}"
     if name == "read_file":
         return f"read_file {args.get('path')} lines {r.get('start')}-{r.get('end')}/{r.get('total_lines')}"
     if name in ("write_file", "replace_in_file"):
@@ -326,6 +334,13 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
     if seqs:
         lines.append(f"- Datasheet sequences recorded ({len(seqs)}): "
                      + "; ".join(f"{s.id} {s.subject}.{s.name} in {s.entry}() ({len(s.steps)} steps)" for s in seqs[:8]))
+    from embedforge.truth.registers import RegisterBook
+    book = RegisterBook(project.root)
+    if not book.empty():
+        regs = sorted(book.registers.values(), key=lambda r: r.addr)
+        lines.append(f"- Register map: {len(regs)} registers (" + ", ".join(f"{r.name} 0x{r.addr:02X}" for r in regs[:16])
+                     + f"), {len(book.layouts)} layouts, {len(book.bursts)} burst rules, {len(book.formulas)} formulas"
+                     + (" (" + ", ".join(f.name for f in list(book.formulas.values())[:12]) + ")" if book.formulas else ""))
     inputs_stale = bool(lv) and lv.get("hash") == current and lv.get("inputs") not in (None, belt.verify_inputs_hash())
     if lv:
         lines.append(f"- Last verify: {lv.get('summary')}"
@@ -339,6 +354,40 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
     nxt = next_step(project, kind, meta, facts, unc, lb, lv, current, req, pin_problems if board is not None else [])
     lines.append(f"- NEXT STEP: {nxt}")
     return "\n".join(lines), nxt
+
+
+_DRIVER_TASK = re.compile(r"\b(driver|sensor|datasheet|register|barometer|imu|gyro|accelerometer|magnetometer|adc|dac|eeprom)\b", re.I)
+
+
+def driver_plan(project: Any, facts: List[Any], request: str) -> str:
+    """Before writing a device driver: the meaning of the datasheet goes on record first, in this order, so verify can
+    check fields, byte order and formulas, not only that numbers were cited."""
+    from embedforge.truth.registers import RegisterBook
+    from embedforge.truth.sequences import SequenceBook
+    ds_facts = [f for f in facts if str(getattr(f, "source_url", "")).startswith("http")]
+    if not (_DRIVER_TASK.search(request or "") or ds_facts):
+        return ""
+    book = RegisterBook(project.root)
+    todo = []
+    if not ds_facts:
+        todo.append("record_facts from the datasheet (read_source first): bus address for the strap on the schematic, ID "
+                    "register + value, command values, start-up/conversion times with units")
+    if not book.registers:
+        todo.append("record_registers: every register the driver will write, poll or test, with fields (bits, named values) "
+                    "and bursts for data that must be read in one transaction")
+    if not book.layouts:
+        todo.append("record_layouts: every multi-byte value (calibration coefficients, raw readings), bytes least significant first")
+    if not book.formulas:
+        todo.append("record_formula: every conversion (coefficient scaling, compensation). If the PDF formulas are garbled, "
+                    "fetch the manufacturer's reference code (github.com/<vendor>) and quote that")
+    if not SequenceBook(project.root).items:
+        todo.append("record_sequence: the init order (reset, wait, calibration read, configuration) with write steps as "
+                    "{op:'write', reg:FACT, fields:{...}}")
+    if not todo:
+        return ("write_file the driver: implement exactly the recorded registers (values composed from their fields), layouts "
+                "(byte order), burst reads, formulas and sequences, then build and verify")
+    return "DRIVER — record what the datasheet MEANS before writing code. Next: " + todo[0] + (
+        f". Then: {'; '.join(t.split(':')[0] for t in todo[1:])}; then write_file and build" if len(todo) > 1 else "; then write_file and build")
 
 
 def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], unc: List[str],
@@ -367,6 +416,9 @@ def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], u
     else:
         from embedforge.truth.verifier import collect_sources
         if not any(p.suffix in (".c", ".cpp", ".ino") for p in collect_sources(project.root)):
+            plan = driver_plan(project, facts, request)
+            if plan:
+                return plan
             return ("record the facts the firmware needs (record_user_fact / record_fact), then write_file the sources "
                     "(src/main.c and modules), then build")
     built_now = lb.get("hash") == current

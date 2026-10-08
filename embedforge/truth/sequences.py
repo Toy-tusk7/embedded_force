@@ -38,6 +38,7 @@ class Step:
     value: str = ""      # FACT id: written value (write), minimum length (read), minimum delay (delay_min), bit mask (poll)
     mask: str = ""       # FACT id: for a write, only these bits must equal the value
     unit: str = ""       # delay unit when the fact has none: us | ms | s
+    fields: Dict[str, int] = field(default_factory=dict)   # write: register-map fields that must hold these values
 
     def public(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v}
@@ -96,6 +97,45 @@ class SequenceBook:
     def _save(self) -> None:
         self.path.write_text(json.dumps([r.public() for r in self.items.values()], indent=2), encoding="utf-8")
 
+    def _resolve_fields(self, st: Step, raw: Any, ledger: FactLedger, subject: str) -> str:
+        """fields {'mode': 'normal', 'press_en': 1} -> {'mode': 3, 'press_en': 1}, checked against the register map; a value
+        fact given too must agree with them."""
+        from embedforge.truth.registers import RegisterBook
+        if st.op != "write":
+            return "fields are only for write steps"
+        if not isinstance(raw, dict) or not raw:
+            return "fields must be an object {field name: value or value name}"
+        addr = _fact_int(ledger, st.reg)
+        if addr is None:
+            return f"reg {st.reg!r} must be the FACT id of the register address"
+        book = RegisterBook(self.path.parent)
+        reg = book.register_at(addr, subject) or book.register_at(addr)
+        if reg is None or not reg.fields:
+            return f"register 0x{addr:02X} has no fields in the register map: record_registers for it first"
+        out: Dict[str, int] = {}
+        for fname, fv in raw.items():
+            f = reg.field(str(fname))
+            if f is None:
+                return f"{reg.name} has no field {fname!r} (fields: {', '.join(x.name for x in reg.fields)})"
+            v = fv if isinstance(fv, int) and not isinstance(fv, bool) else None
+            if v is None:
+                key = str(fv).strip().lower()
+                named = next((vs for n, vs in f.values.items() if n.lower() == key), None)
+                v = named[0] if named else parse_int(key) if not re.fullmatch(r"[01]+", key) or len(key) != f.width else int(key, 2)
+            if v is None or not 0 <= v < (1 << f.width):
+                names = ", ".join(f"{n}={'|'.join(str(x) for x in vs)}" for n, vs in f.values.items())
+                return f"{reg.name}.{f.name} = {fv!r} is not a value of this {f.width}-bit field" + (f" (named values: {names})" if names else "")
+            out[f.name] = v
+        if st.value:
+            want, mask = _fields_value(reg, out)
+            fv = _fact_int(ledger, st.value)
+            if fv is not None and (fv & mask) != want:
+                return (f"{st.value} = 0x{fv:02X} decodes as {reg.decode(fv)}, but the fields ask for "
+                        f"{', '.join(f'{n}={v}' for n, v in out.items())} (= 0x{want:02X} in those bits). The value fact is wrong "
+                        "or the fields are: drop `value` and keep the fields from the register table")
+        st.fields = out
+        return ""
+
     def record(self, ledger: FactLedger, subject: str, name: str, entry: str, steps: List[Dict[str, Any]],
                source_id: str, order_quote: str, device: str = "") -> Dict[str, Any]:
         subject, name, entry = (subject or "").strip(), re.sub(r"[^A-Za-z0-9_]+", "_", (name or "").strip()).strip("_"), (entry or "").strip()
@@ -114,6 +154,11 @@ class SequenceBook:
                 continue
             st = Step(op=str(raw.get("op") or "").strip(), reg=str(raw.get("reg") or "").strip(), value=str(raw.get("value") or "").strip(),
                       mask=str(raw.get("mask") or "").strip(), unit=str(raw.get("unit") or "").strip().lower())
+            if raw.get("fields"):
+                err = self._resolve_fields(st, raw.get("fields"), ledger, subject)
+                if err:
+                    problems.append(f"step {k}: {err}")
+                    continue
             if st.op not in OPS:
                 problems.append(f"step {k}: op must be one of {', '.join(OPS)}")
                 continue
@@ -194,7 +239,30 @@ def _label(ledger: FactLedger, fid: str) -> str:
     return f"{fid} ({f.subject}.{f.property}={f.value})" if f else fid
 
 
-def _matches(step: Step, e: Event, ledger: FactLedger) -> str:
+def _fields_value(reg: Any, fields: Dict[str, int]) -> Tuple[int, int]:
+    """(value, mask) that the named fields of a register-map register put on the register."""
+    want = mask = 0
+    for name, v in fields.items():
+        f = reg.field(name)
+        if f is not None:
+            want |= (v << f.lo) & f.mask
+            mask |= f.mask
+    return want, mask
+
+
+def _step_target(step: Step, ledger: FactLedger, book: Any) -> Tuple[Optional[int], Optional[int]]:
+    """(want, mask) for a write step: from its fields (register map) or from its value/mask facts."""
+    if step.fields and book is not None:
+        addr = _fact_int(ledger, step.reg)
+        reg = book.register_at(addr) if addr is not None else None
+        if reg is not None:
+            return _fields_value(reg, step.fields)
+    want = _fact_int(ledger, step.value) if step.value else None
+    mask = _fact_int(ledger, step.mask) if step.mask else None
+    return want, mask
+
+
+def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None) -> str:
     """'' (no), 'yes', 'unresolved' (could be: register or value unknown at build time), 'value' (right register, other value)."""
     reg = _fact_int(ledger, step.reg)
     if step.op in ("read", "poll"):
@@ -211,8 +279,7 @@ def _matches(step: Step, e: Event, ledger: FactLedger) -> str:
     if step.op == "write":
         if e.kind != "write":
             return ""
-        want = _fact_int(ledger, step.value) if step.value else None
-        mask = _fact_int(ledger, step.mask) if step.mask else None
+        want, mask = _step_target(step, ledger, book)
         saw_reg = False
         unresolved = not is_int(e.reg)
         for r, v in writes_of(e):
@@ -235,7 +302,7 @@ def _matches(step: Step, e: Event, ledger: FactLedger) -> str:
     return ""
 
 
-def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger) -> FlowResult:
+def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: Any = None) -> FlowResult:
     res = FlowResult(seq.id, seq.subject, seq.name, seq.entry, trace.found, notes=list(trace.notes))
     if not trace.found:
         return res
@@ -287,7 +354,7 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger) -> Flo
             continue
         hit = unres = value_hit = None
         for k in range(pos, len(events)):
-            m = _matches(step, events[k], ledger)
+            m = _matches(step, events[k], ledger, book)
             if m == "yes":
                 hit = k
                 break
@@ -295,7 +362,10 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger) -> Flo
                 unres = k
             if m == "value" and value_hit is None:
                 value_hit = k
-        desc = f"{step.op} {_label(ledger, step.reg)}" + (f" = {_label(ledger, step.value)}" if step.value and step.op == "write" else "")
+        desc = f"{step.op} {_label(ledger, step.reg)}" + (f" = {_label(ledger, step.value)}" if step.value and step.op == "write" and not step.fields else "")
+        if step.fields:
+            w, _m = _step_target(step, ledger, book)
+            desc += f" with {', '.join(f'{n}={v}' for n, v in step.fields.items())}" + (f" (0x{w:02X} in those bits)" if w is not None else "")
         if hit is not None:
             e = events[hit]
             if pending is not None:
@@ -305,13 +375,16 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger) -> Flo
                                         desc + ("" if e.guaranteed else " — only inside an if/loop"), e.file, e.entry_line))
             pos, last_idx = hit + 1, hit
             continue
-        earlier = next((k for k in range(0, pos) if _matches(step, events[k], ledger) == "yes"), None)
+        earlier = next((k for k in range(0, pos) if _matches(step, events[k], ledger, book) == "yes"), None)
         if earlier is not None:
             e = events[earlier]
             res.steps.append(StepResult(num, step.op, "order", f"{desc} happens at {e.file}:{e.entry_line}, before step {num - 1}", e.file, e.entry_line))
         elif value_hit is not None:
             e = events[value_hit]
-            got = ", ".join(f"0x{v:02X}" if is_int(v) else repr(v) for _, v in writes_of(e) if is_int(_) and _ == _fact_int(ledger, step.reg)) if e.kind == "write" else f"length {e.length}"
+            rnum = _fact_int(ledger, step.reg)
+            rdef = book.register_at(rnum) if book is not None and rnum is not None else None
+            got = ", ".join((f"0x{v:02X}" + (f" ({rdef.decode(v)})" if rdef is not None and rdef.fields else "")) if is_int(v) else repr(v)
+                            for _, v in writes_of(e) if is_int(_) and _ == rnum) if e.kind == "write" else f"length {e.length}"
             res.steps.append(StepResult(num, step.op, "value", f"{desc}: the code uses {got}", e.file, e.entry_line))
         elif unres is not None:
             e = events[unres]
@@ -335,12 +408,14 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
     book = SequenceBook(project_dir)
     if not book.items:
         return [], []
+    from embedforge.truth.registers import RegisterBook
     model = model or FlowModel.from_dir(Path(project_dir))
+    regs = RegisterBook(project_dir)
     results, findings = [], []
     for seq in book.items.values():
         fn = model.function(seq.entry)
         trace = model.trace(seq.entry)
-        r = check_sequence(seq, trace, ledger)
+        r = check_sequence(seq, trace, ledger, regs)
         results.append(r.public())
         where = fn.file if fn else ""
         if not trace.found:

@@ -70,6 +70,7 @@ class VerifyReport:
     traceability: List[Dict[str, Any]] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
     flows: List[Dict[str, Any]] = field(default_factory=list)   # datasheet sequences checked against the code's order
+    registers: Dict[str, Any] = field(default_factory=dict)     # register map / layouts / formulas checked against the code
 
     def public(self) -> Dict[str, Any]:
         return {
@@ -78,6 +79,7 @@ class VerifyReport:
             "traceability": self.traceability,
             "stats": self.stats,
             "flows": self.flows,
+            "registers": self.registers,
         }
 
     def summary(self) -> str:
@@ -303,10 +305,55 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                 suggestion="Resolve using the manufacturer datasheet."))
 
     flow_steps = _check_flows(project_dir, ledger, report)
+    _check_registers(project_dir, ledger, report)
     report.stats = {"files": len(files), "literals_checked": literals_checked, "justified": justified, "facts_used": len(used_facts),
-                    "sequences": len(report.flows), "sequence_steps_matched": flow_steps}
+                    "sequences": len(report.flows), "sequence_steps_matched": flow_steps,
+                    "formulas_matched": sum(1 for x in report.registers.get("formulas", []) if "matches the code" in x)}
     report.passed = not any(f.severity == "ERROR" for f in report.findings)
     return report
+
+
+def _check_registers(project_dir: Path, ledger: FactLedger, report: VerifyReport) -> None:
+    """Meaning checks (truth/registers.py): register fields, byte layouts, burst reads and formulas. A device the code
+    configures needs its register map on record, like it needs its sequence."""
+    from embedforge.truth.flow import FlowModel
+    from embedforge.truth.registers import RegisterBook, check_registers, coverage_findings
+    try:
+        model = FlowModel.from_dir(project_dir)
+        summary, found = check_registers(project_dir, ledger, model)
+        found = found + coverage_findings(project_dir, ledger, model)
+    except Exception as e:  # never hide the rest of verify
+        report.findings.append(Finding("WARNING", "REGISTER_CHECK_ERROR", "", 0, f"The register check could not run: {type(e).__name__}: {e}"))
+        return
+    report.registers = summary
+    for f in found:
+        report.findings.append(Finding(f.severity, f.code, f.file, f.line, f.message, suggestion=f.suggestion))
+    if RegisterBook(project_dir).empty():
+        configured ={x.message.split(" (address")[0] for x in report.findings if x.code == "FLOW_UNSPECIFIED"}
+        configured |= _configured_devices(project_dir, ledger, report)
+        for dev in sorted(configured):
+            report.findings.append(Finding(
+                "ERROR", "REG_MAP_MISSING", "", 0,
+                f"{dev} is configured by the code but no register map was recorded, so what its register values MEAN (fields, "
+                "byte order, formulas) is unchecked.",
+                suggestion="record_registers (fields of every register the code writes or tests), record_layouts (every multi-byte "
+                           "value), record_formula (every conversion), then verify again."))
+
+
+def _configured_devices(project_dir: Path, ledger: FactLedger, report: VerifyReport) -> set:
+    """Subjects of address facts whose device the traced code writes to (from the sequence results)."""
+    subjects = set()
+    addr_subject = {}
+    for f in ledger.facts.values():
+        n = parse_int(str(f.value))
+        if n is not None and 0 < n < 0x400 and _ADDR_PROP_RE.search(f.property):
+            addr_subject.setdefault(n, f.subject)
+    if not addr_subject:
+        return subjects
+    for r in report.flows:
+        if any(s["status"] in ("matched", "conditional", "value", "order") for s in r.get("steps", [])):
+            subjects.add(r.get("subject", ""))
+    return {s for s in subjects if s and s.lower() in {v.lower() for v in addr_subject.values()}}
 
 
 _ADDR_PROP_RE = re.compile(r"(^|_)(i2c|spi|bus|slave|device|dev)?_?addr(ess)?($|_)", re.I)

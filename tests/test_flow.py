@@ -17,7 +17,10 @@ DATASHEET = (
     "The calibration coefficients start at register 0x31 and are read as one block of 21 bytes. "
     "Register 0x1B is PWR_CTRL; writing 0x33 enables pressure and temperature in normal mode. "
     "With SDO connected to GND the I2C address is 0x76. "
-    "Initialisation: issue a soft reset, wait for the start-up time, read the calibration block, then set PWR_CTRL."
+    "Initialisation: issue a soft reset, wait for the start-up time, read the calibration block, then set PWR_CTRL. "
+    "Register 0x7E CMD: Bit 7..0 cmd, 0xB6 softreset. "
+    "Register 0x1B PWR_CTRL: Bit 0 press_en, Bit 1 temp_en, Bit 5..4 mode 00 sleep mode 11 normal mode. "
+    "Calibration: 0x32 NVM_PAR_T1<15:8> NVM_PAR_T1 16 Bit unsigned 0x31 NVM_PAR_T1<7:0>."
 )
 
 GOOD = r"""
@@ -84,6 +87,9 @@ def _record(p, ledger, src, f, entry="bmp_init", steps=None):
 
 def _flow_codes(p, ledger):
     rep = verify_project(p.root, ledger)
+    # these tests are about order and timing; register meaning (and the rule that it must be recorded) is test_registers.py
+    rep.findings = [x for x in rep.findings if x.code != "REG_MAP_MISSING"]
+    rep.passed = not any(x.severity == "ERROR" for x in rep.findings)
     return rep, sorted({x.code for x in rep.findings if x.code.startswith("FLOW")})
 
 
@@ -132,8 +138,9 @@ static void wr(uint8_t r, uint8_t v) { uint8_t b[] = {r, v}; i2c_write_blocking(
 bool init(void) { uint8_t id = 0; rd(0x00, &id, 1); if (id != 0x50) { return false; }
   if (id == 0x50) { sleep_ms(5); } wr(0x7E, 0xB6); for (int i = 0; i < 3; i++) { wr(0x1C, 0x05); } return true; }"""
     t = FlowModel({"a.c": code}).trace("init")
-    assert [e.describe() for e in t.events] == ["read 0x00 x1", "delay 5000 us", "write 0x7E <- 0xB6", "write 0x1C <- 0x05"]
-    assert [e.guaranteed for e in t.events] == [True, False, True, True]   # the delay is inside a data-dependent if
+    # a counted loop runs its real number of times
+    assert [e.describe() for e in t.events] == ["read 0x00 x1", "delay 5000 us", "write 0x7E <- 0xB6"] + ["write 0x1C <- 0x05"] * 3
+    assert [e.guaranteed for e in t.events] == [True, False, True, True, True, True]   # the delay is inside a data-dependent if
 
 
 # ------------------------------------------------------------------ sequence checking
@@ -211,6 +218,16 @@ def test_record_sequence_tool_and_stale_verify_after_new_facts(tmp_path, monkeyp
     assert res["ok"] and "verify traces" in res["next"]
     monkeypatch.setattr(pio, "build", lambda root, on_line=None: BuildResult(ok=True))
     belt.build()
+    v = belt.verify()
+    assert not v["passed"] and v["findings"][0]["code"] == "REG_MAP_MISSING"   # a configured device needs its register map
+    assert belt.call("record_layouts", {"device": "BMP", "source_id": "SRC-001", "layouts": [
+        {"name": "NVM_PAR_T1", "bytes": ["0x31", "0x32"], "quote": "0x32 NVM_PAR_T1<15:8> NVM_PAR_T1 16 Bit unsigned 0x31 NVM_PAR_T1<7:0>"}]})["ok"]
+    r = belt.call("record_registers", {"device": "BMP", "source_id": "SRC-001", "registers": [
+        {"name": "CMD", "addr": "0x7E", "quote": "Register 0x7E CMD: Bit 7..0 cmd, 0xB6 softreset.",
+         "fields": [{"name": "cmd", "bits": "7:0", "values": {"softreset": "0xB6"}}]},
+        {"name": "PWR_CTRL", "addr": "0x1B", "quote": "Register 0x1B PWR_CTRL: Bit 0 press_en, Bit 1 temp_en, Bit 5..4 mode 00 sleep mode 11 normal mode.",
+         "fields": [{"name": "press_en", "bits": "0"}, {"name": "temp_en", "bits": "1"}, {"name": "mode", "bits": "5:4", "values": {"sleep": "00", "normal": "11"}}]}]})
+    assert r["ok"] and "rejected" not in r, r
     v = belt.verify()
     assert v["passed"] and v["flows"][0]["steps"] == ["1. write: matched (src/main.c:21)", "2. delay_min: matched"]
     assert belt.finish("success", "done")["ok"]

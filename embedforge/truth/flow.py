@@ -15,6 +15,7 @@ symbolic and are reported as unresolved rather than guessed.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,57 @@ Value = Union[int, float, Sym, Arr, Ptr, str, None]
 
 def is_int(v: Any) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _c_div(a: int, b: int) -> int:
+    """C integer division truncates toward zero (Python's // floors)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b >= 0) else -q
+
+
+_INT_TYPES = [   # (regex over the type text, bits, signed)
+    (r"\b(uint8_t|unsigned\s+char|byte|u8|BYTE|uint8|uint_least8_t|uint_fast8_t|bool|_Bool|boolean)\b", 8, False),
+    (r"\b(int8_t|s8|int8|signed\s+char|int_least8_t|int_fast8_t)\b", 8, True),
+    (r"\bchar\b", 8, False),   # plain char is unsigned on ARM (RP2040/RP2350, STM32)
+    (r"\b(uint16_t|unsigned\s+short|u16|WORD|uint16|uint_least16_t|word)\b", 16, False),
+    (r"\b(int16_t|s16|int16|short|int_least16_t)\b", 16, True),
+    (r"\b(uint64_t|u64|uint64|unsigned\s+long\s+long)\b", 64, False),
+    (r"\b(int64_t|s64|int64|long\s+long)\b", 64, True),
+    (r"\b(uint32_t|u32|DWORD|uint32|unsigned\s+long|unsigned\s+int|unsigned|size_t|uint_fast16_t|uint_fast32_t|uintptr_t)\b", 32, False),
+    (r"\b(int32_t|s32|int32|long|int|signed|int_fast16_t|int_fast32_t|ssize_t)\b", 32, True),
+]
+
+
+def c_type_kind(type_text: str) -> Optional[Tuple[str, int, bool]]:
+    """('float', 64, True) / ('int', bits, signed) for a C arithmetic type, None for anything else (struct, pointer)."""
+    if "*" in type_text:
+        return None
+    if re.search(r"\b(float|double|float32_t|float64_t)\b", type_text):
+        return ("float", 64, True)
+    for rx, bits, signed in _INT_TYPES:
+        if re.search(rx, type_text):
+            return ("int", bits, signed)
+    return None
+
+
+def c_convert(type_text: str, v: Any) -> Any:
+    """The value C stores when `v` is converted to the type: floats truncate toward zero, integers wrap."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return v
+    kind = c_type_kind(type_text)
+    if kind is None:
+        return v
+    if kind[0] == "float":
+        return float(v)
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            return v
+        v = int(v)
+    bits, signed = kind[1], kind[2]
+    if re.search(r"\b(bool|_Bool|boolean)\b", type_text):
+        return int(bool(v))
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if signed and v >> (bits - 1) else v
 
 
 def as_bytes(v: Any, n: Any) -> List[Any]:
@@ -335,6 +387,10 @@ class FlowModel:
         self.classes = {m for text in files.values() for m in re.findall(r"\b(?:class|struct)\s+([A-Za-z_]\w*)\s*(?::[^{;]*)?\{", text)}
         self.global_objects: Dict[str, Tuple[str, List[List[Tok]]]] = {}   # name -> (class, constructor argument tokens)
         self.defaults: Dict[str, Dict[int, List[Tok]]] = {}                 # function -> {param index: default value tokens}
+        self.global_vars: Dict[str, Tuple[Optional[List[Tok]], Optional[List[Tok]]]] = {}   # name -> (array size, initializer)
+        self.global_types: Dict[str, str] = {}
+        self.global_type_text: Dict[str, str] = {}   # name -> full declared type ('unsigned int', 'float')
+        self.field_types: Dict[str, Optional[str]] = {}   # struct/class member -> declared type (None when ambiguous)
         for name, text in sorted(files.items()):
             self._load(name, text)
 
@@ -516,6 +572,7 @@ class FlowModel:
                     self._typedef_name(toks, end)
                     kw = next((k2 for k2 in range(i - 1, max(-1, i - 6), -1) if toks[k2].text in ("class", "struct", "union")), None)
                     owner = toks[kw + 1].text if kw is not None and kw + 1 < i and toks[kw + 1].kind == "id" else cls
+                    self._fields(toks[i + 1:end])
                     # class bodies may contain inline methods: scan inside, as methods of that class
                     self._scan(fname, toks[i + 1:end], owner if "class" in head or "struct" in head else cls)
                     i = end + 1
@@ -563,6 +620,37 @@ class FlowModel:
                     self.global_objects[toks[i + 1].text] = (t.text, [])
                     i += 3
                     continue
+            # file-scope variables:  static double par[14];  float t_lin = 0;  struct calib cal;  int a, b;
+            if (not cls and t.kind == "id" and prev_text in (";", "}", "{") and t.text not in
+                    ("typedef", "return", "enum", "namespace", "using", "template", "extern", "class", "const", "constexpr", "if", "for", "while")):
+                semi = self._find_semicolon(toks, i)
+                seg = toks[i:semi]
+                texts_seg = [x.text for x in seg]
+                eq = texts_seg.index("=") if "=" in texts_seg else len(seg)
+                head_txt = texts_seg[:eq]
+                if len(seg) >= 2 and "(" not in head_txt and "{" not in head_txt and "const" not in head_txt and "operator" not in head_txt:
+                    type_name = next((x.text for x in seg if x.kind == "id" and x.text not in ("static", "volatile", "struct", "unsigned", "signed", "register")), "")
+                    seg_type = ""
+                    for k2, part in enumerate(_split_args(seg)):
+                        ptexts = [x.text for x in part]
+                        peq = ptexts.index("=") if "=" in ptexts else len(part)
+                        decl = part[:peq]
+                        if not decl:
+                            continue
+                        lb = next((k3 for k3, x in enumerate(decl) if x.text == "["), None)
+                        name_tok = decl[lb - 1] if lb else decl[-1]
+                        if name_tok.kind != "id" or (k2 == 0 and len(decl) < 2):
+                            continue
+                        size = None
+                        if lb is not None:
+                            rb = _match(decl, lb, "[", "]")
+                            size = decl[lb + 1:rb]
+                        self.global_vars[name_tok.text] = (size, part[peq + 1:] if peq < len(part) else None)
+                        self.global_types[name_tok.text] = type_name
+                        if k2 == 0:
+                            name_at = next((k3 for k3, x in enumerate(seg) if x is name_tok), 0)
+                            seg_type = " ".join(x.text for x in seg[:name_at] if x.text not in ("static", "volatile", "struct"))
+                        self.global_type_text[name_tok.text] = seg_type
             if t.text == "[" and i >= 2 and toks[i - 1].kind == "id" and toks[i - 2].kind == "id":
                 rb = _match(toks, i, "[", "]")
                 if rb + 1 < n and toks[rb + 1].text in (";", "="):
@@ -585,6 +673,43 @@ class FlowModel:
                     i = semi + 1
                     continue
             i += 1
+
+    def _fields(self, body: List[Tok]) -> None:
+        """Member declarations of a struct/class body (depth 0, not methods): uint16_t par_t1; int8_t a, b; float x[3];"""
+        seg: List[Tok] = []
+        depth = 0
+        for tk in body:
+            if tk.text in ("{", "("):
+                depth += 1
+            elif tk.text in ("}", ")"):
+                depth -= 1
+            if depth == 0 and tk.text == ";":
+                self._field_decl(seg)
+                seg = []
+            elif depth == 0 and tk.text == ":" and seg and seg[-1].text in ("public", "private", "protected"):
+                seg = []
+            elif depth >= 0:
+                seg.append(tk)
+        return None
+
+    def _field_decl(self, seg: List[Tok]) -> None:
+        texts = [x.text for x in seg]
+        if not seg or any(x in texts for x in ("(", "{", "typedef", "using", "friend", "enum", "return")):
+            return
+        parts = _split_args(seg)
+        first = parts[0]
+        cut = next((k for k, x in enumerate(first) if x.text in ("[", "=", ":")), len(first))
+        if cut < 2 or first[cut - 1].kind != "id":
+            return
+        type_text = " ".join(x.text for x in first[:cut - 1] if x.text not in ("static", "volatile", "const", "mutable", "struct", "union"))
+        if not type_text:
+            return
+        names = [first[cut - 1].text] + [next((x.text for x in p if x.kind == "id"), "") for p in parts[1:]]
+        for nm in names:
+            if not nm:
+                continue
+            prev = self.field_types.get(nm, type_text)
+            self.field_types[nm] = type_text if prev == type_text else None   # same name, different types: unknown
 
     @staticmethod
     def _ctor_params_end(toks: List[Tok], name_i: int) -> Optional[int]:
@@ -707,6 +832,22 @@ class FlowModel:
         w.call(fn, call_args, (), guaranteed=True)
         return Trace(entry, normalize(w.events), w.notes, found=True, opaque=sorted(w.opaque))
 
+    def run(self, entries: List[str], probe: Optional[Dict[int, int]] = None) -> "Walker":
+        """Walk several entry functions in order on one shared state (setup() then loop(), as the Arduino core does).
+        In probe mode a device read returns the `probe` byte of each register, so the code's arithmetic runs on concrete
+        data and the walker's `values` hold every number it computes. Without a probe, read bytes stay symbolic but
+        remember their register (shifts and masks applied to them are in obs_shifts / obs_masks)."""
+        w = Walker(self)
+        w.probe = probe
+        for obj_name, (cls, ctor_args) in self.global_objects.items():
+            w.construct(obj_name, cls, ctor_args)
+        for entry in entries:
+            fn = self.function(entry)
+            if fn is not None and len(w.events) < MAX_EVENTS:
+                w.call(fn, [Sym(p) for p in fn.params], (), guaranteed=True)
+        w.events = normalize(w.events)
+        return w
+
 
 @dataclass
 class Trace:
@@ -721,6 +862,29 @@ class Trace:
 
 
 # ------------------------------------------------------------------ expression evaluation
+
+
+MAX_ITER = 256   # iterations of one loop with known bounds
+_SHIFTED_RX = re.compile(r"^\(?<?rx@0x[0-9A-F]+<<\d+")   # (msb << 8) ...: the other half of `(msb << 8) | lsb`
+
+
+@dataclass(frozen=True)
+class RxByte:
+    """A byte read from a device register (unknown value, known origin): lets the analysis see how the code assembles
+    multi-byte values and which status bits it tests."""
+    reg: int
+    dev: Optional[int] = None   # bus address of the device, when known
+
+    def __repr__(self) -> str:
+        return f"rx@0x{self.reg:02X}"
+
+
+class _Break(Exception):
+    pass
+
+
+class _Continue(Exception):
+    pass
 
 
 class _Return(Exception):
@@ -822,6 +986,8 @@ class Evaluator:
                 return left
             self._next()
             right = self._expr(prec + 1)
+            if self.w is not None:
+                self.w.observe(t.text, left, right, self.file, t.line)
             left = self._binop(t.text, left, right)
 
     @staticmethod
@@ -841,7 +1007,7 @@ class Evaluator:
                  "^": lambda: int(a) ^ int(b), "&": lambda: int(a) & int(b), "==": lambda: int(a == b), "!=": lambda: int(a != b),
                  "<": lambda: int(a < b), ">": lambda: int(a > b), "<=": lambda: int(a <= b), ">=": lambda: int(a >= b),
                  "<<": lambda: int(a) << int(b), ">>": lambda: int(a) >> int(b), "+": lambda: a + b, "-": lambda: a - b,
-                 "*": lambda: a * b, "/": lambda: (int(a) // int(b) if is_int(a) and is_int(b) else a / b), "%": lambda: int(a) % int(b)}[op]()
+                 "*": lambda: a * b, "/": lambda: (_c_div(a, b) if is_int(a) and is_int(b) else a / b), "%": lambda: (a - b * _c_div(a, b) if is_int(a) and is_int(b) else math.fmod(a, b))}[op]()
             return r
         except (ZeroDivisionError, ValueError, OverflowError):
             return Sym(f"{a}{op}{b}")
@@ -872,10 +1038,16 @@ class Evaluator:
             if name and (follow is None or follow.text not in (".", "->", "[")):
                 if name not in self.env and isinstance(v, Sym):
                     return Obj(name)  # &global_struct
-                if name in self.env and isinstance(v, Sym):
-                    return Ptr(Arr([v]), 0)   # &local: a one-element buffer (and a handle for field access)
-                if name in self.env:
-                    self.env[name] = Sym(f"{name}@")  # its address escapes: whatever is called may write it
+                home = self.env if name in self.env else (self.w.globals if self.w is not None and name in self.w.globals else None)
+                if home is not None:
+                    # &scalar: a one-element buffer (also a handle for field access). What a call writes into it flows
+                    # back into the variable when the call returns (Walker.on_call).
+                    cell = Arr([v])
+                    if self.w is not None:
+                        self.w._addr_cells.append((home, name, cell, v))
+                    if not isinstance(v, Sym):
+                        home[name] = Sym(f"{name}@")   # its address escapes: whatever is called may write it
+                    return Ptr(cell, 0)
             if isinstance(v, Sym) and follow is not None and follow.text in (".", "->"):
                 return Obj(v.text)  # &a.b / &dev->cfg: an object handle for that field path
             return Ptr(Arr([v]), 0)
@@ -938,15 +1110,7 @@ class Evaluator:
 
     @staticmethod
     def _cast(type_toks: List[Tok], v: Any) -> Any:
-        names = " ".join(t.text for t in type_toks)
-        if is_int(v) and "*" not in names:
-            if re.search(r"\b(uint8_t|unsigned char|byte|u8|BYTE|uint8)\b", names):
-                return v & 0xFF
-            if re.search(r"\b(uint16_t|unsigned short|u16|WORD|uint16)\b", names):
-                return v & 0xFFFF
-            if re.search(r"\b(int8_t|s8|int8)\b", names):
-                return ((v & 0xFF) ^ 0x80) - 0x80
-        return v
+        return c_convert(" ".join(t.text for t in type_toks), v)
 
     def _init_list(self) -> Arr:
         end = _match(self.toks, self.i, "{", "}")
@@ -1007,9 +1171,12 @@ class Evaluator:
         if here is not None and name not in self.m.macros and name not in self.m.consts and name not in self.m.functions \
                 and name not in self.m.global_arrays and name not in self.m.global_objects:
             key = obj_key(here[0])
-            return self.w.fields.get((key, name), Sym(f"{key}.{name}"))   # a member of the current object
+            if (key, name) in self.w.fields or name not in self.m.global_vars:
+                return self.w.fields.get((key, name), Sym(f"{key}.{name}"))   # a member of the current object
         if name in self.m.global_objects:
             return Obj(name)
+        if self.w is not None and name in self.m.global_vars:
+            return self.w.global_value(name)
         return self.m_const(name, 0)
 
     def m_const(self, name: str, depth: int) -> Any:
@@ -1103,6 +1270,50 @@ class Walker:
         self.fields: Dict[Tuple[str, str], Any] = {}        # (object, field) -> value, e.g. ('the_sensor', 'write') -> fn
         self._frames: List[Dict[str, bool]] = []
         self._this: List[Tuple[Any, str]] = []              # (object, class) of the method being walked
+        self._iterating = 0                                 # > 0 inside an iterated loop: break/continue are live
+        self.probe: Optional[Dict[int, int]] = None         # register -> byte the device returns (probe mode)
+        self.ptr: Dict[Any, int] = {}                       # bus address -> register pointer last written
+        self._rxq: Dict[str, List[Any]] = {}                # Arduino Wire: bytes waiting for Wire.read()
+        self.obs_shifts: List[Tuple[RxByte, int, str, int]] = []  # (read byte, left shift, file, line): how bytes are assembled
+        self.obs_masks: List[Tuple[RxByte, int, str, int]] = []   # (read byte, mask, file, line): which bits are tested
+        self.outputs: List[Tuple[Any, int]] = []            # numbers the code prints (Serial.print, printf, ...)
+        self.globals: Dict[str, Any] = {}                   # file-scope variables written during the walk
+        self.values: List[Tuple[Any, str, str]] = []        # probe mode: every number the code computes (value, file:line, where)
+        self.regs_written: Dict[Any, Dict[int, int]] = {}   # device -> register -> last value written (probe read-back)
+        self._ltypes: Dict[Tuple[str, str], str] = {}      # (function, local) -> declared type
+        self._last_env: Dict[str, Any] = {}
+        self._addr_cells: List[Tuple[Dict[str, Any], str, Arr, Any]] = []   # (&x passed to a call): where x lives, its cell
+        self._opaque_n = 0                                                  # calls into code the walk cannot see
+
+    def note_value(self, v: Any, file: str, line: int, where: str) -> None:
+        if self.probe is not None and isinstance(v, (int, float)) and not isinstance(v, bool) and len(self.values) < 20000:
+            self.values.append((v, f"{file}:{line}", where))
+
+    def rx(self, reg: Any, k: int, dev: Any = None) -> Any:
+        """The value of byte k of a read that started at register `reg`: in probe mode the probe byte (or, for a register
+        the probe does not set, the last value the code wrote there), otherwise a byte that remembers its register."""
+        if not is_int(reg):
+            return Sym("rx")
+        if self.probe is not None:
+            r = reg + k
+            return self.probe[r] if r in self.probe else self.regs_written.get(repr(dev), {}).get(r, 0)
+        return RxByte(reg + k, dev if is_int(dev) else None)
+
+    def global_value(self, name: str) -> Any:
+        """A file-scope variable: zero-initialised (as C does) or from its initializer, created on first use."""
+        if name not in self.globals:
+            size_toks, init_toks = self.m.global_vars[name]
+            if init_toks:
+                v = Evaluator(self.m, {}, (), None).eval(init_toks)
+                v = Arr(list(v.items)) if isinstance(v, Arr) else v
+            elif size_toks is not None:
+                size = Evaluator(self.m, {}, (), None).eval(size_toks) if size_toks else 0
+                v = Arr([0] * (size if is_int(size) and 0 <= size <= 4096 else 0))
+            else:
+                kind = c_type_kind(self.m.global_type_text.get(name, ""))
+                v = Obj(name) if kind is None else (0.0 if kind[0] == "float" else 0)
+            self.globals[name] = v
+        return self.globals[name]
 
     def this(self) -> Optional[Tuple[Any, str]]:
         return self._this[-1] if self._this else None
@@ -1183,8 +1394,12 @@ class Walker:
             frame = self._frames.pop()
             if this is not None:
                 self._this.pop()
+            self._last_env = env
         # a return inside an uncertain branch means the caller cannot know which value comes back
-        return Sym(f"{fn.name}()") if frame["may_return"] else value
+        if frame["may_return"]:
+            return Sym(f"{fn.name}()")
+        self.note_value(value, fn.file, fn.line, f"{fn.name}() returns")
+        return value
 
     def block(self, toks: List[Tok], env: Dict[str, Any], chain: Tuple[str, ...], guaranteed: bool, file: str) -> None:
         i, n = 0, len(toks)
@@ -1232,30 +1447,24 @@ class Walker:
                 parts = self._split_semis(head)
                 if parts and parts[0]:
                     self._expr_stmt(parts[0], env, chain, guaranteed, file)
-                cond = ev(guaranteed).eval(parts[1]) if len(parts) > 1 and parts[1] else 1
-                runs = bool(is_int(cond) and cond)
-                if runs:
-                    self._run(body, env, chain, guaranteed, file, loop=True)
-                else:
-                    self._uncertain([body], env, chain, file, may_skip=True, loop=True)
+                cond_toks = parts[1] if len(parts) > 1 else []
+                step_toks = parts[2] if len(parts) > 2 else []
+                self._loop(body, cond_toks, step_toks, env, chain, guaranteed, file, counted=True)
             elif t.text == "while":
-                cond = ev(guaranteed).eval(head)
-                if is_int(cond) and cond:          # while(1) { ... break; }: the body runs
-                    self._run(body, env, chain, guaranteed, file, loop=True)
-                elif not (is_int(cond) and cond == 0):
-                    self._uncertain([body], env, chain, file, may_skip=True, loop=True)
+                self._loop(body, head, [], env, chain, guaranteed, file, counted=False)
             else:
                 ev(guaranteed).eval(head)
                 self._uncertain([body], env, chain, file, may_skip=True)
             return body_end
         if t.kind == "id" and t.text == "do":
             body_end = self._stmt_end(toks, i + 1)
-            self._run(toks[i + 1:body_end], env, chain, guaranteed, file, loop=True)  # a do-body runs at least once
             j = body_end
+            cond_toks: List[Tok] = []
             if j < len(toks) and toks[j].text == "while":
                 end = _match(toks, j + 1)
-                ev(False).eval(toks[j + 2:end])
+                cond_toks = toks[j + 2:end]
                 j = end + 1
+            self._loop(toks[i + 1:body_end], cond_toks, [], env, chain, guaranteed, file, counted=False, do_first=True)
             return j + 1 if j < len(toks) and toks[j].text == ";" else j
         if t.kind == "id" and t.text == "return":
             semi = self._semi(toks, i)
@@ -1265,6 +1474,8 @@ class Walker:
             if self._frames:
                 self._frames[-1]["may_return"] = True
             return semi + 1
+        if t.kind == "id" and t.text in ("break", "continue") and guaranteed and self._iterating:
+            raise _Break() if t.text == "break" else _Continue()
         if t.kind == "id" and t.text in ("break", "continue", "goto"):
             return self._semi(toks, i) + 1
         semi = self._semi(toks, i)
@@ -1277,6 +1488,50 @@ class Walker:
         except _Return:
             if guaranteed and not loop:
                 raise
+        except (_Break, _Continue):
+            if not loop:
+                raise
+
+    def _loop(self, body: List[Tok], cond_toks: List[Tok], step_toks: List[Tok], env, chain, guaranteed: bool, file: str,
+              counted: bool, do_first: bool = False) -> None:
+        """Iterate while the condition is known (counted loops always; while/do loops in probe mode, where device
+        reads are concrete). An unknown condition walks the body once as a path that may or may not run."""
+        ev = Evaluator(self.m, env, chain, self, guaranteed, file)
+        iterate = counted or self.probe is not None
+        n = 0
+        while True:
+            if not (do_first and n == 0):
+                cond = ev.eval(cond_toks) if cond_toks else 1
+                if not is_int(cond) or (not iterate and n == 0):
+                    if n == 0:   # unknown (or not iterated): one possible pass
+                        if is_int(cond) and cond == 0:
+                            return
+                        if is_int(cond) and cond:
+                            self._run(body, env, chain, guaranteed, file, loop=True)
+                        else:
+                            self._uncertain([body], env, chain, file, may_skip=True, loop=True)
+                    return
+                if not cond:
+                    return
+            if n >= MAX_ITER or len(self.events) >= MAX_EVENTS:
+                self.notes.append(f"loop at {file}:{(body[0].line if body else 0)} did not end within {MAX_ITER} iterations")
+                return
+            self._iterating += 1
+            try:
+                self.block(body, env, chain, guaranteed, file)
+            except _Break:
+                return
+            except _Continue:
+                pass
+            except _Return:
+                raise
+            finally:
+                self._iterating -= 1
+            if step_toks:
+                self._expr_stmt(step_toks, env, chain, guaranteed, file)
+            n += 1
+            if not iterate:
+                return
 
     @staticmethod
     def _semi(toks: List[Tok], i: int) -> int:
@@ -1338,10 +1593,20 @@ class Walker:
         if not toks:
             return
         texts = [t.text for t in toks]
+        # i++ / ++i / i-- / --i as a statement (loop steps)
+        if len(toks) == 2 and ("++" in texts or "--" in texts):
+            name_tok = toks[0] if toks[1].text in ("++", "--") else toks[1]
+            op = toks[1].text if toks[1].text in ("++", "--") else toks[0].text
+            if name_tok.kind == "id":
+                cur = Evaluator(self.m, env, chain, self, guaranteed, file).eval([name_tok])
+                self._assign([name_tok], (cur + (1 if op == "++" else -1)) if isinstance(cur, (int, float)) else Sym(name_tok.text), env, chain, guaranteed, file)
+                return
         ev = Evaluator(self.m, env, chain, self, guaranteed, file)
         # declarations:  [qualifiers] type name [N] = init , name2 = init2 ;
         if self._is_decl(toks):
             decl_start = self._decl_names_start(toks)
+            decl_type = " ".join(x.text for x in toks[:decl_start] if x.text not in ("static", "const", "volatile", "register", "constexpr", "struct"))
+            fn_name = chain[-1] if chain else ""
             for part in _split_args(toks[decl_start:]):
                 if not part:
                     continue
@@ -1350,9 +1615,15 @@ class Walker:
                 if name_tok is None:
                     continue
                 name = name_tok.text
+                ptr_decl = "*" in pt[:pt.index(name)] if name in pt else False
+                if not ptr_decl:
+                    self._ltypes[(fn_name, name)] = decl_type
                 if "=" in pt:
                     eq = pt.index("=")
                     val = Evaluator(self.m, env, chain, self, guaranteed, file).eval(part[eq + 1:])
+                    if not ptr_decl and "[" not in pt[:eq]:
+                        val = c_convert(decl_type, val)
+                        self.note_value(val, file, name_tok.line, name)
                     if "[" in pt[:eq] and is_int(val):
                         val = Arr([val])
                     if isinstance(val, Arr):
@@ -1390,24 +1661,41 @@ class Walker:
         return d
 
     def _assign(self, lhs: List[Tok], val: Any, env, chain, guaranteed, file) -> None:
+        fn_name = chain[-1] if chain else ""
         if len(lhs) == 1 and lhs[0].kind == "id":
+            name = lhs[0].text
             here = self.this()
-            if lhs[0].text not in env and here is not None:   # a member of the current object: _addr = addr;
-                self.fields[(obj_key(here[0]), lhs[0].text)] = val
+            if name not in env and here is not None and ((obj_key(here[0]), name) in self.fields or name not in self.m.global_vars):
+                val = c_convert(self.m.field_types.get(name) or "", val)
+                self.fields[(obj_key(here[0]), name)] = val   # a member of the current object: _addr = addr;
+            elif name not in env and name in self.m.global_vars:
+                val = c_convert(self.m.global_type_text.get(name, ""), val)
+                self.globals[name] = val
             else:
-                env[lhs[0].text] = val
+                val = c_convert(self._ltypes.get((fn_name, name), ""), val)
+                env[name] = val
+            self.note_value(val, file, lhs[0].line, name)
             return
         if len(lhs) >= 4 and lhs[0].kind == "id" and lhs[1].text == "[" and lhs[-1].text == "]":
             arr = env.get(lhs[0].text)
+            if arr is None and lhs[0].text in self.m.global_vars:
+                arr = self.global_value(lhs[0].text)
+            elif arr is None and self.this() is not None:
+                arr = self.fields.get((obj_key(self.this()[0]), lhs[0].text))
             idx = Evaluator(self.m, env, chain, self, guaranteed, file).eval(lhs[2:-1])
             target = arr.arr if isinstance(arr, Ptr) else arr
             base = arr.offset if isinstance(arr, Ptr) else 0
+            name = lhs[0].text
+            elem_type = (self._ltypes.get((fn_name, name)) if name in env else
+                         self.m.global_type_text.get(name) if name in self.m.global_vars else self.m.field_types.get(name)) or ""
+            val = c_convert(elem_type, val)
             if isinstance(target, Arr) and is_int(idx):
                 j = base + idx
                 if 0 <= j < 4096:
                     while len(target.items) <= j:
                         target.items.append(Sym("uninit"))
                     target.items[j] = val
+            self.note_value(val, file, lhs[0].line, f"{name}[{idx!r}]")
             return
         if lhs and lhs[0].text == "*" and len(lhs) == 2 and lhs[1].kind == "id":
             p = env.get(lhs[1].text)
@@ -1418,11 +1706,13 @@ class Walker:
         k = len(lhs) - 2
         if k >= 1 and lhs[-1].kind == "id" and lhs[k].text in (".", "->") and self._depth_at(lhs, k) == 0:
             base = Evaluator(self.m, env, chain, self, guaranteed, file).eval(lhs[:k])
-            if len(lhs[:k]) == 1 and lhs[0].kind == "id" and lhs[0].text not in env and isinstance(base, Sym):
-                base = Obj(lhs[0].text)
+            if len(lhs[:k]) == 1 and lhs[0].kind == "id" and lhs[0].text not in env and isinstance(base, Sym) and base.text == lhs[0].text:
+                base = Obj(lhs[0].text)   # an unknown global struct (a member path like obj._calib keeps its key)
             key = obj_key(base)
             if key is not None:
+                val = c_convert(self.m.field_types.get(lhs[-1].text) or "", val)
                 self.fields[(key, lhs[-1].text)] = val
+                self.note_value(val, file, lhs[-1].line, f"{key}.{lhs[-1].text}")
                 return
         # anything else: evaluate for side effects (calls), value not tracked
         Evaluator(self.m, env, chain, self, guaranteed, file).eval(lhs)
@@ -1466,8 +1756,30 @@ class Walker:
 
     # ---------------------------------------------------------- calls
     def on_call(self, name: str, obj: Any, arg_toks: List[List[Tok]], ev: Evaluator, line: int, arrow: str) -> Any:
+        mark, opaque_before = len(self._addr_cells), self._opaque_n
+        try:
+            return self._on_call(name, obj, arg_toks, ev, line, arrow)
+        finally:
+            # variables passed by address (&x): take what the callee stored; if it stored nothing and everything it called
+            # is known, x keeps its value; an unknown callee may have written it, so it stays unknown
+            for home, var, cell, before in self._addr_cells[mark:]:
+                now = cell.items[0] if cell.items else before
+                if now is not before:
+                    home[var] = now
+                elif self._opaque_n == opaque_before:
+                    home[var] = before
+            del self._addr_cells[mark:]
+
+    def _on_call(self, name: str, obj: Any, arg_toks: List[List[Tok]], ev: Evaluator, line: int, arrow: str) -> Any:
         prim = _PRIMITIVES.get(name)
         args = [Evaluator(self.m, ev.env, ev.chain, self, ev.guaranteed, ev.file).eval(a) for a in arg_toks]
+        if name in _PRINT_FUNCS and (obj is not None or name in ("printf", "sprintf", "snprintf", "printk") or name.startswith(("ESP_LOG", "LOG_"))):
+            for a in args:
+                if isinstance(a, (int, float)) and not isinstance(a, bool):
+                    self.outputs.append((a, line))
+                    self.note_value(a, ev.file, line, f"printed by {name}()")
+            if name in ("print", "println", "printf", "printk") or name.startswith(("ESP_LOG", "LOG_")):
+                return 1
         if obj is not None:
             # a function pointer the walk saw being stored in this object's field: dev->write = &i2c_write
             key = obj_key(obj)
@@ -1476,7 +1788,7 @@ class Walker:
                 fn = self.m.function(fv.text[3:])
                 if fn is not None and fn.name not in self._stack:
                     return self._inline(fn, args, ev, line)
-        if obj is not None and name in _WIRE_METHODS and not (name in ("write", "read") and arrow == "->" and len(args) >= 3):
+        if obj is not None and name in _WIRE_METHODS and not (name in ("write", "read") and arrow == "->" and len(args) >= 3) and not (name == "read" and args):
             return self._wire_call(name, obj, args, ev, line)
         if obj is not None:
             # otherwise: a project function some code stores in a field of that name (vtable, Bosch-style callbacks) —
@@ -1506,6 +1818,7 @@ class Walker:
             if fn is not None and fn.params and len(fn.params) == len(args):
                 return self._inline(fn, args, ev, line)
             self.opaque.add(f"{name}()")
+            self._opaque_n += 1
             return Sym(f"{name}()")
         if prim is not None:
             return prim(self, args, ev, line)
@@ -1516,6 +1829,7 @@ class Walker:
         if fn is not None:
             return self._inline(fn, args, ev, line, arg_toks=arg_toks)
         self.opaque.add(f"{name}()")
+        self._opaque_n += 1
         return Sym(f"{name}()")
 
     def _inline(self, fn: Function, args: List[Any], ev: Evaluator, line: int, this: Optional[Tuple[Any, str]] = None,
@@ -1525,15 +1839,41 @@ class Walker:
             return self.call(fn, args, ev.chain, ev.guaranteed, this=this)
         finally:
             self._sites.pop()
-            # C++ reference parameters: the callee may have written the caller's variable
+            # C++ reference parameters: the caller's variable now holds what the callee left in it
+            callee_env = self._last_env
             for k in fn.refs:
                 at = arg_toks[k] if arg_toks and k < len(arg_toks) else None
-                if at and len(at) == 1 and at[0].kind == "id" and at[0].text in ev.env:
-                    ev.env[at[0].text] = Sym(f"{at[0].text}@ref")
+                if at and len(at) == 1 and at[0].kind == "id" and k < len(fn.params):
+                    val = callee_env.get(fn.params[k], Sym(f"{at[0].text}@ref"))
+                    self._assign(at, val, ev.env, ev.chain, ev.guaranteed, ev.file)
 
     def emit(self, ev: Evaluator, line: int, **kw: Any) -> None:
+        if kw.get("kind") == "write" and kw.get("reg") is None and kw.get("data") and is_int(kw["data"][0]):
+            first = kw["data"][0]   # the register a following read starts at (SPI: bit 7 is the read flag)
+            self.ptr[repr(kw.get("addr"))] = first & 0x7F if kw.get("bus") == "spi" else first
+        if kw.get("kind") == "write" and self.probe is not None:
+            data, reg = list(kw.get("data") or []), kw.get("reg")
+            if reg is None and data and is_int(data[0]):
+                reg, data = (data[0] & 0x7F if kw.get("bus") == "spi" else data[0]), data[1:]
+            if is_int(reg):
+                mem = self.regs_written.setdefault(repr(kw.get("addr")), {})
+                for k, v in enumerate(data[:64]):
+                    if is_int(v):
+                        mem[reg + k] = v & 0xFF
         if len(self.events) < MAX_EVENTS:
             self.events.append(Event(file=ev.file, line=line, chain=ev.chain, guaranteed=ev.guaranteed, sites=tuple(self._sites), **kw))
+
+    def observe(self, op: str, a: Any, b: Any, file: str, line: int) -> None:
+        """How the code uses bytes read from registers: shifts (assembling multi-byte values) and masks (testing bits)."""
+        if op == "<<" and isinstance(a, RxByte) and is_int(b):
+            self.obs_shifts.append((a, b, file, line))
+        elif op == "&" and (isinstance(a, RxByte) and is_int(b) or isinstance(b, RxByte) and is_int(a)):
+            rx_, m = (a, b) if isinstance(a, RxByte) else (b, a)
+            self.obs_masks.append((rx_, m, file, line))
+        elif op in ("|", "+"):
+            for x, other in ((a, b), (b, a)):
+                if isinstance(x, RxByte) and isinstance(other, Sym) and _SHIFTED_RX.match(other.text):
+                    self.obs_shifts.append((x, 0, file, line))   # the low byte of an assembled value: (msb << 8) | lsb
 
     def _wire_call(self, name: str, obj: Any, args: List[Any], ev: Evaluator, line: int) -> Any:
         key = repr(obj)
@@ -1553,8 +1893,17 @@ class Walker:
             self.emit(ev, line, kind="write", addr=addr, data=list(buf), length=len(buf), note="Wire")
             return 0
         if name == "requestFrom":
-            self.emit(ev, line, kind="read", addr=args[0] if args else None, length=args[1] if len(args) > 1 else None, note="Wire")
-            return args[1] if len(args) > 1 else Sym("n")
+            addr = args[0] if args else None
+            n = args[1] if len(args) > 1 else None
+            reg = self.ptr.get(repr(addr))
+            self._rxq[key] = [self.rx(reg, k, addr) for k in range(n)] if is_int(n) and 0 < n <= 512 else []
+            self.emit(ev, line, kind="read", addr=addr, length=n, note="Wire")
+            return n if is_int(n) else Sym("n")
+        if name == "read":
+            q = self._rxq.get(key)
+            return q.pop(0) if q else Sym("rx")
+        if name == "available":
+            return len(self._rxq.get(key) or []) if key in self._rxq else Sym("available")
         return Sym(f"{name}()")
 
 
@@ -1583,14 +1932,17 @@ def _write_buf(addr_i: int, buf_i: int, len_i: int, bus: str = "i2c", addr_shift
     return h
 
 
-def taint(v: Any, n: Any = None) -> None:
-    """A read fills its destination with runtime data: nothing about it is known at build time."""
+def taint(v: Any, n: Any = None, w: Optional["Walker"] = None, reg: Any = None, dev: Any = None) -> None:
+    """A read fills its destination with device data: bytes that remember their register (or, in probe mode, the
+    probe's bytes). Nothing about their value is known at build time."""
     target, base = (v.arr, v.offset) if isinstance(v, Ptr) else ((v, 0) if isinstance(v, Arr) else (None, 0))
     if target is None:
         return
+    if is_int(n) and len(target.items) < base + n <= base + 4096:
+        target.items.extend([Sym("uninit")] * (base + n - len(target.items)))
     end = len(target.items) if not is_int(n) else min(len(target.items), base + n)
     for k in range(base, end):
-        target.items[k] = Sym("rx")
+        target.items[k] = w.rx(reg, k - base, dev) if w is not None else Sym("rx")
 
 
 def _read_buf(addr_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, dst_i: int = 2):
@@ -1600,7 +1952,7 @@ def _read_buf(addr_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, ds
             addr >>= addr_shift
         n = a[len_i] if len_i < len(a) else None
         if dst_i < len(a):
-            taint(a[dst_i], n)
+            taint(a[dst_i], n, w, w.ptr.get(repr(addr)), addr)
         w.emit(ev, line, kind="read", addr=addr, length=n, bus=bus)
         return n if is_int(n) else Sym("ret")
     return h
@@ -1625,7 +1977,7 @@ def _mem_read(addr_i: int, reg_i: int, len_i: int, addr_shift: int = 0, bus: str
             addr >>= addr_shift
         d = dst_i if dst_i is not None else (len_i - 1)
         if 0 <= d < len(a):
-            taint(a[d], a[len_i] if len_i < len(a) else None)
+            taint(a[d], a[len_i] if len_i < len(a) else None, w, a[reg_i] if reg_i < len(a) else None, addr)
         w.emit(ev, line, kind="read", addr=addr, reg=a[reg_i] if reg_i < len(a) else None,
                length=a[len_i] if len_i < len(a) else None, bus=bus, note="mem")
         return 0
@@ -1647,7 +1999,8 @@ def _write_read(addr_i: int, wbuf_i: int, wlen_i: int, rlen_i: int, bus: str = "
         wn = a[wlen_i] if wlen_i < len(a) else None
         w.emit(ev, line, kind="write", addr=addr, data=as_bytes(a[wbuf_i] if wbuf_i < len(a) else None, wn), length=wn, bus=bus)
         if rlen_i - 1 < len(a):
-            taint(a[rlen_i - 1], a[rlen_i] if rlen_i < len(a) else None)
+            first = as_bytes(a[wbuf_i] if wbuf_i < len(a) else None, 1)
+            taint(a[rlen_i - 1], a[rlen_i] if rlen_i < len(a) else None, w, first[0] if first else None, addr)
         w.emit(ev, line, kind="read", addr=addr, length=a[rlen_i] if rlen_i < len(a) else None, bus=bus)
         return 0
     return h
@@ -1693,6 +2046,11 @@ _CONST_HELPERS = {
     "BIT": _pure(lambda n: 1 << int(n)), "_BV": _pure(lambda n: 1 << int(n)), "BIT_MASK": _pure(lambda n: (1 << int(n)) - 1),
     "GENMASK": _pure(lambda h, l: ((1 << (int(h) - int(l) + 1)) - 1) << int(l)),
     "FIELD_PREP": _pure(lambda mask, v: (int(v) << ((int(mask) & -int(mask)).bit_length() - 1)) & int(mask)),
+    "pow": _pure(lambda x, y: float(x) ** float(y)), "powf": _pure(lambda x, y: float(x) ** float(y)),
+    "ldexp": _pure(lambda x, e: math.ldexp(float(x), int(e))), "ldexpf": _pure(lambda x, e: math.ldexp(float(x), int(e))),
+    "sqrt": _pure(lambda x: math.sqrt(x)), "sqrtf": _pure(lambda x: math.sqrt(x)), "fabs": _pure(lambda x: abs(float(x))),
+    "fabsf": _pure(lambda x: abs(float(x))), "abs": _pure(lambda x: abs(x)), "exp": _pure(lambda x: math.exp(x)),
+    "expf": _pure(lambda x: math.exp(x)), "log": _pure(lambda x: math.log(x)), "logf": _pure(lambda x: math.log(x)),
 }
 
 _PRIMITIVES = {
@@ -1736,7 +2094,8 @@ _PRIMITIVES.update(_CONST_HELPERS)
 _PRIMITIVES["i2c_reg_read_byte"] = lambda w, a, ev, line: (w.emit(ev, line, kind="read", addr=a[1] if len(a) > 1 else None, reg=a[2] if len(a) > 2 else None, length=1, note="mem"), 0)[1]
 _PRIMITIVES["i2c_reg_read_byte_dt"] = lambda w, a, ev, line: (w.emit(ev, line, kind="read", reg=a[1] if len(a) > 1 else None, length=1, note="mem"), 0)[1]
 
-_WIRE_METHODS = {"beginTransmission", "write", "endTransmission", "requestFrom"}
+_WIRE_METHODS = {"beginTransmission", "write", "endTransmission", "requestFrom", "read", "available"}
+_PRINT_FUNCS = {"print", "println", "printf", "sprintf", "snprintf", "printFloat", "ESP_LOGI", "ESP_LOGD", "LOG_INF", "LOG_DBG", "printk"}
 
 
 def _fnptr_write(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
@@ -1748,7 +2107,7 @@ def _fnptr_write(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
 
 def _fnptr_read(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
     if len(a) > 1:
-        taint(a[1], a[2] if len(a) > 2 else None)
+        taint(a[1], a[2] if len(a) > 2 else None, w, a[0])
     w.emit(ev, line, kind="read", reg=a[0], length=a[2] if len(a) > 2 else None, note="fnptr")
     return 0
 
@@ -1770,7 +2129,10 @@ def _BUSIO_STYLE(w: Walker, name: str, a: List[Any], ev: Evaluator, line: int) -
             data = as_bytes(a[3], a[4]) + data
         w.emit(ev, line, kind="write", data=data, length=len(data), note="busio")
     elif name == "write_then_read":
-        w.emit(ev, line, kind="write", data=as_bytes(a[0], a[1] if len(a) > 1 else None), length=a[1] if len(a) > 1 else None, note="busio")
+        wb = as_bytes(a[0], a[1] if len(a) > 1 else None)
+        w.emit(ev, line, kind="write", data=wb, length=a[1] if len(a) > 1 else None, note="busio")
+        if len(a) > 2:
+            taint(a[2], a[3] if len(a) > 3 else None, w, wb[0] if wb else None)
         w.emit(ev, line, kind="read", length=a[3] if len(a) > 3 else None, note="busio")
     else:
         w.emit(ev, line, kind="read", length=a[1] if len(a) > 1 else None, note="busio")
