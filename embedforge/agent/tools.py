@@ -306,6 +306,8 @@ class ToolBelt:
         self.ended: Optional[str] = None       # 'ask_user' | 'finish'
         self.final: Dict[str, Any] = {}
         self._searches: Dict[str, List[Dict[str, Any]]] = {}  # normalized query -> results (per run)
+        self._failed_calls: Dict[str, int] = {}      # identical record_* calls that were rejected (per run)
+        self._failed_errors: Dict[str, str] = {}
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
         meta = project.meta()
@@ -376,6 +378,13 @@ class ToolBelt:
             call_args[missing[0]] = args[ignored[0]]
             ignored = [f"{ignored[0]} (used as {missing[0]})"]
         limit = 14000 if name == "query_board" else 7000
+        import json as _json
+        sig = name + _json.dumps(call_args, sort_keys=True, default=str)
+        if name.startswith("record_") and self._failed_calls.get(sig, 0) >= 2:
+            return {"ok": False, "error": (f"This exact {name} call was already rejected {self._failed_calls[sig]} times "
+                                           f"({self._failed_errors.get(sig, '')[:200]}). Sending it again cannot succeed: change "
+                                           "the quote (copy one of the candidate_quotes) or the value, or skip it if the firmware "
+                                           "does not need it, and move on to the NEXT STEP.")}
         try:
             res = _truncate(h(**call_args), limit=limit)
         except TypeError as e:
@@ -386,6 +395,9 @@ class ToolBelt:
             return {"error": f"{type(e).__name__}: {e}"}
         if ignored and isinstance(res, dict):
             res["ignored_args"] = ignored  # harmless extras (e.g. build(project_dir='.')) are dropped, not fatal
+        if name.startswith("record_") and isinstance(res, dict) and res.get("ok") is False and not res.get("recorded"):
+            self._failed_calls[sig] = self._failed_calls.get(sig, 0) + 1
+            self._failed_errors[sig] = str(res.get("error") or (res.get("rejected") or [{}])[0].get("error") or "")
         return res
 
     def source_hash(self) -> str:
@@ -627,6 +639,14 @@ class ToolBelt:
         if m:
             source_id = f"SRC-{int(m.group(1)):03d}"
         res = self.ledger.record(subject, property, value, source_id, quote, unit)
+        if not res.get("ok") and "does not appear inside the quoted text" in str(res.get("error")):
+            # '111011x (6 MSB fixed, LSB from SDO)' -> '111011x': the model's own explanation is not part of the value
+            core = re.split(r"\s*[(\[;]|\s+-\s+|,\s+(?=[A-Za-z])", str(value).strip(), maxsplit=1)[0].strip()
+            if core and core != str(value).strip():
+                again = self.ledger.record(subject, property, core, source_id, quote, unit)
+                if again.get("ok"):
+                    res = again
+                    res.setdefault("warnings", []).append(f"Recorded the value as {core!r}: the explanation after it is not in the quote.")
         if res.get("ok"):
             self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
         elif self.store.get(source_id) is None:

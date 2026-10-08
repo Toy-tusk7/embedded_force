@@ -422,6 +422,18 @@ def test_tools_record_and_verify_shows_meaning(tmp_path, monkeypatch):
     assert any("PAR_T1: matches the code" in x for x in v["meaning"]["formulas"]), v["meaning"]
 
 
+def test_fact_value_commentary_is_dropped_and_repeated_rejections_stop(tmp_path):
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+    belt = ToolBelt(p, RunSession("r", p.id), store, ledger)
+    r = belt.call("record_fact", {"subject": "BMPX", "property": "addr_sdo_gnd", "value": "0x76 (SDO tied to GND)",
+                                  "source_id": src.id, "quote": "The 7-bit I2C address is 0x76 when SDO is connected to GND."})
+    assert r["ok"] and r["fact"]["value"] == "0x76", r
+    bad = {"subject": "BMPX", "property": "x", "value": "0x99", "source_id": src.id, "quote": "The 7-bit I2C address is 0x76"}
+    assert "does not appear" in belt.call("record_fact", bad)["error"]
+    assert "does not appear" in belt.call("record_fact", bad)["error"]
+    assert "already rejected 2 times" in belt.call("record_fact", bad)["error"]
+
+
 # ------------------------------------------------------------------ the C the tracer computes
 
 
