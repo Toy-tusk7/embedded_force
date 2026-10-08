@@ -155,6 +155,8 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         {"path": S, "content": S}, ["path", "content"]),
     _fn("replace_in_file", "Replace an exact text snippet in a project file (must match exactly once).",
         {"path": S, "old": S, "new": S}, ["path", "old", "new"]),
+    _fn("rename_file", "Rename a project source file, e.g. src/driver.c -> src/driver.cpp (Arduino's Wire/Serial/SPI are C++).",
+        {"path": S, "new_path": S}, ["path", "new_path"]),
     _fn("read_file", "Read a project file as numbered lines (long files come in windows; pass start/end for more).",
         {"path": S, "start": {"type": "integer"}, "end": {"type": "integer"}}, ["path"]),
     _fn("list_files", "List project files (optionally only those whose path starts with `path`).", {"path": S}, []),
@@ -327,6 +329,7 @@ class ToolBelt:
             "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
             "write_file": self.write_file, "replace_in_file": self.replace_in_file, "read_file": self.read_file,
+            "rename_file": self.rename_file,
             "list_files": self.list_files, "build": self.build, "verify": self.verify, "set_plan": self.set_plan,
             "ask_user": self.ask_user, "finish": self.finish,
         }
@@ -1143,7 +1146,27 @@ class ToolBelt:
         self.session.emit("file", path=res["path"], content=content)
         return {**res, **({"unchanged": True} if unchanged else {}), **self._config_feedback(path, content)}
 
+    def rename_file(self, path: str, new_path: str) -> Dict[str, Any]:
+        """Rename a project source (e.g. bmp388.c -> bmp388.cpp when it uses Arduino C++ objects)."""
+        src = (self.project.root / str(path).replace("\\", "/").lstrip("/")).resolve()
+        dst_rel = str(new_path).replace("\\", "/").lstrip("/")
+        root = self.project.root.resolve()
+        if root not in src.parents or not src.is_file():
+            return {"error": f"{path} is not a project file"}
+        text = src.read_text(encoding="utf-8", errors="ignore")
+        problem = check_agent_write(dst_rel, text) or check_agent_write(str(src.relative_to(root)).replace("\\", "/"), text)
+        if problem:
+            return {"error": problem}
+        if (self.project.root / dst_rel).exists():
+            return {"error": f"{dst_rel} already exists"}
+        res = self.project.write_file(dst_rel, text)
+        src.unlink()
+        self.session.emit("file", path=res["path"], content=text)
+        return {"ok": True, "renamed": f"{path} -> {dst_rel}", "next": "build"}
+
     def replace_in_file(self, path: str, old: str, new: str) -> Dict[str, Any]:
+        if old == new:
+            return {"error": "'old' and 'new' are identical, so nothing would change. Write the corrected text in 'new'."}
         text = self.project.read_file(path)
         n = text.count(old)
         if n != 1:
@@ -1234,6 +1257,13 @@ class ToolBelt:
             if out["diagnostics"]:
                 out.pop("log_tail", None)
                 out["next"] = "Fix the FIRST error (later ones are often consequences), then build again."
+                c_files = {str(d.get("file")) for d in out["diagnostics"] if str(d.get("file") or "").endswith(".c")}
+                cpp_api = [f for f in c_files if (self.project.root / f).is_file() and re.search(
+                    r"\b(Wire|Serial|SPI|Wire1)\s*\.\s*\w+\s*\(|#include\s*[<\"](Wire|Arduino|SPI)\.h", (self.project.root / f).read_text(encoding="utf-8", errors="ignore"))]
+                if cpp_api:
+                    out["next"] = (f"{', '.join(sorted(cpp_api))} is compiled as C, but it uses Arduino's C++ objects (Wire, Serial, SPI): "
+                                   f"rename_file it to .cpp (e.g. rename_file('{sorted(cpp_api)[0]}', '{sorted(cpp_api)[0][:-2]}.cpp')), "
+                                   "then build.")
             else:
                 out["log_tail"] = "\n".join((out.get("log_tail") or "").splitlines()[-25:])
         self.project.update_meta(last_build={

@@ -434,6 +434,18 @@ def test_fact_value_commentary_is_dropped_and_repeated_rejections_stop(tmp_path)
     assert "already rejected 2 times" in belt.call("record_fact", bad)["error"]
 
 
+def test_rename_file_and_identical_replace(tmp_path):
+    p = Project("r6", tmp_path / "r6")
+    (p.root / "src").mkdir(parents=True, exist_ok=True)
+    (p.root / "src" / "d.c").write_text("#include <Wire.h>\nvoid f(void){ Wire.beginTransmission(1); }\n", encoding="utf-8")
+    store = SourceStore(p.root)
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    assert "identical" in belt.call("replace_in_file", {"path": "src/d.c", "old": "f", "new": "f"})["error"]
+    assert belt.call("rename_file", {"path": "src/d.c", "new_path": "src/d.cpp"})["ok"]
+    assert sorted(x.name for x in (p.root / "src").iterdir()) == ["d.cpp"]
+    assert "error" in belt.call("rename_file", {"path": "src/d.cpp", "new_path": "../evil.cpp"})
+
+
 # ------------------------------------------------------------------ the C the tracer computes
 
 
