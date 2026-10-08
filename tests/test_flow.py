@@ -1,0 +1,290 @@
+"""Static flow verification: register operations traced from driver code, compared with datasheet sequences."""
+
+from pathlib import Path
+
+import pytest
+
+from embedforge.agent.events import RunSession
+from embedforge.agent.tools import ToolBelt, check_agent_write
+from embedforge.agent.workspace import Project
+from embedforge.truth import FactLedger, SourceStore, verify_project
+from embedforge.truth.flow import FlowModel
+from embedforge.truth.sequences import SequenceBook
+
+DATASHEET = (
+    "Register 0x7E is the CMD register. Writing 0xB6 to CMD triggers a soft reset. "
+    "After a soft reset the device needs a start-up time of 2 ms before any other register access. "
+    "The calibration coefficients start at register 0x31 and are read as one block of 21 bytes. "
+    "Register 0x1B is PWR_CTRL; writing 0x33 enables pressure and temperature in normal mode. "
+    "With SDO connected to GND the I2C address is 0x76. "
+    "Initialisation: issue a soft reset, wait for the start-up time, read the calibration block, then set PWR_CTRL."
+)
+
+GOOD = r"""
+#include "hardware/i2c.h"
+#define ADDR          0x76   /* FACT-008 */
+#define REG_CMD       0x7E   /* FACT-001 */
+#define CMD_SOFTRESET 0xB6   /* FACT-002 */
+#define REG_CALIB     0x31   /* FACT-004 */
+#define CALIB_LEN     21     /* FACT-005 */
+#define REG_PWR_CTRL  0x1B   /* FACT-006 */
+#define PWR_NORMAL    0x33   /* FACT-007 */
+#define STARTUP_MS    2      /* FACT-003 */
+static uint8_t calib[CALIB_LEN];
+static int write_reg(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    return i2c_write_blocking(i2c0, ADDR, buf, 2, false);
+}
+static int read_regs(uint8_t reg, uint8_t *dst, size_t len) {
+    i2c_write_blocking(i2c0, ADDR, &reg, 1, true);
+    return i2c_read_blocking(i2c0, ADDR, dst, len, false);
+}
+bool bmp_init(void) {
+    write_reg(REG_CMD, CMD_SOFTRESET);
+    sleep_ms(STARTUP_MS);
+    read_regs(REG_CALIB, calib, sizeof(calib));
+    write_reg(REG_PWR_CTRL, PWR_NORMAL);
+    return true;
+}
+int main(void) { bmp_init(); return 0; }
+"""
+
+
+def _project(tmp_path: Path, code: str = GOOD):
+    p = Project("f1", tmp_path / "f1")
+    store = SourceStore(p.root)
+    src = store.add("https://example.com/bmp-like-datasheet.pdf", "datasheet", DATASHEET, kind="pdf")
+    ledger = FactLedger(p.root, store)
+    facts = {}
+    for key, prop, val, unit, quote in [
+        ("cmd", "cmd_reg", "0x7E", "", "Register 0x7E is the CMD register."),
+        ("rst", "softreset_cmd", "0xB6", "", "Writing 0xB6 to CMD triggers a soft reset."),
+        ("t", "startup_time", "2", "ms", "After a soft reset the device needs a start-up time of 2 ms"),
+        ("cal", "calib_first_reg", "0x31", "", "The calibration coefficients start at register 0x31"),
+        ("len", "calib_len", "21", "", "read as one block of 21 bytes"),
+        ("pwr", "pwr_ctrl_reg", "0x1B", "", "Register 0x1B is PWR_CTRL"),
+        ("norm", "pwr_ctrl_normal", "0x33", "", "writing 0x33 enables pressure and temperature in normal mode"),
+        ("addr", "i2c_address", "0x76", "", "With SDO connected to GND the I2C address is 0x76."),
+    ]:
+        res = ledger.record("BMP", prop, val, src.id, quote, unit)
+        assert res["ok"], res
+        facts[key] = res["fact"]["id"]
+    (p.root / "src").mkdir(exist_ok=True)
+    (p.root / "src" / "main.c").write_text(code, encoding="utf-8")
+    return p, store, ledger, src, facts
+
+
+def _record(p, ledger, src, f, entry="bmp_init", steps=None):
+    steps = steps or [{"op": "write", "reg": f["cmd"], "value": f["rst"]}, {"op": "delay_min", "value": f["t"]},
+                      {"op": "read", "reg": f["cal"], "value": f["len"]}, {"op": "write", "reg": f["pwr"], "value": f["norm"]}]
+    return SequenceBook(p.root).record(ledger, "BMP", "power_on_init", entry, steps, src.id,
+                                       "Initialisation: issue a soft reset, wait for the start-up time, read the calibration block, then set PWR_CTRL.",
+                                       device=f["addr"])
+
+
+def _flow_codes(p, ledger):
+    rep = verify_project(p.root, ledger)
+    return rep, sorted({x.code for x in rep.findings if x.code.startswith("FLOW")})
+
+
+# ------------------------------------------------------------------ tracing
+
+
+def test_traces_through_helpers_macros_and_buffers():
+    t = FlowModel({"src/main.c": GOOD}).trace("bmp_init")
+    assert [e.describe() for e in t.events] == ["write 0x7E <- 0xB6", "delay 2000 us", "read 0x31 x21", "write 0x1B <- 0x33"]
+    assert all(e.addr == 0x76 and e.guaranteed for e in t.ops())
+    assert t.events[0].public()["via"].startswith("bmp_init:21 > write_reg")
+
+
+@pytest.mark.parametrize("code, entry, expected", [
+    ("""#include <Wire.h>
+#define A 0x77
+class S { public: bool begin() {
+  Wire.beginTransmission(A); Wire.write(0x7E); Wire.write(0xB6); Wire.endTransmission();
+  delay(10);
+  Wire.beginTransmission(A); Wire.write((uint8_t)0x31); Wire.endTransmission(false); Wire.requestFrom(A, 21);
+  return true; } };""", "begin", ["write 0x7E <- 0xB6", "delay 10000 us", "read 0x31 x21"]),
+    ("""#define BMP (0x76 << 1)
+void bmp_init(I2C_HandleTypeDef *h) { uint8_t v = 0xB6;
+  HAL_I2C_Mem_Write(h, BMP, 0x7E, I2C_MEMADD_SIZE_8BIT, &v, 1, 100); HAL_Delay(5);
+  uint8_t c[21]; HAL_I2C_Mem_Read(h, BMP, 0x31, I2C_MEMADD_SIZE_8BIT, c, 21, 100); }""", "bmp_init",
+     ["write 0x7E <- 0xB6", "delay 5000 us", "read 0x31 x21"]),
+    ("""static int bmp388_init(const struct device *dev) { const struct bmp388_config *cfg = dev->config;
+  i2c_reg_write_byte_dt(&cfg->i2c, 0x7E, 0xB6); k_sleep(K_MSEC(2));
+  uint8_t buf[21]; i2c_burst_read_dt(&cfg->i2c, 0x31, buf, sizeof(buf)); return 0; }""", "bmp388_init",
+     ["write 0x7E <- 0xB6", "delay 2000 us", "read 0x31 x21"]),
+    ("""#define BMP3_REG_CMD 0x7E
+typedef struct { int8_t (*write)(uint8_t, const uint8_t *, uint32_t, void *); void (*delay_us)(uint32_t, void *); void *intf_ptr; } bmp3_dev;
+int8_t bmp3_soft_reset(bmp3_dev *dev) { uint8_t cmd = 0xB6; dev->write(BMP3_REG_CMD, &cmd, 1, dev->intf_ptr); dev->delay_us(2000, dev->intf_ptr); return 0; }""",
+     "bmp3_soft_reset", ["write 0x7E <- 0xB6", "delay 2000 us"]),
+    ("""void init(void) { uint8_t b[2]; b[0] = 0x7E; b[1] = 0xB6; i2c_master_write_to_device(I2C_NUM_0, 0x76, b, 2, 100);
+  vTaskDelay(pdMS_TO_TICKS(3)); }""", "init", ["write 0x7E <- 0xB6", "delay 3000 us"]),
+])
+def test_traces_in_each_hal_style(code, entry, expected):
+    assert [e.describe() for e in FlowModel({"src/x.cpp": code}).trace(entry).events] == expected
+
+
+def test_read_data_is_runtime_and_branches_are_conditional():
+    code = """#define A 0x76
+static void rd(uint8_t r, uint8_t *d, int n) { i2c_write_blocking(i2c0, A, &r, 1, true); i2c_read_blocking(i2c0, A, d, n, false); }
+static void wr(uint8_t r, uint8_t v) { uint8_t b[] = {r, v}; i2c_write_blocking(i2c0, A, b, 2, false); }
+bool init(void) { uint8_t id = 0; rd(0x00, &id, 1); if (id != 0x50) { return false; }
+  if (id == 0x50) { sleep_ms(5); } wr(0x7E, 0xB6); for (int i = 0; i < 3; i++) { wr(0x1C, 0x05); } return true; }"""
+    t = FlowModel({"a.c": code}).trace("init")
+    assert [e.describe() for e in t.events] == ["read 0x00 x1", "delay 5000 us", "write 0x7E <- 0xB6", "write 0x1C <- 0x05"]
+    assert [e.guaranteed for e in t.events] == [True, False, True, True]   # the delay is inside a data-dependent if
+
+
+# ------------------------------------------------------------------ sequence checking
+
+
+def test_correct_driver_matches_every_step(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path)
+    assert _record(p, ledger, src, f)["ok"]
+    rep, codes = _flow_codes(p, ledger)
+    assert codes == [] and rep.passed, [x.public() for x in rep.findings]
+    assert [s["status"] for s in rep.flows[0]["steps"]] == ["matched"] * 4
+    assert rep.stats["sequence_steps_matched"] == 4
+
+
+@pytest.mark.parametrize("mutate, code", [
+    (lambda c: c.replace("    write_reg(REG_CMD, CMD_SOFTRESET);\n", ""), "FLOW_STEP_MISSING"),
+    (lambda c: c.replace("sleep_ms(STARTUP_MS);", "sleep_ms(1);"), "FLOW_DELAY_SHORT"),
+    (lambda c: c.replace("    sleep_ms(STARTUP_MS);\n", ""), "FLOW_DELAY_SHORT"),
+    (lambda c: c.replace("#define PWR_NORMAL    0x33", "#define PWR_NORMAL    0x13"), "FLOW_VALUE_MISMATCH"),
+    (lambda c: c.replace("    write_reg(REG_CMD, CMD_SOFTRESET);\n    sleep_ms(STARTUP_MS);\n    read_regs(REG_CALIB, calib, sizeof(calib));",
+                         "    read_regs(REG_CALIB, calib, sizeof(calib));\n    write_reg(REG_CMD, CMD_SOFTRESET);\n    sleep_ms(STARTUP_MS);"), "FLOW_ORDER"),
+    (lambda c: c.replace("read_regs(REG_CALIB, calib, sizeof(calib));", "read_regs(REG_CALIB, calib, 6);"), "FLOW_VALUE_MISMATCH"),
+])
+def test_flow_errors_are_reported(tmp_path, mutate, code):
+    bad = mutate(GOOD)
+    assert bad != GOOD
+    p, store, ledger, src, f = _project(tmp_path, bad)
+    assert _record(p, ledger, src, f)["ok"]
+    rep, codes = _flow_codes(p, ledger)
+    assert code in codes and not rep.passed, codes
+
+
+def test_runtime_dependent_delay_is_a_warning_not_a_pass(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path, GOOD.replace("sleep_ms(STARTUP_MS);", "sleep_ms(get_wait());"))
+    assert _record(p, ledger, src, f)["ok"]
+    rep, codes = _flow_codes(p, ledger)
+    assert codes == ["FLOW_DELAY_UNVERIFIABLE"] and rep.passed            # warning: honest "cannot tell"
+
+
+def test_missing_entry_function_is_an_error(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path)
+    assert _record(p, ledger, src, f, entry="bmp388_begin")["ok"]
+    rep, codes = _flow_codes(p, ledger)
+    assert codes == ["FLOW_ENTRY_MISSING"] and not rep.passed
+
+
+def test_configured_device_without_a_sequence_is_an_error(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path)
+    rep, codes = _flow_codes(p, ledger)
+    assert codes == ["FLOW_UNSPECIFIED"] and not rep.passed
+
+
+def test_record_sequence_only_accepts_facts_and_verbatim_order(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path)
+    book = SequenceBook(p.root)
+    bad_fact = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "write", "reg": "FACT-999"}], src.id, DATASHEET[:60])
+    assert not bad_fact["ok"] and "FACT-999" in bad_fact["error"]
+    bad_quote = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "write", "reg": f["cmd"]}], src.id, "reset first, then wait 5 ms")
+    assert not bad_quote["ok"] and "verbatim" in bad_quote["error"]
+    no_unit = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "delay_min", "value": f["len"]}], src.id, DATASHEET[:60])
+    assert not no_unit["ok"] and "time unit" in no_unit["error"]
+    first = _record(p, ledger, src, f)
+    again = _record(p, ledger, src, f)
+    assert first["ok"] and again.get("replaced") and again["sequence"]["id"] == first["sequence"]["id"]
+
+
+def test_record_sequence_tool_and_stale_verify_after_new_facts(tmp_path, monkeypatch):
+    from embedforge.toolchain import pio
+    from embedforge.toolchain.pio import BuildResult
+    p, store, ledger, src, f = _project(tmp_path)
+    belt = ToolBelt(p, RunSession("r", p.id), store, ledger)
+    res = belt.call("record_sequence", {"subject": "BMP", "name": "power_on_init", "entry": "bmp_init", "device": f["addr"],
+                                        "source_id": "SRC001", "order_quote": "issue a soft reset, wait for the start-up time",
+                                        "steps": [{"op": "write", "reg": f["cmd"], "value": f["rst"]}, {"op": "delay_min", "value": f["t"]}]})
+    assert res["ok"] and "verify traces" in res["next"]
+    monkeypatch.setattr(pio, "build", lambda root, on_line=None: BuildResult(ok=True))
+    belt.build()
+    v = belt.verify()
+    assert v["passed"] and v["flows"][0]["steps"] == ["1. write: matched (src/main.c:21)", "2. delay_min: matched"]
+    assert belt.finish("success", "done")["ok"]
+    belt.ended = None
+    ledger.record("BMP", "chip_id_reg", "0x31", src.id, "start at register 0x31")       # a new fact after verify
+    assert "changed after the last verify" in belt.finish("success", "done")["error"]
+
+
+# ------------------------------------------------------------------ truth holes
+
+
+@pytest.mark.parametrize("path", ["CMakeLists.txt", "src/CMakeLists.txt", "src/memmap.ld", "cmake/x.cmake", "src/link.lds".replace(".lds", ".ld"), "tools/a.rb"])
+def test_build_and_linker_scripts_are_not_agent_writable(path):
+    assert check_agent_write(path, "") is not None
+
+
+def test_linker_and_generated_flash_files_change_the_build_hash(tmp_path):
+    p = Project("h1", tmp_path / "h1")
+    store = SourceStore(p.root)
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    (p.root / "src").mkdir(exist_ok=True)
+    (p.root / "src" / "main.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+    h0 = belt.source_hash()
+    (p.root / "src" / "memmap.ld").write_text("MEMORY { FLASH : ORIGIN = 0x10000000, LENGTH = 2M }\n", encoding="utf-8")
+    h1 = belt.source_hash()
+    cfg = p.root / "betaflight" / "configs" / "CUST" / "B"
+    cfg.mkdir(parents=True)
+    (cfg / "config.mk").write_text("FLASH_SIZE = 2048\n", encoding="utf-8")
+    h2 = belt.source_hash()
+    assert len({h0, h1, h2}) == 3
+
+
+# ------------------------------------------------------------------ patterns learned from real drivers (corpus)
+def test_function_pointer_stored_by_the_caller_is_followed():
+    code = """typedef struct { int (*write)(uint8_t, const uint8_t *, uint32_t, void *); void *intf; } dev_t;
+static int my_write(uint8_t reg, const uint8_t *data, uint32_t len, void *intf) {
+    uint8_t buf[2] = {reg, data[0]}; return i2c_write_blocking(i2c0, 0x76, buf, 2, false); }
+static int soft_reset(dev_t *dev) { uint8_t cmd = 0xB6; return dev->write(0x7E, &cmd, 1, dev->intf); }
+static dev_t sensor;
+void init(void) { sensor.write = &my_write; soft_reset(&sensor); }"""
+    t = FlowModel({"a.c": code}).trace("init")
+    assert [e.describe() for e in t.events] == ["write 0x7E <- 0xB6"] and t.events[0].addr == 0x76
+    assert "my_write" in t.events[0].chain
+
+
+def test_const_vtable_is_followed():
+    code = """struct bus_io { int (*write)(const void *bus, uint8_t reg, uint8_t val); };
+static int reg_write_i2c(const void *bus, uint8_t reg, uint8_t val) { return i2c_reg_write_byte(bus, 0x76, reg, val); }
+const struct bus_io bus_io_i2c = { .write = reg_write_i2c, };
+int init(const struct cfg *cfg) { return cfg->bus_io->write(&cfg->bus, 0x7E, 0xB6); }"""
+    assert [e.describe() for e in FlowModel({"a.c": code}).trace("init").events] == ["write 0x7E <- 0xB6"]
+
+
+def test_values_changed_on_an_uncertain_path_become_unknown_not_wrong():
+    code = """void init(int intf) { uint8_t reg = 0x7E; if (intf == 0) { reg = reg | 0x80; }
+  uint8_t b[2] = {reg, 0xB6}; i2c_write_blocking(i2c0, 0x76, b, 2, false); }"""
+    e = FlowModel({"a.c": code}).trace("init").events[0]
+    assert e.kind == "write" and not isinstance(e.reg, int)            # neither 0x7E nor 0xFE is claimed
+
+
+def test_return_on_an_uncertain_path_does_not_end_the_trace():
+    code = """static bool calib(void) { uint8_t c[21]; if (HAL_I2C_Mem_Read(h, 0xEC, 0x88, 1, c, 21, 10) == HAL_OK) { return true; } return false; }
+bool init(void) { if (!calib()) { return false; } uint8_t v = 0x33; HAL_I2C_Mem_Write(h, 0xEC, 0xF4, 1, &v, 1, 10); return true; }"""
+    assert [e.describe() for e in FlowModel({"a.c": code}).trace("init").events] == ["read 0x88 x21", "write 0xF4 <- 0x33"]
+
+
+def test_preprocessor_branches_on_sdk_macros_are_walked_as_conditional():
+    code = """#define REG_CONFIG _u(0xF5)
+int main(void) {
+#if !defined(i2c_default)
+    puts("no i2c"); return 0;
+#else
+    uint8_t b[2] = {REG_CONFIG, 0x94}; i2c_write_blocking(i2c_default, 0x76, b, 2, false);
+#endif
+    return 0; }"""
+    ev = FlowModel({"a.c": code}).trace("main").events
+    assert [e.describe() for e in ev] == ["write 0xF5 <- 0x94"] and not ev[0].guaranteed

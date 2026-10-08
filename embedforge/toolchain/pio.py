@@ -344,6 +344,11 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 1500) ->
     if not env_name:
         return BuildResult(ok=False, error="platformio.ini missing or has no [env:...] section. Call init_project first.")
     code, lines, timed_out = _run_streaming(_pio_cmd(["run", "-d", str(project_dir)]), project_dir, on_line, timeout_s)
+    if code not in (0, -1) and not timed_out and any("CreateProcess: No such file or directory" in ln for ln in lines[-400:]):
+        # Windows sometimes refuses to start a freshly unpacked compiler (antivirus scan in progress): one clean retry
+        if on_line:
+            on_line("Compiler could not be started (Windows file lock); retrying the build once…")
+        code, lines, timed_out = _run_streaming(_pio_cmd(["run", "-d", str(project_dir)]), project_dir, on_line, timeout_s)
     if code == -1:
         return BuildResult(ok=False, env=env_name, error=lines[0] if lines else "Could not launch PlatformIO")
     res = BuildResult(ok=code == 0 and not timed_out, env=env_name, duration_s=round(time.time() - t0, 1))

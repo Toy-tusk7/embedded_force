@@ -18,13 +18,14 @@ class EmbedForgeConfig(BaseModel):
         default_factory=lambda: os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
     )
     nebius_model: str = Field(
-        default_factory=lambda: os.getenv("NEBIUS_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
+        default_factory=lambda: os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
     )
     tavily_api_key: Optional[str] = Field(
         default_factory=lambda: os.getenv("TAVILY_API_KEY")
     )
     agent_model: str = Field(
-        default_factory=lambda: os.getenv("NEBIUS_AGENT_MODEL") or os.getenv("NEBIUS_MODEL", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B")
+        # Ultra is the only Nemotron that produced correct firmware in our evals (Nano: 0 of 4)
+        default_factory=lambda: os.getenv("NEBIUS_AGENT_MODEL") or os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
     )
     # Optional second provider: NVIDIA API catalog / NIM (OpenAI-compatible), https://build.nvidia.com
     nvidia_api_key: Optional[str] = Field(

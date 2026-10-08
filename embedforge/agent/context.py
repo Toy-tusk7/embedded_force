@@ -49,6 +49,10 @@ def digest(name: str, args: Dict[str, Any], result: Any) -> str:
         rec = ", ".join(str(x) for x in r.get("recorded") or [])
         extra = [f"{len(r[k])} {k.replace('_', ' ')}" for k in ("tagged", "mismatched", "not_in_config", "rejected") if r.get(k)]
         return f"record_board_pins -> {rec or 'none'}" + (f"; {', '.join(extra)}" if extra else "")
+    if name == "record_sequence":
+        s = r.get("sequence") or {}
+        return (f"record_sequence -> {s.get('id')} {s.get('subject')}.{s.get('name')} in {s.get('entry')}() ({len(s.get('steps') or [])} steps)"
+                if r.get("ok") else f"record_sequence REJECTED: {str(r.get('error'))[:140]}")
     if name == "read_file":
         return f"read_file {args.get('path')} lines {r.get('start')}-{r.get('end')}/{r.get('total_lines')}"
     if name in ("write_file", "replace_in_file"):
@@ -317,11 +321,20 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
                      + "".join(f"\n    {d}" for d in (lb.get("diagnostics") or [])[:3]))
     else:
         lines.append("- Last build: never built")
+    from embedforge.truth.sequences import SequenceBook
+    seqs = list(SequenceBook(project.root).items.values())
+    if seqs:
+        lines.append(f"- Datasheet sequences recorded ({len(seqs)}): "
+                     + "; ".join(f"{s.id} {s.subject}.{s.name} in {s.entry}() ({len(s.steps)} steps)" for s in seqs[:8]))
+    inputs_stale = bool(lv) and lv.get("hash") == current and lv.get("inputs") not in (None, belt.verify_inputs_hash())
     if lv:
-        lines.append(f"- Last verify: {lv.get('summary')}" + (" (sources changed since)" if lv.get("hash") != current else "")
+        lines.append(f"- Last verify: {lv.get('summary')}"
+                     + (" (sources changed since)" if lv.get("hash") != current else " (facts/sequences changed since: verify again)" if inputs_stale else "")
                      + "".join(f"\n    {d}" for d in (lv.get("findings") or [])[:3]))
     else:
         lines.append("- Last verify: never run")
+    if inputs_stale:
+        lv = {**lv, "hash": None}
 
     nxt = next_step(project, kind, meta, facts, unc, lb, lv, current, req, pin_problems if board is not None else [])
     lines.append(f"- NEXT STEP: {nxt}")
@@ -331,6 +344,10 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
 def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], unc: List[str],
               lb: Dict[str, Any], lv: Dict[str, Any], current: str, request: str = "",
               pin_problems: Optional[List[str]] = None) -> str:
+    if not kind and re.search(r"platform\s*io|arduino|pico[- ]?sdk|esp[- ]?idf|stm32cube", request, re.I) and not re.search(r"beta\s*flight", request, re.I):
+        board = re.search(r"\bboard\s+([a-z0-9_]{3,40})\b", request, re.I)
+        return ("resolve_target, then init_project" + (f"(board='{board.group(1)}', framework=<the framework the user named>)" if board else "")
+                + " — the user asked for a PlatformIO/SDK project (not Betaflight)")
     if not kind and re.search(r"\bbeta\s*flight\b", request, re.I):
         return ("init_betaflight(board_name=<short board name>, target=<in-tree target, e.g. RP2350B for an RP2350B/RP2354B>, "
                 "flash_mb=<2 for RP2354A/B>) — Betaflight has its own build; do not use resolve_target/init_project")

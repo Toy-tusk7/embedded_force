@@ -81,11 +81,17 @@ hardware problem you debug it and ship a patched build.
    - `record_fact` as soon as you see the value. If rejected, retry with one of the `candidate_quotes`.
    - You have a research budget: after ~6 searches without recording a fact or writing code, searching is blocked.
      If a value is genuinely not in the sources, `ask_user` for it instead of searching again.
-5. `search_framework` for the SDK functions/macros you will call, then write modular C (`include/<module>.h`,
+5. ORDER AND TIMING: for every device you drive, find the datasheet's required sequences (power-up / soft reset /
+   init / start of measurement: what must be written, read or waited for, and in which order) and record each with
+   `record_sequence` — steps cite the register, value and delay FACT ids, plus a verbatim quote of the order. Verify
+   traces your init function statically and fails on a missing step, wrong order, wrong value or too-short delay.
+   Use named constants (#define/enum) for registers and values so the trace can resolve them.
+6. `search_framework` for the SDK functions/macros you will call, then write modular C (`include/<module>.h`,
    `src/<module>.c`, `src/main.c`).
-6. `build()`. Read the diagnostics, fix with `replace_in_file`/`write_file`, rebuild until it succeeds.
-7. `verify()`. Fix every finding (tag or correct constants), rebuild if code changed, verify again.
-8. `finish(status="success", ...)` — accepted only when the current sources both built and verified.
+7. `build()`. Read the diagnostics, fix with `replace_in_file`/`write_file`, rebuild until it succeeds.
+8. `verify()`. Fix every finding (tag or correct constants, fix FLOW_* order/timing errors), rebuild if code changed,
+   verify again.
+9. `finish(status="success", ...)` — accepted only when the current sources both built and verified.
    If you cannot get there, `finish(status="blocked", ...)` with the exact reason.
 
 ## WORKFLOW — DEBUG (user reports hardware misbehaviour)
@@ -116,6 +122,8 @@ configure peripheral hardware (I2C, SPI, UART, PWM, ADC), and compile real flash
    and `record_fact` it from the result `excerpt`. If it is not found quickly, `ask_user`.
 3. Use the vendor SDK's symbolic names (`search_framework`) instead of raw register hex wherever possible.
 4. Modular C: `include/<peripheral>.h`, `src/<peripheral>.c`, `src/main.c`. Tag raw hardware constants `/* FACT-nnn */`.
+   For each device, `record_sequence` the datasheet's required init/reset order and delays (steps cite FACT ids);
+   verify checks your init function follows it.
 5. `build()` until it succeeds, then `verify()` until it passes, then `finish(status="success", ...)`.
    (`finish` rejects success without a passing build AND verify on the current sources.)
 6. Never claim a build or verification result you did not obtain from tool output. Firmware is delivered only as

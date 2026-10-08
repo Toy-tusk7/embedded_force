@@ -69,6 +69,7 @@ class VerifyReport:
     findings: List[Finding] = field(default_factory=list)
     traceability: List[Dict[str, Any]] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=dict)
+    flows: List[Dict[str, Any]] = field(default_factory=list)   # datasheet sequences checked against the code's order
 
     def public(self) -> Dict[str, Any]:
         return {
@@ -76,6 +77,7 @@ class VerifyReport:
             "findings": [f.public() for f in self.findings],
             "traceability": self.traceability,
             "stats": self.stats,
+            "flows": self.flows,
         }
 
     def summary(self) -> str:
@@ -118,6 +120,23 @@ def _strip_comments(text: str) -> List[Dict[str, str]]:
                 i += 1
         out.append({"code": code, "comment": comment})
     return out
+
+
+BUILD_INPUT_EXTS = SRC_EXTS | {".ld", ".cmake", ".mk", ".lds"}
+BUILD_INPUT_NAMES = {"CMakeLists.txt", "Makefile", "platformio.ini"}
+
+
+def collect_build_inputs(project_dir: Path) -> List[Path]:
+    """Everything that changes what the build produces: sources plus linker/CMake/make files (e.g. Betaflight's
+    generated config.mk and pico_flash_mem.ld) and platformio.ini. A change to any of them invalidates the build."""
+    project_dir = Path(project_dir)
+    files: List[Path] = []
+    for d in SRC_DIRS:
+        base = project_dir / d
+        if base.is_dir():
+            files += [p for p in base.rglob("*") if p.is_file() and (p.suffix in BUILD_INPUT_EXTS or p.name in BUILD_INPUT_NAMES)]
+    files += [project_dir / n for n in BUILD_INPUT_NAMES if (project_dir / n).is_file()]
+    return sorted(set(files))
 
 
 def collect_sources(project_dir: Path) -> List[Path]:
@@ -283,6 +302,50 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                 f"Conflicting facts used: {a.id}={a.value} vs {b.id}={b.value} for {a.subject}.{a.property}.",
                 suggestion="Resolve using the manufacturer datasheet."))
 
-    report.stats = {"files": len(files), "literals_checked": literals_checked, "justified": justified, "facts_used": len(used_facts)}
+    flow_steps = _check_flows(project_dir, ledger, report)
+    report.stats = {"files": len(files), "literals_checked": literals_checked, "justified": justified, "facts_used": len(used_facts),
+                    "sequences": len(report.flows), "sequence_steps_matched": flow_steps}
     report.passed = not any(f.severity == "ERROR" for f in report.findings)
     return report
+
+
+_ADDR_PROP_RE = re.compile(r"(^|_)(i2c|spi|bus|slave|device|dev)?_?addr(ess)?($|_)", re.I)
+_ENTRY_RE = re.compile(r"(init|begin|setup|start|config|probe|reset)", re.I)
+
+
+def _check_flows(project_dir: Path, ledger: FactLedger, report: VerifyReport) -> int:
+    """Datasheet sequences vs the code's order and timing (static; see truth/flow.py). Also warns when a device is
+    configured by the code but no sequence for it was recorded. Returns the number of matched sequence steps."""
+    from embedforge.truth.flow import FlowModel
+    from embedforge.truth.sequences import SequenceBook, check_flows
+    try:
+        model = FlowModel.from_dir(project_dir)
+        flows, found = check_flows(project_dir, ledger, model)
+    except Exception as e:  # a flow-check bug must never hide the rest of verify
+        report.findings.append(Finding("WARNING", "FLOW_CHECK_ERROR", "", 0, f"The flow check could not run: {type(e).__name__}: {e}"))
+        return 0
+    report.flows = flows
+    for sev, code, file, line, msg, sug in found:
+        report.findings.append(Finding(sev, code, file, line, msg, suggestion=sug))
+    # coverage: a device the code configures needs its datasheet sequence on record
+    covered = {r.subject.lower() for r in SequenceBook(project_dir).items.values()}
+    addr_facts = {}
+    for f in ledger.facts.values():
+        n = parse_int(str(f.value))
+        if n is not None and 0 < n < 0x400 and _ADDR_PROP_RE.search(f.property):
+            addr_facts.setdefault(n, f)
+    if addr_facts:
+        entries = [name for name in model.functions if "::" not in name and (_ENTRY_RE.search(name) or name in ("main", "setup", "app_main"))]
+        reported = set()
+        for name in entries[:40]:
+            for e in model.trace(name).events:
+                f = addr_facts.get(e.addr) if isinstance(e.addr, int) else None
+                if f is None or e.kind != "write" or f.subject.lower() in covered or f.subject.lower() in reported:
+                    continue
+                reported.add(f.subject.lower())
+                report.findings.append(Finding(
+                    "ERROR", "FLOW_UNSPECIFIED", e.file, e.entry_line,
+                    f"{f.subject} (address {f.value}, {f.id}) is configured in {name}() but no datasheet sequence was recorded, "
+                    "so the order and timing of its init are not checked.",
+                    suggestion="record_sequence with the datasheet's required init/reset order (steps citing register, value and delay facts)."))
+    return sum(1 for r in report.flows for s in r["steps"] if s["status"] == "matched")
