@@ -2098,6 +2098,44 @@ _WIRE_METHODS = {"beginTransmission", "write", "endTransmission", "requestFrom",
 _PRINT_FUNCS = {"print", "println", "printf", "sprintf", "snprintf", "printFloat", "ESP_LOGI", "ESP_LOGD", "LOG_INF", "LOG_DBG", "printk"}
 
 
+def _buf_slot(v: Any) -> Tuple[Optional[Arr], int]:
+    if isinstance(v, Ptr):
+        return v.arr, v.offset
+    if isinstance(v, Arr):
+        return v, 0
+    return None, 0
+
+
+def _memcpy(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
+    """memcpy/memmove(dst, src, n) between byte buffers the walk tracks (other destinations become unknown)."""
+    if len(a) < 3:
+        return Sym("memcpy()")
+    (dst, d0), (src, s0), n = _buf_slot(a[0]), _buf_slot(a[1]), a[2]
+    if dst is not None and src is not None and is_int(n) and 0 <= n <= 4096:
+        items = [src.items[s0 + k] if s0 + k < len(src.items) else Sym("uninit") for k in range(n)]
+        while len(dst.items) < d0 + n:
+            dst.items.append(Sym("uninit"))
+        dst.items[d0:d0 + n] = items
+    elif dst is not None:
+        taint(a[0], n)
+    return a[0]
+
+
+def _memset(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
+    if len(a) < 3:
+        return Sym("memset()")
+    (dst, d0), v, n = _buf_slot(a[0]), a[1], a[2]
+    if dst is not None and is_int(n) and 0 <= n <= 4096:
+        while len(dst.items) < d0 + n:
+            dst.items.append(0)
+        for k in range(n):
+            dst.items[d0 + k] = (v & 0xFF) if is_int(v) else Sym("memset")
+    return a[0]
+
+
+_PRIMITIVES.update({"memcpy": _memcpy, "memmove": _memcpy, "memset": _memset})
+
+
 def _fnptr_write(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
     # Bosch API: write(reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr)
     n = a[2] if len(a) > 2 else None

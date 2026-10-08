@@ -30,6 +30,7 @@ import random
 import re
 import threading
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -45,6 +46,46 @@ def _alnum(s: str) -> str:
     return _ALNUM.sub("", (s or "").lower())
 
 
+_ESC = re.compile(r"\\u([0-9a-fA-F]{4})|\\[nrt]")
+_GAP = re.compile(r"\s*(?:…|\.{3,}|\[\.\.\.\])\s*")
+
+
+def _unescape(q: str) -> str:
+    """Literal '\\u2013' / '\\n' left in a quote by double JSON escaping are the characters they stand for."""
+    return _ESC.sub(lambda m: chr(int(m.group(1), 16)) if m.group(1) else " ", q or "")
+
+
+@lru_cache(maxsize=8)
+def _squashed(text: str, strip_comments: bool) -> str:
+    if strip_comments:
+        text = re.sub(r"/\*.*?\*/|//[^\n]*", " ", text, flags=re.S)
+    return _squash(text)
+
+
+def verbatim(quote: str, text: str) -> bool:
+    """The quote is in the text, ignoring whitespace, case and quote marks; '…' / '...' may stand for omitted text between
+    verbatim pieces (in order, close together), and C comments may be left out of a quoted code block."""
+    q = _unescape(quote)
+    variants = [(q, False)]
+    if "/*" in text or "//" in text:
+        variants.append((re.sub(r"/\*.*?\*/|//[^\n]*", " ", q, flags=re.S), True))
+    for qq, strip in variants:
+        tt = _squashed(text, strip)
+        parts = [_squash(p) for p in _GAP.split(qq) if _squash(p)]
+        if not parts or (len(parts) > 1 and min(len(p) for p in parts) < 8):
+            continue
+        pos, ok = None, True
+        for p in parts:
+            i = tt.find(p, pos or 0)
+            if i < 0 or (pos is not None and i - pos > 1500):
+                ok = False
+                break
+            pos = i + len(p)
+        if ok:
+            return True
+    return False
+
+
 def _quote_ok(store: SourceStore, source_id: str, quote: str, what: str) -> Optional[str]:
     src = store.get(source_id)
     if src is None:
@@ -53,9 +94,71 @@ def _quote_ok(store: SourceStore, source_id: str, quote: str, what: str) -> Opti
         return f"{what}: quote too short — copy the full table rows / sentence from read_source"
     if len(quote) > MAX_QUOTE:
         return f"{what}: quote longer than {MAX_QUOTE} chars — quote only the rows that state it"
-    if _squash(quote) not in _squash(src.text):
+    if not verbatim(quote, src.text):
         return f"{what}: quote is not verbatim in {source_id} (copy it exactly from read_source)"
     return None
+
+
+def table_passages(text: str, keys: List[str], want_bits: bool = True, limit: int = 2, size: int = 520) -> List[str]:
+    """Verbatim windows of a source starting at the line where one of `keys` (register name or address) appears, best
+    first: register descriptions with bit rows ('Table 40: Register 0x1B ... Bit 5..4 mode') before memory-map rows and
+    the table of contents."""
+    scored = []
+    for key in [k for k in keys if k and len(k) >= 2]:
+        rx = rf"(?<![0-9A-Za-z]){re.escape(key)}(?![0-9A-Za-z])" if re.fullmatch(r"0x[0-9A-Fa-f]+", key) else re.escape(key)
+        for m in re.finditer(rx, text, re.I):
+            a = text.rfind("\n", 0, m.start()) + 1
+            window = text[a:a + size]
+            if "....." in window[:200]:
+                continue   # table of contents
+            score = (2 if re.search(r"\bBit\s*\d", window) or not want_bits else 0) + (1 if re.match(r"\s*Table\s+\d+", window) else 0)
+            scored.append((-score, a, window))
+    out: List[str] = []
+    for _s, _a, w in sorted(scored):
+        w = (w[:w.rfind("\n")] if "\n" in w[size // 3:] else w).strip()
+        if w and all(w[:80] not in o for o in out):
+            out.append(w)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def layout_passages(text: str, addrs: List[int], limit: int = 3) -> List[str]:
+    """Shortest verbatim spans (whole lines) that contain every address of a multi-byte value: its table rows."""
+    pats = [re.compile(rf"(?<![0-9a-z])0x0*{a:x}(?![0-9a-z])", re.I) for a in addrs]
+    if not pats:
+        return []
+    out: List[str] = []
+    for m in pats[0].finditer(text):
+        lo, hi = m.start(), m.end()
+        ok = True
+        for p in pats[1:]:
+            near = [x for x in p.finditer(text, max(0, m.start() - 700), m.end() + 700)]
+            if not near:
+                ok = False
+                break
+            x = min(near, key=lambda x: abs(x.start() - m.start()))
+            lo, hi = min(lo, x.start()), max(hi, x.end())
+        if not ok or hi - lo > 900:
+            continue
+        a = text.rfind("\n", 0, lo) + 1
+        b = text.find("\n", hi)
+        span = text[a:b if b >= 0 else len(text)].strip()
+        if "....." not in span and span not in out:
+            out.append(span)
+        if len(out) >= limit:
+            break
+    return sorted(out, key=len)
+
+
+_ROW_RANGE = re.compile(r"(?<![0-9a-z])0x([0-9a-f]{1,4})(?![0-9a-z])[^\n<\[]{0,40}?([a-z][\w ]{1,30}?)\s*[<\[]\s*(\d+)\s*:\s*(\d+)\s*[>\]]", re.I)
+
+
+@lru_cache(maxsize=8)
+def row_ranges(text: str) -> Tuple[Tuple[int, str, int, int], ...]:
+    """Register-content rows written as NAME<hi:lo> / NAME[hi:lo] next to their address ('0x32 NVM_PAR_T1<15:8>'):
+    (address, normalised name, hi, lo). They state exactly which bytes make up a multi-byte value."""
+    return tuple((int(m.group(1), 16), _alnum(m.group(2)), int(m.group(3)), int(m.group(4))) for m in _ROW_RANGE.finditer(text))
 
 
 def _num(v: Any) -> Optional[int]:
@@ -74,15 +177,17 @@ def _hex(v: int) -> str:
 
 
 def _bits_in_quote(quote: str, hi: int, lo: int, fname: str = "") -> bool:
-    q = quote.translate(dict.fromkeys(map(ord, "‐‑‒–—−"), "-"))
-    if hi == lo:
-        low = q.lower()
-        if re.search(rf"bits?\s*{lo}(?![0-9])|\[\s*{lo}\s*\]|<\s*{lo}\s*>|(?<![0-9a-z])[bd]{lo}(?![0-9])", low):
-            return True
-        # a table row: the bit number right before the field name ('0 press_en', '| 0 | press_en')
-        return any(re.search(rf"(?<![0-9]){lo}[\s|:]{{1,6}}$", low[max(0, a - 10):a]) for a, _ in _name_spans(q, fname)) if fname else False
+    """The field's bit position is stated in its own row: right before its name ('Bit 5..4 mode', '0 press_en') or right
+    after it ('mode[5:4]', 'press_en (bit 0)'). A bit number elsewhere in the quote belongs to another row."""
+    q = quote.translate(dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")).lower()
     sep = r"\s*(?:\.\.\.?|:|-|to|…)\s*"
-    return bool(re.search(rf"(?<![0-9])[Dd]?{hi}{sep}[Dd]?{lo}(?![0-9])", q) or re.search(rf"(?<![0-9]){lo}{sep}{hi}(?![0-9])", q))
+    spec = rf"{lo}" if hi == lo else rf"(?:{hi}{sep}{lo}|{lo}{sep}{hi})"
+    before = re.compile(rf"(?:^|[^0-9a-z.])(?:bits?\s*|[\[<]\s*|[bd])?{spec}(?![0-9.])[\s|:\]>)\-]*$")
+    after = re.compile(rf"^[\s:|(\[<\-=]*(?:bits?\s*|[bd])?{spec}(?![0-9])")
+    for a, b in _name_spans(q, fname or ""):
+        if before.search(q[max(0, a - 16):a]) or after.search(q[b:b + 16]):
+            return True
+    return False
 
 
 def _name_spans(quote: str, name: str) -> List[Tuple[int, int]]:
@@ -90,7 +195,7 @@ def _name_spans(quote: str, name: str) -> List[Tuple[int, int]]:
     chars = [re.escape(c) for c in name if c.isalnum()]
     if not chars:
         return []
-    rx = r"[\s_\-]*".join(chars)
+    rx = r"(?<![A-Za-z0-9_])" + r"[\s_\-]*".join(chars) + r"(?![A-Za-z0-9_])"   # a whole word: drdy is not drdy_press
     return [(m.start(), m.end()) for m in re.finditer(rx, quote, re.I)]
 
 
@@ -464,12 +569,20 @@ class RegisterBook:
         device = (device or "").strip()
         if not device:
             return {"ok": False, "error": "device is required (the part, e.g. 'BMP388')"}
-        recorded, rejected = [], []
+        recorded, rejected, notes = [], [], []
         for k, raw in enumerate((registers or [])[:60], start=1):
             raw = raw if isinstance(raw, dict) else {}
-            res = self._one_register(store, ledger, device, str(raw.get("source_id") or source_id), raw)
+            dropped: List[str] = []
+            res = self._one_register(store, ledger, device, str(raw.get("source_id") or source_id), raw, dropped)
             (recorded if isinstance(res, RegisterDef) else rejected).append(res if isinstance(res, RegisterDef) else
                                                                            {"register": raw.get("name") or f"#{k}", "error": res})
+            if isinstance(res, RegisterDef):
+                values = [d for d in dropped if not d.startswith("@")]
+                if values:
+                    notes.append(f"{res.name}: kept without the value name(s) {', '.join(values)} (not stated next to the name in the quote)")
+                if "@located" in dropped:
+                    notes.append(f"{res.name}: your quote was not verbatim; the fields were checked against the datasheet's own "
+                                 f"text for it instead: {res.quote[:120]!r}…")
         out_b, rej_b = [], []
         for k, raw in enumerate((bursts or [])[:10], start=1):
             raw = raw if isinstance(raw, dict) else {}
@@ -491,6 +604,8 @@ class RegisterBook:
                                             for r in recorded]}
         if out_b:
             out["bursts"] = [f"{b.id} {b.name}: {_hex(b.start)}..{_hex(b.end)} in one read" for b in out_b]
+        if notes:
+            out["notes"] = notes
         if rejected or rej_b:
             out["rejected"] = rejected + rej_b
             out["hint"] = ("Each register needs `quote` = its table text verbatim (name or address in it); each field's name and bit "
@@ -498,7 +613,36 @@ class RegisterBook:
                            "name (e.g. '11 normal mode' -> values {normal: '0b11'}). Recorded items are kept; resend only the rejected ones.")
         return out
 
-    def _one_register(self, store: SourceStore, ledger: Optional[FactLedger], device: str, source_id: str, raw: Dict[str, Any]) -> Any:
+    def _one_register(self, store: SourceStore, ledger: Optional[FactLedger], device: str, source_id: str, raw: Dict[str, Any],
+                      dropped: Optional[List[str]] = None) -> Any:
+        """Check a register against its quote; if the quote is not verbatim or does not state the fields, check the same
+        claims against the datasheet's own text for that register (name/address). The claims are what must be true; a
+        model that cannot copy a table exactly is not blocked, a wrong bit position still is."""
+        res = self._check_register(store, ledger, device, source_id, raw, dropped)
+        if isinstance(res, RegisterDef) or not isinstance(res, str):
+            return res
+        src = store.get(source_id)
+        name = str(raw.get("name") or "").strip()
+        addr = _num(raw.get("addr") if raw.get("addr") is not None else raw.get("address"))
+        if src is None or not name or addr is None or re.search(r"required|overlap|does not fit|beyond|give name|must be a number", res):
+            return res
+        fields = []
+        for f in raw.get("fields") or []:
+            if isinstance(f, dict):
+                fq = str(f.get("quote") or "")
+                keep = fq and _quote_ok(store, str(f.get("source_id") or source_id), fq, "field") is None
+                fields.append(dict(f, quote=fq if keep else ""))
+        for passage in table_passages(src.text, [name, _hex(addr)], limit=4, size=900):
+            d2: List[str] = []
+            r2 = self._check_register(store, ledger, device, source_id, dict(raw, quote=passage, fields=fields), d2)
+            if isinstance(r2, RegisterDef):
+                if dropped is not None:
+                    dropped.extend(d2 + ["@located"])
+                return r2
+        return res
+
+    def _check_register(self, store: SourceStore, ledger: Optional[FactLedger], device: str, source_id: str, raw: Dict[str, Any],
+                        dropped: Optional[List[str]] = None) -> Any:
         name = str(raw.get("name") or "").strip()
         addr = _num(raw.get("addr") if raw.get("addr") is not None else raw.get("address"))
         quote = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(raw.get("quote") or ""))
@@ -526,9 +670,10 @@ class RegisterBook:
                 if err:
                     return err
                 quotes.append(fq)
-            if not any(_name_spans(q, fname) for q in quotes):
+            whole = (hi, lo) == (7, 0) and raw.get("width") in (None, 8, "8")   # the whole register: no position to check
+            if not whole and not any(_name_spans(q, fname) for q in quotes):
                 return f"field {fname}: its name is not in the quote(s)"
-            if not any(_bits_in_quote(q, hi, lo, fname) for q in quotes):
+            if not whole and not any(_bits_in_quote(q, hi, lo, fname) for q in quotes):
                 return (f"field {fname}: bit {lo} is not stated in the quote(s)" if hi == lo else
                         f"field {fname}: bits {hi}..{lo} are not stated in the quote(s)")
             values: Dict[str, List[int]] = {}
@@ -542,10 +687,16 @@ class RegisterBook:
             for vname, vraw in (fr.get("values") or {}).items() if isinstance(fr.get("values"), dict) else []:
                 vs = [fval(x) for x in (vraw if isinstance(vraw, list) else str(vraw).replace("|", ",").split(","))] if not is_int(vraw) else [vraw]
                 if not vs or any(v is None for v in vs):
+                    if dropped is not None:   # optional detail: keep the field without it
+                        dropped.append(f"{fname}.{vname}")
+                        continue
                     return f"field {fname}: value {vname!r} must be a number or list of numbers ('0b11', '3', ['0b01','0b10'])"
                 if any(v >= (1 << (hi - lo + 1)) for v in vs):
                     return f"field {fname}: value {vname}={vs} does not fit in {hi - lo + 1} bit(s)"
-                if not any(all(_value_near(q, vname, v, hi - lo + 1) for v in vs) for q in quotes):
+                if not re.search(r"[A-Za-z]", str(vname)) or not any(all(_value_near(q, vname, v, hi - lo + 1) for v in vs) for q in quotes):
+                    if dropped is not None:   # a value name is optional: keep the field, leave out what the quote does not show
+                        dropped.append(f"{fname}.{vname}")
+                        continue
                     return (f"field {fname}: value {vname}={'/'.join(format(v, f'0{hi - lo + 1}b') for v in vs)} is not stated next to "
                             f"'{vname}' in the quote(s)")
                 values[vname] = vs
@@ -561,8 +712,10 @@ class RegisterBook:
                 id_value = _num(fact.value)
             else:
                 id_value = _num(iv)
-                if id_value is None or not value_in_text(_hex(id_value), quote):
-                    return f"id_value {iv} must be a FACT id or appear in the register quote"
+                backed = ledger is not None and id_value is not None and any(
+                    f.subject.lower() == device.lower() and _num(str(f.value)) == id_value for f in ledger.facts.values())
+                if id_value is None or not (value_in_text(_hex(id_value), quote) or backed):
+                    return f"id_value {iv} must be a FACT id, a value already recorded as a fact for {device}, or appear in the register quote"
         return RegisterDef("", device, name, addr, fields, source_id, quote.strip(), id_value)
 
     def _one_burst(self, store: SourceStore, device: str, source_id: str, raw: Dict[str, Any]) -> Any:
@@ -608,13 +761,47 @@ class RegisterBook:
                            "byte is '0xE5[3:0]'. The quote must contain every address and, if it says, the signedness.")
         return out
 
+    @staticmethod
+    def _after_addr(low: str, addr: int) -> str:
+        out = []
+        for m in re.finditer(rf"(?<![0-9a-z])0x0*{addr:x}(?![0-9a-z])", low):
+            tail = low[m.end():m.end() + 90]
+            nxt = re.search(r"(?<![0-9a-z])(?:\d+\s+)?0x[0-9a-f]+", tail)
+            out.append(tail[:nxt.start()] if nxt else tail)
+        return " ".join(out)
+
     _RANGE_AFTER = re.compile(r"<\s*(\d+)\s*:\s*(\d+)\s*>|\[\s*(\d+)\s*:\s*(\d+)\s*\]|_(\d+)_(\d+)\b")
 
     def _one_layout(self, store: SourceStore, device: str, source_id: str, raw: Dict[str, Any]) -> Any:
+        res = self._check_layout(store, device, source_id, raw)
+        src = store.get(source_id)
+        if isinstance(res, LayoutDef) or src is None or not re.search(r"not verbatim|not in the quote|too short|longer than", str(res)):
+            return res
+        parts = [_parse_part(p) for p in self._layout_bytes(raw)]
+        if not parts or any(p is None for p in parts):
+            return res
+        for passage in layout_passages(src.text, [p.addr for p in parts]):
+            r2 = self._check_layout(store, device, source_id, dict(raw, quote=passage))
+            if isinstance(r2, LayoutDef):
+                return r2
+            if not re.search(r"not verbatim|not in the quote|too short|longer than", str(r2)):
+                return r2   # the datasheet's own rows contradict the claim: report that, not the quote problem
+        return res
+
+    @staticmethod
+    def _layout_bytes(raw: Dict[str, Any]) -> List[Any]:
+        parts = raw.get("bytes") or raw.get("parts") or raw.get("registers") or raw.get("addresses") or raw.get("regs") or []
+        parts = list(parts) if isinstance(parts, (list, tuple)) else [x for x in re.split(r"[,\s]+", str(parts)) if x]
+        order = str(raw.get("bytes_order") or raw.get("byte_order") or raw.get("order") or raw.get("endianness") or "").lower()
+        if re.search(r"msb|big|high.*first", order):
+            parts.reverse()   # stated most significant first
+        return parts
+
+    def _check_layout(self, store: SourceStore, device: str, source_id: str, raw: Dict[str, Any]) -> Any:
         name = str(raw.get("name") or "").strip()
         quote = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(raw.get("quote") or ""))
-        parts_raw = raw.get("bytes") or raw.get("parts") or []
-        if not name or not isinstance(parts_raw, list) or not parts_raw:
+        parts_raw = self._layout_bytes(raw)
+        if not name or not parts_raw:
             return "give name and bytes (register addresses, least significant first)"
         parts = [_parse_part(p) for p in parts_raw]
         if any(p is None for p in parts):
@@ -631,13 +818,48 @@ class RegisterBook:
                 return f"register {_hex(p.addr)} is not in the quote (quote the rows that list each address)"
         signed = raw.get("signed")
         signed = str(signed).strip().lower() in ("true", "1", "yes", "signed") if signed is not None else False
-        says_unsigned = "unsigned" in low
-        says_signed = bool(re.search(r"(?<!un)signed", low))
-        if says_unsigned and not says_signed and signed:
-            return "the quote says unsigned but signed is true"
-        if says_signed and not says_unsigned and not signed:
-            return "the quote says signed but signed is false"
         lay = LayoutDef("", device, name, parts, signed, source_id, quote.strip())
+        # what the rows of these addresses say (text after each address up to the next one): size and sign
+        rows = " ".join(self._after_addr(low, p.addr) for p in parts)
+        local = rows if re.search(r"signed|\bbits?\b", rows) else low
+        says_unsigned = "unsigned" in local
+        says_signed = bool(re.search(r"(?<!un)signed", local))
+        if says_unsigned and not says_signed and signed:
+            return "the datasheet rows say unsigned but signed is true"
+        if says_signed and not says_unsigned and not signed:
+            return "the datasheet rows say signed but signed is false"
+        if signed and not says_signed and not re.search(r"two'?s[\s-]*complement|2'?s[\s-]*complement", low):
+            return ("nothing in the quote says the value is signed (\"signed\" / \"two's complement\"): quote the text that says so, "
+                    "or record it unsigned")
+        sizes = {int(x) for x in re.findall(r"(?<![\w.])(8|16|20|24|32)\s*-?\s*bits?\b", rows)}
+        if sizes and lay.width not in sizes and len(sizes) == 1:
+            return (f"the datasheet rows give {name} {sizes.pop()} bits, but the bytes listed make {lay.width} bits — list every "
+                    "byte of the value")
+        # where the datasheet writes content as NAME<hi:lo> next to each address, the bytes must be exactly those rows
+        src = store.get(source_id)
+        table = row_ranges(src.text) if src is not None else ()
+        mine = {p.addr for p in parts}
+        # the value's name must agree with what the datasheet's rows at these addresses hold (P9 is not P7)
+        tag = re.search(r"([a-z])(\d+)$", _alnum(name))
+        for a, nm, h, l in table:
+            if a in mine:
+                other = re.search(r"([a-z])(\d+)$", nm)
+                if tag and other and tag.groups() != other.groups():
+                    return (f"{_hex(a)} holds {nm.upper()} per the datasheet ({_hex(a)}<{h}:{l}>), not {name}: "
+                            "take each value's addresses from its own rows")
+        for n in {nm for a, nm, h, l in table if a in mine}:
+            nrows = {(a, h, l) for a, nm, h, l in table if nm == n and h - l == 7}
+            if not nrows or not any(a in mine for a, _h, _l in nrows) or max(h for _a, h, _l in nrows) <= 7:
+                continue   # one byte per name (ACC_X_LSB<7:0>): the name does not describe the whole value
+            want = {a for a, _h, _l in nrows}
+            if want != mine and all((p.hi, p.lo) == (7, 0) for p in parts):
+                return (f"the datasheet lists {n.upper()} in {', '.join(f'{_hex(a)}<{h}:{l}>' for a, h, l in sorted(nrows, key=lambda r: r[2]))}; "
+                        f"bytes must be exactly those, least significant first")
+            for a, h, l in nrows:
+                k = next(i for i, p in enumerate(parts) if p.addr == a)
+                if lay.offset_of(k) != l:
+                    return (f"the datasheet puts {_hex(a)} at bits {h}:{l} of {n.upper()}, but `bytes` puts it at bits "
+                            f"{lay.offset_of(k) + 7}:{lay.offset_of(k)} — list bytes least significant first")
         # where the quote states the bit range of an address (e.g. '0x32 NVM_PAR_T1<15:8>'), the order must agree
         for k, p in enumerate(parts):
             for m in re.finditer(rf"(?<![0-9a-z])0x0*{p.addr:x}(?![0-9a-z])", low):
@@ -655,12 +877,23 @@ class RegisterBook:
         return lay
 
     def record_formula(self, store: SourceStore, device: str, source_id: str, name: str, steps: Any, quote: str,
-                       unit: str = "") -> Dict[str, Any]:
+                       unit: str = "", inputs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         device, name = (device or "").strip(), (name or "").strip()
         if not device or not re.fullmatch(r"[A-Za-z_]\w{0,40}", name):
             return {"ok": False, "error": "device and name (an identifier such as 'PAR_T1' or 'T_LIN') are required"}
         if isinstance(steps, str):
             steps = [s for s in re.split(r";\s*|\n", steps) if s.strip()]
+        if isinstance(inputs, dict) and isinstance(steps, list):
+            # the quote's own names (uncomp_temp, calib_data->par_t1) bound to recorded layouts/formulas (UT, PAR_T1)
+            def bind(s: str) -> str:
+                s = prep_expr(s) if "=" not in s else s.split("=", 1)[0] + "=" + prep_expr(s.split("=", 1)[1])
+                for src_name, rec_name in inputs.items():
+                    short = re.sub(r"^.*(?:->|\.)", "", str(src_name)).strip()
+                    if re.fullmatch(r"[A-Za-z_]\w*", short) and re.fullmatch(r"[A-Za-z_]\w*", str(rec_name).strip()):
+                        lhs, _, rhs = s.partition("=")
+                        s = lhs + "=" + re.sub(rf"\b{re.escape(short)}\b", str(rec_name).strip(), rhs, flags=re.I) if rhs else s
+                return s
+            steps = [bind(str(s)) for s in steps]
         if not isinstance(steps, list) or not steps:
             return {"ok": False, "error": "steps: list of 'var = expression' strings, in order; the last var is the result"}
         quote = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(quote or ""))
@@ -687,8 +920,11 @@ class RegisterBook:
                 return {"ok": False, "error": f"step {k} ({var}): {e}"}
             unknown = [n for n in _names(tree) if n not in defined and n not in known]
             if unknown:
-                return {"ok": False, "error": f"step {k}: unknown name(s) {', '.join(sorted(set(unknown)))}. Inputs must be layouts "
-                                              f"(record_layouts) or formulas recorded before; known: {', '.join(sorted(known)) or 'none'}"}
+                return {"ok": False, "error": f"step {k}: unknown name(s) {', '.join(sorted(set(unknown)))}. Every input must be a layout "
+                                              f"(record_layouts) or a formula recorded before (known: {', '.join(sorted(known)) or 'none'}). "
+                                              "Keep the quote's names and bind them with inputs={'" + sorted(set(unknown))[0] +
+                                              "': '<recorded name>'}; a coefficient the code scales (par_t1 = NVM_PAR_T1 / 2^-8) "
+                                              "is its own record_formula first."}
             for text, value, exp in _constants(tree):
                 if not _const_in_quote(quote, value, exp):
                     missing_consts.append(text)

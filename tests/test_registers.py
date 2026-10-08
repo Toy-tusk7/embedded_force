@@ -253,7 +253,6 @@ def _book(tmp_path):
 
 @pytest.mark.parametrize("field, why", [
     ({"name": "mode", "bits": "4:3"}, "bits 4..3 are not stated"),
-    ({"name": "mode", "bits": "5:4", "values": {"normal": "0b10"}}, "not stated next to 'normal'"),
     ({"name": "power_mode", "bits": "5:4"}, "name is not in the quote"),
     ({"name": "mode", "bits": "5:4", "values": {"normal": "0b111"}}, "does not fit"),
 ])
@@ -261,6 +260,19 @@ def test_register_fields_must_match_the_table(tmp_path, field, why):
     p, store, ledger, src, book = _book(tmp_path)
     res = book.record_registers(store, ledger, "BMPX", src.id, [{"name": "PWR_CTRL", "addr": "0x1B", "quote": _q("Table 3", "11 normal mode"), "fields": [field]}])
     assert not res["ok"] and why in res["rejected"][0]["error"], res
+
+
+def test_unstated_value_names_are_dropped_not_the_register(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    q = _q("Table 3", "11 normal mode").replace("“", '"')
+    res = book.record_registers(store, ledger, "BMPX", src.id, [{"name": "PWR_CTRL", "addr": "0x1B", "quote": q, "fields": [
+        {"name": "mode", "bits": "5:4", "values": {"normal": "0b10", "sleep": "00", "1": "01"}}]}])
+    assert res["ok"] and "mode.normal" in res["notes"][0] and "mode.1" in res["notes"][0], res
+    assert book.register_at(0x1B).field("mode").values == {"sleep": [0]}
+    # a whole-register field needs no bit numbers, and quote marks do not have to match
+    res = book.record_registers(store, ledger, "BMPX", src.id, [{"name": "CHIP_ID", "addr": "0x00", "quote": '0x00 "CHIP_ID" 0x50 chip_id',
+                                                                  "id_value": "0x50", "fields": [{"name": "chip_id", "bits": "7:0"}]}])
+    assert res["ok"] and "rejected" not in res, res
 
 
 def test_layouts_must_be_lsb_first_and_signed_as_stated(tmp_path):
@@ -283,6 +295,20 @@ def test_formulas_need_their_constants_and_inputs_on_record(tmp_path):
     assert "not verbatim" in book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-8"], "PAR_T1 = NVM_PAR_T1 / 256 exactly")["error"]
     ok = book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = (float)calib->nvm_par_t1 / 2^-8;"], fq)
     assert ok["ok"] and "nvm_par_t1 / 2**-8" in ok["formula"], ok
+
+
+def test_formula_binds_the_quotes_own_names(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
+    fq = "Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T2 = NVM_PAR_T2 / 2^30"
+    assert book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-8"], fq)["ok"]
+    assert book.record_formula(store, "BMPX", src.id, "PAR_T2", ["PAR_T2 = NVM_PAR_T2 / 2^30"], fq)["ok"]
+    steps = ["partial = (float)(uncomp_temp – calib_data->par_t1)", "T = partial * calib_data->par_t2"]
+    q = "Temperature: partial = UT - PAR_T1; T = partial * PAR_T2"
+    bad = book.record_formula(store, "BMPX", src.id, "T", steps, q)
+    assert not bad["ok"] and "inputs={'uncomp_temp'" in bad["error"], bad
+    ok = book.record_formula(store, "BMPX", src.id, "T", steps, q, inputs={"uncomp_temp": "UT"})
+    assert ok["ok"] and "partial = (ut - par_t1)" in ok["formula"].lower(), ok
 
 
 def test_garbled_pdf_exponents_count_as_the_constant():
@@ -355,3 +381,16 @@ def test_probe_run_computes_like_c(tmp_path):
     assert vals["g"] == -255 and vals["q"] == -36 and vals["m"] == -3 and vals["scale"] == -127.5, vals
     shifts = FlowModel({"src/a.cpp": code}).run(["setup"]).obs_shifts
     assert sorted((rx.reg, s) for rx, s, _f, _l in shifts) == [(0x10, 0), (0x11, 8)]
+
+
+def test_memcpy_carries_read_bytes(tmp_path):
+    code = r"""
+    #include <string.h>
+    #include "hardware/i2c.h"
+    static uint8_t raw[4];
+    static int32_t v;
+    void main(void) { uint8_t r = 0x20, tmp[4]; i2c_write_blocking(i2c0, 0x76, &r, 1, true); i2c_read_blocking(i2c0, 0x76, tmp, 4, false);
+      memcpy(raw, tmp, 4); memset(tmp, 0, 4); v = (raw[3] << 8) | raw[2]; }
+    """
+    w = FlowModel({"src/a.c": code}).run(["main"], probe={0x22: 0x34, 0x23: 0x12})
+    assert ({where: x for x, _, where in w.values})["v"] == 0x1234

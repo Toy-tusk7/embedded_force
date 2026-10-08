@@ -104,11 +104,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Record a conversion the code must implement (coefficient scaling, compensation, unit conversion): name='PAR_T1', "
         "steps=['PAR_T1 = NVM_PAR_T1 / 2^-8'] or several 'var = expression' lines whose last var is the result; quote = the "
         "verbatim text that states it (the datasheet, or the manufacturer's reference code on GitHub). Inputs are layout names "
-        "or earlier formulas; operators + - * / ^ (power) // (C integer division) >> << & | and pow/sqrt/exp/log/abs; C casts "
-        "and struct prefixes (calib->par_t1) are ignored. Every constant must be in the quote. PDF text loses fraction bars and "
-        "superscripts: 'X = NVM_X' followed by '2−8' means X = NVM_X / 2^-8, and '230' is 2^30. verify runs the code on random "
-        "register bytes and requires it to compute exactly this value.",
-        {"device": S, "source_id": S, "name": S, "steps": _arr(), "quote": S, "unit": S},
+        "or earlier formulas; `inputs` binds the quote's own names to them ({'uncomp_temp': 'UT'}); operators + - * / ^ "
+        "(power) // (C integer division) >> << & | and pow/sqrt/exp/log/abs; C casts and struct prefixes (calib->par_t1) are "
+        "ignored. Every constant must be in the quote. PDF text loses fraction bars and superscripts: 'X = NVM_X' followed by "
+        "'2−8' means X = NVM_X / 2^-8, and '230' is 2^30. verify runs the code on random register bytes and requires it to "
+        "compute exactly this value.",
+        {"device": S, "source_id": S, "name": S, "steps": _arr(), "quote": S, "unit": S, "inputs": {"type": "object"}},
         ["device", "source_id", "name", "steps", "quote"]),
     _fn("record_sequence",
         "Record an ORDER/TIMING rule from a datasheet (power-up, soft reset, init, measurement start) so verify checks "
@@ -618,6 +619,17 @@ class ToolBelt:
 
     def record_user_fact(self, subject: str, property: str, value: Any, quote: str) -> Dict[str, Any]:
         sid = self.store._by_url.get("user://conversation")
+        board_sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
+        board = self.store.get(board_sid) if board_sid else None
+        if board is not None and self._BOARD_LINE.match(str(quote or "")):
+            from embedforge.truth.ledger import _squash
+            if _squash(quote) in _squash(board.text):   # a schematic line: it is the board source's fact, not the user's words
+                res = self.ledger.record(subject, property, value, board_sid, quote)
+                if res.get("ok"):
+                    self.session.emit("fact", fact=res["fact"], warnings=res.get("warnings", []))
+                    res["note"] = (f"Recorded from the schematic ({board_sid}). For pins, record_board_pins records many "
+                                   "at once from query_board lines.")
+                return res
         if not sid:
             return {"ok": False, "error": "No user statements stored."}
         res = self.ledger.record(subject, property, value, sid, quote)
@@ -771,6 +783,10 @@ class ToolBelt:
         out: Dict[str, Any] = {"ok": bool(recorded), "recorded": recorded}
         if rejected:
             out["rejected"] = rejected
+            if any("are all required" in r["error"] for r in rejected):
+                out["format"] = ("Each item is one fact: {subject:'BMP388', property:'chip_id', value:'0x50', quote:'0x00 CHIP_I D "
+                                 "0x50 chip_id_fixed chip_id_nvm'} — subject, property, value and quote are separate keys; the "
+                                 "quote is copied exactly from read_source and contains the value.")
         return out
 
     def _register_book(self):
@@ -785,6 +801,18 @@ class ToolBelt:
             if isinstance(r, dict) and r.get("source_id"):
                 r["source_id"] = self._sid(r["source_id"])
         res = self._register_book().record_registers(self.store, self.ledger, device, sid, regs, bursts if isinstance(bursts, list) else [])
+        for rej in res.get("rejected") or []:
+            raw = next((r for r in regs if isinstance(r, dict) and r.get("name") == rej.get("register")), None)
+            if raw and re.search(r"quote|not stated|not in the quote|mentions neither", str(rej.get("error"))):
+                cands = self._table_passages(str(raw.get("source_id") or sid), [str(raw.get("name") or ""), str(raw.get("addr") or "")])
+                if cands:
+                    rej["candidate_quotes"] = cands
+            if "burst" in rej and re.search(r"quote", str(rej.get("error"))):
+                src = self.store.get(sid)
+                if src is not None:   # sentences of the source that require a single burst / transaction
+                    sents = re.findall(r"[^.\n]*(?:\n[^.\n]*){0,2}\b(?:single burst|burst read|one burst|in one transaction|"
+                                       r"shadow)[^.]*\.", src.text, re.I)
+                    rej["candidate_quotes"] = [re.sub(r"\s+", " ", s).strip() for s in sents if len(s) < 400][:3]
         if res.get("recorded") or res.get("bursts"):
             self.session.emit("registers", device=device, recorded=res.get("recorded", []), bursts=res.get("bursts", []))
             res["next"] = ("Record every multi-byte value with record_layouts and every conversion with record_formula; in "
@@ -797,12 +825,68 @@ class ToolBelt:
             if isinstance(l, dict) and l.get("source_id"):
                 l["source_id"] = self._sid(l["source_id"])
         res = self._register_book().record_layouts(self.store, device, self._sid(source_id), lays)
+        for rej in res.get("rejected") or []:
+            raw = next((l for l in lays if isinstance(l, dict) and l.get("name") == rej.get("layout")), None)
+            if raw and re.search(r"quote", str(rej.get("error"))):
+                keys = [str(b) for b in (raw.get("bytes") or [])][-1:] + [str(raw.get("name") or "")]
+                cands = self._table_passages(str(raw.get("source_id") or self._sid(source_id)), keys, want_bits=False)
+                if cands:
+                    rej["candidate_quotes"] = cands
         if res.get("recorded"):
             self.session.emit("layouts", device=device, recorded=res["recorded"])
         return res
 
-    def record_formula(self, device: str, source_id: str, name: str, steps: Any, quote: str, unit: str = "") -> Dict[str, Any]:
-        res = self._register_book().record_formula(self.store, device, self._sid(source_id), name, steps, quote, unit)
+    def _table_passages(self, source_id: str, keys: List[str], want_bits: bool = True, limit: int = 2) -> List[str]:
+        """Verbatim windows of a source that start at a table for one of `keys` (register name or address), so a rejected
+        register/layout can be retried with an exact quote. Register descriptions ('Table 40: Register 0x1B ...') rank
+        before mentions in the memory map or the table of contents."""
+        src = self.store.get(source_id)
+        if not src:
+            return []
+        text = src.text
+        out: List[str] = []
+        scored = []
+        for key in [k for k in keys if k and len(k) >= 2]:
+            for m in re.finditer(re.escape(key), text, re.I):
+                a = text.rfind("\n", 0, m.start()) + 1
+                window = text[a:a + 520]
+                if "....." in window[:200]:
+                    continue   # table of contents
+                score = (2 if re.search(r"\bBit\s*\d", window) or not want_bits else 0) + (1 if re.match(r"\s*Table\s+\d+", window) else 0)
+                scored.append((-score, a, window))
+        for _s, _a, w in sorted(scored)[:12]:
+            w = w[:w.rfind("\n")] if "\n" in w[200:] else w
+            w = w.strip()
+            if w and all(w[:80] not in o for o in out):
+                out.append(w)
+            if len(out) >= limit:
+                break
+        return out
+
+    def record_formula(self, device: str, source_id: str, name: str, steps: Any, quote: str, unit: str = "",
+                       inputs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        res = self._register_book().record_formula(self.store, device, self._sid(source_id), name, steps, quote, unit,
+                                                   inputs if isinstance(inputs, dict) else None)
+        src = self.store.get(self._sid(source_id))
+        if not res.get("ok") and src is not None and re.search(r"not verbatim|not in the quote", str(res.get("error"))):
+            # the passage the formula comes from, so the model can quote it exactly instead of retyping it
+            idents = sorted({w for s in (steps if isinstance(steps, list) else [str(steps)]) for w in re.findall(r"[A-Za-z_]\w{3,}", str(s))
+                             if w.lower() not in ("float", "double", "return", "calib", "data")}, key=len, reverse=True)
+            cands: List[str] = []
+            for w in idents[:6]:
+                m = re.search(rf"\b{re.escape(w)}\b\s*=", src.text) or re.search(rf"\b{re.escape(w)}\b", src.text)
+                if m:
+                    a = src.text.rfind("\n", 0, m.start()) + 1
+                    win = src.text[a:a + 1200]
+                    win = win[:win.rfind("\n")] if "\n" in win[400:] else win
+                    if all(win[:60] not in c for c in cands):
+                        cands.append(win.strip())
+                if len(cands) >= 2:
+                    break
+            if cands:
+                res["candidate_quotes"] = cands
+                res["hint"] = ("Copy the quote from one of these passages exactly (you may cut it short or replace an omitted "
+                               "middle part with '...'); C comments may be left out.")
         if res.get("ok"):
             self.session.emit("formula", device=device, formula=res["formula"])
         return res
@@ -940,6 +1024,12 @@ class ToolBelt:
         """Numbered lines; long files are windowed so the reply never collapses into an unreadable preview."""
         if str(path).startswith(("bf:", "betaflight-src:")):
             return self.read_framework_file(path, start or 1, end or 0)
+        rel = str(path or "").replace("\\", "/").lstrip("./")
+        if rel.startswith("schematics/") and (self.project.root / "board.json").exists():
+            # the raw EDA export is thousands of lines of footprints; the parsed board is what facts quote
+            return {"error": "This is the raw schematic export. Use query_board('U3') / query_board('<net>') instead: it returns "
+                             "the parsed connectivity lines (e.g. 'U3 pin 4 (SDI) -> net I2C_SDA -> ... U1.16 (GPIO16)') that "
+                             "record_board_pins and record_fact quote."}
         lines = self.project.read_file(path).splitlines()
         start = max(1, int(start or 1))
         out, size, last = [], 0, start - 1

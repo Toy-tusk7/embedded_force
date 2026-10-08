@@ -29,7 +29,8 @@ def _squash(s: str) -> str:
     """Whitespace-free, case-folded form used for robust verbatim-quote containment."""
     s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl")
     s = s.translate(_DASHES).translate(_QUOTES)
-    return re.sub(r"\s+", "", s).lower()
+    # quote marks carry no meaning and PDFs use curly ones the model often drops: Register 0x1B “PWR_CTRL”
+    return re.sub(r"[\s\"'`´]+", "", s).lower()
 
 
 def parse_int(value: str) -> Optional[int]:
