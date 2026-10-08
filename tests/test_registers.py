@@ -39,6 +39,8 @@ Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T2 = NVM_PAR_T2 / 2^30
 Temperature: partial = UT - PAR_T1; T = partial * PAR_T2
 The 7-bit I2C address is 0x76 when SDO is connected to GND.
 Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.
+Reference code: partial = (float)(uncomp_temp - calib_data->par_t1); T = partial * calib_data->par_t2;
+Vendor code: par_t1 = (double)reg_calib_data->par_t1 / 0.00390625;
 """
 
 GOOD = r"""
@@ -336,11 +338,28 @@ def test_formula_binds_the_quotes_own_names(tmp_path):
     assert book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-8"], fq)["ok"]
     assert book.record_formula(store, "BMPX", src.id, "PAR_T2", ["PAR_T2 = NVM_PAR_T2 / 2^30"], fq)["ok"]
     steps = ["partial = (float)(uncomp_temp – calib_data->par_t1)", "T = partial * calib_data->par_t2"]
-    q = "Temperature: partial = UT - PAR_T1; T = partial * PAR_T2"
+    q = "partial = (float)(uncomp_temp - calib_data->par_t1); T = partial * calib_data->par_t2;"
     bad = book.record_formula(store, "BMPX", src.id, "T", steps, q)
     assert not bad["ok"] and "inputs={'uncomp_temp'" in bad["error"], bad
     ok = book.record_formula(store, "BMPX", src.id, "T", steps, q, inputs={"uncomp_temp": "UT"})
     assert ok["ok"] and "partial = (ut - par_t1)" in ok["formula"].lower(), ok
+
+
+def test_formula_cannot_swap_a_converted_coefficient_for_the_raw_register(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
+    q = "partial = (float)(uncomp_temp - calib_data->par_t1); T = partial * calib_data->par_t2;"
+    # the model writes the raw names itself: they are not what the quote says
+    swapped = book.record_formula(store, "BMPX", src.id, "T", ["partial = UT - NVM_PAR_T1", "T = partial * NVM_PAR_T2"], q)
+    assert not swapped["ok"] and "NVM_PAR_T1" in swapped["error"] and "do not appear" in swapped["error"].replace("do(es)", "do"), swapped
+    # or binds the quote's par_t1 to the raw register content
+    bound = book.record_formula(store, "BMPX", src.id, "T", ["partial = uncomp_temp - calib_data->par_t1", "T = partial * calib_data->par_t2"],
+                                q, inputs={"uncomp_temp": "UT", "par_t1": "NVM_PAR_T1", "par_t2": "NVM_PAR_T2"})
+    assert not bound["ok"] and "converted coefficient" in bound["error"], bound
+    # a name the quote marks as raw register content may be bound to it
+    raw = book.record_formula(store, "BMPX", src.id, "PAR_T1", ["temp = reg_calib_data->par_t1 / 0.00390625"],
+                              "par_t1 = (double)reg_calib_data->par_t1 / 0.00390625;", inputs={"reg_calib_data->par_t1": "NVM_PAR_T1"})
+    assert raw["ok"], raw
 
 
 def test_formula_quoted_from_another_stored_source_is_recorded_with_it(tmp_path):

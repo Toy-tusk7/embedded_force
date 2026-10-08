@@ -906,6 +906,11 @@ class RegisterBook:
             return {"ok": False, "error": "device and name (an identifier such as 'PAR_T1' or 'T_LIN') are required"}
         if isinstance(steps, str):
             steps = [s for s in re.split(r";\s*|\n", steps) if s.strip()]
+        steps = [s for s in steps if not re.match(r"\s*return\b", str(s))] if isinstance(steps, list) else steps
+        orig_steps = list(steps) if isinstance(steps, list) else []
+        problem = self._binding_problem(store, device, inputs if isinstance(inputs, dict) else {})
+        if problem:
+            return {"ok": False, "error": problem}
         if isinstance(inputs, dict) and isinstance(steps, list):
             # the quote's own names (uncomp_temp, calib_data->par_t1) bound to recorded layouts/formulas (UT, PAR_T1)
             def bind(s: str) -> str:
@@ -930,6 +935,7 @@ class RegisterBook:
         missing_consts: List[str] = []
         for k, s in enumerate(steps[:40], start=1):
             s = str(s).strip().rstrip(";")
+            s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", s)   # calib_data->t_lin = ... -> t_lin = ...
             m = _STEP_RE.match(s)
             if not m:
                 if len(steps) == 1:
@@ -955,6 +961,11 @@ class RegisterBook:
             parsed.append([var, prep_expr(expr)])
         if parsed[-1][0].lower() != name.lower():
             parsed.append([name, parsed[-1][0]])
+        foreign = self._names_not_in_quote(orig_steps, quote, inputs if isinstance(inputs, dict) else {})
+        if foreign:
+            return {"ok": False, "error": f"{', '.join(foreign)} do(es) not appear in the quote. Write the steps with the quote's own "
+                                          "names (e.g. calib_data->par_t1, uncomp_temp) and bind them to recorded layouts/formulas "
+                                          "with inputs={...}: a value the quote uses must be the value it means, not a similar raw one."}
         if missing_consts:
             return {"ok": False, "error": f"constant(s) {', '.join(sorted(set(missing_consts)))} are not in the quote. Quote the "
                                           "text that states the formula (the datasheet, or the manufacturer's reference code)."}
@@ -965,6 +976,54 @@ class RegisterBook:
             self.formulas[fid] = f
             self._save()
         return {"ok": True, "formula": f"{fid} {name}: {f.text()}" + (f" [{unit}]" if unit else "")}
+
+
+    _RAW_MARK = re.compile(r"(?:^|[^a-z])(?:reg|raw|nvm|uncomp|adc)", re.I)
+
+    def _binding_problem(self, store: SourceStore, device: str, inputs: Dict[str, Any]) -> str:
+        """A quote's name may stand for a raw register value only if the quote marks it as raw: the datasheet's own row name
+        (NVM_PAR_T1) or a raw-marked path (reg_calib_data->par_t1). `par_t1` alone is the converted coefficient."""
+        for a, b in inputs.items():
+            a_full, b_name = str(a).strip(), str(b).strip()
+            short = re.sub(r"^.*(?:->|\.)", "", a_full).strip()
+            lay = next((l for l in self.layouts.values() if l.name.lower() == b_name.lower() and l.device.lower() == device.lower()), None)
+            if lay is None or _alnum(short) == _alnum(b_name):
+                continue
+            src = store.get(lay.source_id)
+            rownames = {nm for _a, nm, _h, _l in row_ranges(src.text)} if src is not None else set()
+            if _alnum(lay.name) in rownames and not self._RAW_MARK.search(a_full[: len(a_full) - len(short)] + " " + short):
+                return (f"inputs: {a_full!r} is bound to the raw register content {lay.name}, but nothing in that name marks it "
+                        f"as raw — in datasheet code {short} is normally the converted coefficient (e.g. {short.upper()} = "
+                        f"{lay.name} / 2^n). Record that conversion with record_formula first (find_reference_code if the PDF "
+                        "formula is garbled), or bind the quote's full raw name (e.g. 'reg_calib_data->" + short + "').")
+        return ""
+
+    @staticmethod
+    def _names_not_in_quote(steps: List[Any], quote: str, inputs: Dict[str, Any]) -> List[str]:
+        import unicodedata
+        q = unicodedata.normalize("NFKC", _unescape(quote))
+        garbled = any(0x1D400 <= ord(c) <= 0x1D7FF for c in _unescape(quote))
+        qn = re.sub(r"\b[A-Za-z_]\w*\s*(?:->|\.)\s*(?=[A-Za-z_])", "", q)
+        tags = {(m.group(1), m.group(2)) for m in re.finditer(r"([a-z])\1*(\d+)", q.lower())}
+        defined: set = set()
+        bound = {re.sub(r"^.*(?:->|\.)", "", str(k)).strip().lower() for k in inputs}
+        out: List[str] = []
+        for s in steps:
+            lhs, eq, rhs = str(s).partition("=")
+            if not eq:
+                rhs, lhs = lhs, ""
+            for n in re.findall(r"[A-Za-z_]\w*", re.sub(r"\b\w+\s*\(", " ", prep_expr(rhs))):
+                if n.lower() in defined or n.lower() in _FUNCS or n in out:
+                    continue
+                if _name_spans(qn, n) or (n.lower() in bound and _name_spans(qn, n)):
+                    continue
+                tag = re.search(r"([a-z])(\d+)$", _alnum(n))
+                if garbled and tag and tag.groups() in tags:
+                    continue   # PDF math glyphs: only the index (T1, P11) of a name survives
+                out.append(n)
+            if lhs.strip():
+                defined.add(re.sub(r"^.*(?:->|\.)", "", lhs).strip().lower())
+        return out
 
 
 # ------------------------------------------------------------------ checking

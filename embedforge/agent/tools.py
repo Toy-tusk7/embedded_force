@@ -810,6 +810,14 @@ class ToolBelt:
             source_id = f"SRC-{int(m.group(1)):03d}"
         res = SequenceBook(self.project.root).record(self.ledger, subject, name, entry, steps if isinstance(steps, list) else [],
                                                      source_id, order_quote, device)
+        src = self.store.get(source_id)
+        if not res.get("ok") and src is not None and "order_quote" in str(res.get("error")):
+            # sentences of the source about order and timing, to quote instead of a paraphrase
+            words = re.compile(r"soft.?reset|power.?(?:on|up)|start.?up|after|before|wait|sleep mode|normal mode|must|first|then", re.I)
+            sents = [re.sub(r"\s+", " ", s).strip() for s in re.split(r"(?<=[.;])\s+", src.text) if 30 < len(s) < 400]
+            ranked = sorted(sents, key=lambda s: -len(words.findall(s)))[:3]
+            if ranked:
+                res["candidate_quotes"] = ranked
         if res.get("ok"):
             self.session.emit("sequence", sequence=res["sequence"])
             res["next"] = (f"Implement it in {res['sequence']['entry']}(), then build and verify: verify traces that function "
