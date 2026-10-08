@@ -251,6 +251,9 @@ class Function:
     body: List[Tok]
     file: str
     line: int
+    init: List[Tuple[str, List[Tok]]] = field(default_factory=list)   # C++ constructor initializer list: member(expr)
+    cls: str = ""                                                      # owning class for methods
+    refs: Tuple[int, ...] = ()                                         # indexes of C++ reference parameters (T &x)
 
 
 @dataclass
@@ -329,6 +332,9 @@ class FlowModel:
         self.fnptr_fields: Dict[str, List[str]] = {}  # struct field name -> project functions assigned to it
         self.types: set = set()
         self._defined = {m for text in files.values() for m in re.findall(r"^\s*#\s*define\s+([A-Za-z_]\w*)", text, re.M)}
+        self.classes = {m for text in files.values() for m in re.findall(r"\b(?:class|struct)\s+([A-Za-z_]\w*)\s*(?::[^{;]*)?\{", text)}
+        self.global_objects: Dict[str, Tuple[str, List[List[Tok]]]] = {}   # name -> (class, constructor argument tokens)
+        self.defaults: Dict[str, Dict[int, List[Tok]]] = {}                 # function -> {param index: default value tokens}
         for name, text in sorted(files.items()):
             self._load(name, text)
 
@@ -435,7 +441,7 @@ class FlowModel:
             body = rest[len(name):].strip()
             self.macros[name] = Macro(None, tokenize(body))
 
-    def _scan(self, fname: str, toks: List[Tok]) -> None:
+    def _scan(self, fname: str, toks: List[Tok], cls: str = "") -> None:
         i, n = 0, len(toks)
         depth_stack: List[str] = []   # 'scope' (namespace/class/extern) or 'other'
         while i < n:
@@ -457,13 +463,34 @@ class FlowModel:
                                 break
                         k -= 1
                     name_i = k - 1
+                    init: List[Tuple[str, List[Tok]]] = []
+                    ctor = self._ctor_params_end(toks, name_i) if name_i >= 1 and toks[name_i - 1].text in (",", ":") else None
+                    if ctor is not None:   # Class::Class(params) : a(x), b(y) {  — the group before '{' is an initializer
+                        for item in _split_args(toks[ctor + 2:j + 1]):
+                            if len(item) >= 3 and item[0].kind == "id" and item[1].text in ("(", "{"):
+                                init.append((item[0].text, item[2:-1]))
+                        j, k = ctor, ctor
+                        depth = 0
+                        while k >= 0:
+                            if toks[k].text == ")":
+                                depth += 1
+                            elif toks[k].text == "(":
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                            k -= 1
+                        name_i = k - 1
                     if name_i >= 0 and toks[name_i].kind == "id" and toks[name_i].text not in _KEYWORDS:
                         name = toks[name_i].text
+                        owner = cls
                         if name_i >= 2 and toks[name_i - 1].text == "::" and toks[name_i - 2].kind == "id":
-                            name = f"{toks[name_i - 2].text}::{name}"
+                            owner = toks[name_i - 2].text
+                        if owner:
+                            name = f"{owner}::{name}"
                         end = _match(toks, i, "{", "}")
                         params = self._params(toks[k + 1:j])
-                        fn = Function(name, params, toks[i + 1:end], fname, toks[name_i].line)
+                        refs = tuple(n2 for n2, p in enumerate(_split_args(toks[k + 1:j])) if any(x.text == "&" for x in p) and not any(x.text == "(" for x in p))
+                        fn = Function(name, params, toks[i + 1:end], fname, toks[name_i].line, init, owner, refs)
                         self.functions.setdefault(name.split("::")[-1], []).append(fn)
                         if "::" in name:
                             self.functions.setdefault(name, []).append(fn)
@@ -487,8 +514,10 @@ class FlowModel:
                 if "struct" in head or "union" in head or "class" in head:
                     end = _match(toks, i, "{", "}")
                     self._typedef_name(toks, end)
-                    # class bodies may contain inline methods: scan inside
-                    self._scan(fname, toks[i + 1:end])
+                    kw = next((k2 for k2 in range(i - 1, max(-1, i - 6), -1) if toks[k2].text in ("class", "struct", "union")), None)
+                    owner = toks[kw + 1].text if kw is not None and kw + 1 < i and toks[kw + 1].kind == "id" else cls
+                    # class bodies may contain inline methods: scan inside, as methods of that class
+                    self._scan(fname, toks[i + 1:end], owner if "class" in head or "struct" in head else cls)
                     i = end + 1
                     continue
                 depth_stack.append("scope")
@@ -508,6 +537,32 @@ class FlowModel:
                     i = semi + 1
                     continue
             prev_text = toks[i - 1].text if i else ";"
+            # declaration with default arguments:  BMP388(uint8_t addr = BMP388_ADDR);  /  void f(int x = 5);
+            if t.kind == "id" and t.text not in _KEYWORDS and i + 1 < n and toks[i + 1].text == "(":
+                close = _match(toks, i + 1)
+                if close + 1 < n and toks[close + 1].text == ";" and any(x.text == "=" for x in toks[i + 2:close]):
+                    defaults = {}
+                    for idx, part in enumerate(_split_args(toks[i + 2:close])):
+                        texts_p = [x.text for x in part]
+                        if "=" in texts_p:
+                            defaults[idx] = part[texts_p.index("=") + 1:]
+                    qual = f"{cls}::{t.text}" if cls else t.text
+                    self.defaults.setdefault(qual, {}).update(defaults)
+            # global object of a project class:  BMP388 bmp(0x76);  /  BMP388 bmp;  /  static BMP388 bmp{0x76};
+            if (not cls and t.kind == "id" and t.text in self.classes and i + 1 < n and toks[i + 1].kind == "id"
+                    and (prev_text in (";", "}", "{") or (i >= 1 and toks[i - 1].text == "static"))):
+                after = toks[i + 2].text if i + 2 < n else ";"
+                if after in ("(", "{"):
+                    close = _match(toks, i + 2, after, ")" if after == "(" else "}")
+                    args = _split_args(toks[i + 3:close])
+                    if close + 1 < n and toks[close + 1].text == ";" and not any(a and a[0].kind == "id" and (a[0].text in _TYPE_WORDS or _TYPE_RE.match(a[0].text)) for a in args):
+                        self.global_objects[toks[i + 1].text] = (t.text, args)
+                        i = close + 2
+                        continue
+                elif after == ";":
+                    self.global_objects[toks[i + 1].text] = (t.text, [])
+                    i += 3
+                    continue
             if t.text == "[" and i >= 2 and toks[i - 1].kind == "id" and toks[i - 2].kind == "id":
                 rb = _match(toks, i, "[", "]")
                 if rb + 1 < n and toks[rb + 1].text in (";", "="):
@@ -530,6 +585,32 @@ class FlowModel:
                     i = semi + 1
                     continue
             i += 1
+
+    @staticmethod
+    def _ctor_params_end(toks: List[Tok], name_i: int) -> Optional[int]:
+        """For `Class::Class(params) : a(x), b(y) {` called with name_i at an initializer's member name: the index of
+        the ')' closing the constructor's own parameter list, or None if this is not an initializer list."""
+        m = name_i - 1
+        while m >= 1:
+            if toks[m].text == ":":
+                return m - 1 if toks[m - 1].text == ")" else None
+            if toks[m].text != ",":
+                return None
+            close = m - 1
+            if close < 0 or toks[close].text not in (")", "}"):
+                return None
+            opener = "(" if toks[close].text == ")" else "{"
+            depth, q = 0, close
+            while q >= 0:
+                if toks[q].text == toks[close].text:
+                    depth += 1
+                elif toks[q].text == opener:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                q -= 1
+            m = q - 2   # the token before that initializer's member name
+        return None
 
     @staticmethod
     def _find_semicolon(toks: List[Tok], i: int) -> int:
@@ -611,6 +692,8 @@ class FlowModel:
         if fn is None:
             return Trace(entry, [], [f"function '{entry}' not found in the project sources"], found=False)
         w = Walker(self)
+        for obj_name, (cls, ctor_args) in self.global_objects.items():   # global constructors run before main/setup
+            w.construct(obj_name, cls, ctor_args)
         call_args = list(args or [])
         for k, p in enumerate(fn.params):
             if k >= len(call_args):
@@ -918,6 +1001,15 @@ class Evaluator:
             return 1
         if name in ("false", "NULL", "nullptr"):
             return 0
+        here = self.w.this() if self.w is not None else None
+        if name == "this" and here is not None:
+            return here[0]
+        if here is not None and name not in self.m.macros and name not in self.m.consts and name not in self.m.functions \
+                and name not in self.m.global_arrays and name not in self.m.global_objects:
+            key = obj_key(here[0])
+            return self.w.fields.get((key, name), Sym(f"{key}.{name}"))   # a member of the current object
+        if name in self.m.global_objects:
+            return Obj(name)
         return self.m_const(name, 0)
 
     def m_const(self, name: str, depth: int) -> Any:
@@ -1010,6 +1102,20 @@ class Walker:
         self._sites: List[int] = []
         self.fields: Dict[Tuple[str, str], Any] = {}        # (object, field) -> value, e.g. ('the_sensor', 'write') -> fn
         self._frames: List[Dict[str, bool]] = []
+        self._this: List[Tuple[Any, str]] = []              # (object, class) of the method being walked
+
+    def this(self) -> Optional[Tuple[Any, str]]:
+        return self._this[-1] if self._this else None
+
+    def construct(self, obj_name: str, cls: str, arg_toks: List[List[Tok]]) -> None:
+        """Run a global object's constructor (member initializer list, then body) before the entry function, as the
+        C++ runtime does: BMP388 bmp(0x76); -> fields bmp._addr = 0x76."""
+        ctor = self.m.function(f"{cls}::{cls}")
+        ev = Evaluator(self.m, {}, (f"{cls}::{cls}",), self, True, ctor.file if ctor else "")
+        args = [ev.eval(a) for a in arg_toks]
+        if ctor is None:
+            return
+        self.call(ctor, args, (), True, this=(Obj(obj_name), cls))
 
     # ---------------------------------------------------------- uncertain control flow
     _MISSING = object()
@@ -1049,14 +1155,25 @@ class Walker:
         self.fields = merged_fields
 
     # ---------------------------------------------------------- functions
-    def call(self, fn: Function, args: List[Any], chain: Tuple[str, ...], guaranteed: bool) -> Any:
+    def call(self, fn: Function, args: List[Any], chain: Tuple[str, ...], guaranteed: bool, this: Optional[Tuple[Any, str]] = None) -> Any:
         if len(self._stack) >= MAX_DEPTH or fn.name in self._stack:
             self.notes.append(f"stopped at {' > '.join(chain + (fn.name,))} (recursion/depth limit)")
             return Sym(f"{fn.name}()")
-        env = {p: (args[k] if k < len(args) else Sym(p)) for k, p in enumerate(fn.params)}
+        defaults = self.m.defaults.get(fn.name) or self.m.defaults.get(fn.name.split("::")[-1]) or {}
+        env = {p: (args[k] if k < len(args) else
+                   (Evaluator(self.m, {}, chain, None, True, fn.file).eval(defaults[k]) if k in defaults else Sym(p)))
+               for k, p in enumerate(fn.params)}
+        if this is None and fn.cls and self.this() and self.this()[1] == fn.cls:
+            this = self.this()   # an unqualified call to another method of the same object
         self._stack.append(fn.name)
         self._frames.append({"may_return": False})
+        if this is not None:
+            self._this.append(this)
         try:
+            key = obj_key(this[0]) if this is not None else None
+            for member, expr in fn.init:   # constructor initializer list
+                if key is not None:
+                    self.fields[(key, member)] = Evaluator(self.m, env, chain + (fn.name,), self, guaranteed, fn.file).eval(expr)
             self.block(fn.body, env, chain + (fn.name,), guaranteed, fn.file)
             value = None
         except _Return as r:
@@ -1064,6 +1181,8 @@ class Walker:
         finally:
             self._stack.pop()
             frame = self._frames.pop()
+            if this is not None:
+                self._this.pop()
         # a return inside an uncertain branch means the caller cannot know which value comes back
         return Sym(f"{fn.name}()") if frame["may_return"] else value
 
@@ -1272,7 +1391,11 @@ class Walker:
 
     def _assign(self, lhs: List[Tok], val: Any, env, chain, guaranteed, file) -> None:
         if len(lhs) == 1 and lhs[0].kind == "id":
-            env[lhs[0].text] = val
+            here = self.this()
+            if lhs[0].text not in env and here is not None:   # a member of the current object: _addr = addr;
+                self.fields[(obj_key(here[0]), lhs[0].text)] = val
+            else:
+                env[lhs[0].text] = val
             return
         if len(lhs) >= 4 and lhs[0].kind == "id" and lhs[1].text == "[" and lhs[-1].text == "]":
             arr = env.get(lhs[0].text)
@@ -1365,6 +1488,15 @@ class Walker:
                     if len(cands) > 1:
                         self.notes.append(f"{name}() could be {', '.join(cands)}; followed {cands[0]}")
                     return self._inline(fn, args, ev, line)
+            # a method of a project class:  bmp.begin()  /  this->readRegister(...)
+            owner = self.m.global_objects.get(key, (None,))[0] if key is not None else None
+            if owner is None and isinstance(obj, Obj) and self.this() and obj == self.this()[0]:
+                owner = self.this()[1]
+            method = self.m.function(f"{owner}::{name}") if owner else None
+            if method is not None and method.cls != owner:
+                method = None   # same short name in another class
+            if method is not None and method.name not in self._stack:
+                return self._inline(method, args, ev, line, this=(obj if isinstance(obj, Obj) else Obj(key or "obj"), method.cls), arg_toks=arg_toks)
             first_is_buffer = bool(args) and isinstance(args[0], (Ptr, Arr))
             if name in ("write", "write_then_read", "read") and len(args) >= 2 and (first_is_buffer or name == "write_then_read"):
                 return _BUSIO_STYLE(self, name, args, ev, line)   # Adafruit BusIO: write(buf, len, stop, prefix, prefix_len)
@@ -1378,17 +1510,26 @@ class Walker:
         if prim is not None:
             return prim(self, args, ev, line)
         fn = self.m.function(name)
+        here = self.this()
+        if here is not None:   # unqualified call inside a method: prefer the method of the same class
+            fn = self.m.function(f"{here[1]}::{name}") or fn
         if fn is not None:
-            return self._inline(fn, args, ev, line)
+            return self._inline(fn, args, ev, line, arg_toks=arg_toks)
         self.opaque.add(f"{name}()")
         return Sym(f"{name}()")
 
-    def _inline(self, fn: Function, args: List[Any], ev: Evaluator, line: int) -> Any:
+    def _inline(self, fn: Function, args: List[Any], ev: Evaluator, line: int, this: Optional[Tuple[Any, str]] = None,
+                arg_toks: Optional[List[List[Tok]]] = None) -> Any:
         self._sites.append(line)
         try:
-            return self.call(fn, args, ev.chain, ev.guaranteed)
+            return self.call(fn, args, ev.chain, ev.guaranteed, this=this)
         finally:
             self._sites.pop()
+            # C++ reference parameters: the callee may have written the caller's variable
+            for k in fn.refs:
+                at = arg_toks[k] if arg_toks and k < len(arg_toks) else None
+                if at and len(at) == 1 and at[0].kind == "id" and at[0].text in ev.env:
+                    ev.env[at[0].text] = Sym(f"{at[0].text}@ref")
 
     def emit(self, ev: Evaluator, line: int, **kw: Any) -> None:
         if len(self.events) < MAX_EVENTS:

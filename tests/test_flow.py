@@ -288,3 +288,12 @@ int main(void) {
     return 0; }"""
     ev = FlowModel({"a.c": code}).trace("main").events
     assert [e.describe() for e in ev] == ["write 0xF5 <- 0x94"] and not ev[0].guaranteed
+
+def test_finish_rejects_claims_the_state_does_not_support(tmp_path):
+    p, store, ledger, src, f = _project(tmp_path)
+    belt = ToolBelt(p, RunSession("r", p.id), store, ledger)
+    err = belt.finish("blocked", "Driver skeleton built and verified, but compensation is not done.")["error"]
+    assert "verified" in err and "built" in err
+    assert belt.finish("blocked", "Tested on the hardware, works fine.").get("error")
+    ok = belt.finish("blocked", "Not built yet: the compensation formulas are missing; nothing was verified.")
+    assert ok.get("ok"), ok

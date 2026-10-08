@@ -1048,6 +1048,25 @@ class ToolBelt:
                 problems.append("facts, sequences or the schematic changed after the last verify (call verify again)")
             if problems:
                 return {"error": "Cannot finish with success: " + "; ".join(problems) + "."}
+        false = self._unsupported_claims(summary or "", h)
+        if false:  # any status: a 'blocked' summary may not claim a build or a verify that did not happen either
+            return {"error": "The summary claims " + "; ".join(false) + ". Rewrite it to say exactly what was built and verified "
+                             "(and what was not), then call finish again."}
         self.ended = "finish"
         self.final = {"status": status, "summary": summary}
         return {"ok": True}
+
+    def _unsupported_claims(self, summary: str, h: str) -> List[str]:
+        built = bool(self.state["build_ok"] and self.state["build_hash"] == h)
+        verified = bool(self.state["verify_ok"] and self.state["verify_hash"] == h and self.state.get("verify_inputs") == self.verify_inputs_hash())
+        text = re.sub(r"\b(not|never|un|could not|couldn't|cannot|can't|failed to|fails?|without|nothing\s+(?:was|is|has been|got)|"
+                      r"no(?:thing)?\s+(?:code|firmware|part)?\s*(?:was|is|has been))\s+(yet\s+|been\s+|be\s+)?(fully\s+)?",
+                      "NOT_", summary, flags=re.I)
+        out = []
+        if not verified and re.search(r"(?<!NOT_)\b(verified|verification passed|passe[sd] verif\w*|verify passe[sd])\b", text, re.I):
+            out.append("the code is verified, but the current sources have no passing verify")
+        if not built and re.search(r"(?<!NOT_)\b(built|builds|compiled|compiles)\b(?!\s+(?:yet|fails|failed))", text, re.I):
+            out.append("the code is built, but the current sources have no successful build")
+        if re.search(r"(?<!NOT_)\b(tested on (the )?(hardware|board)|flashed|works on the board|flies|flight[- ]tested)\b", text, re.I):
+            out.append("hardware testing, which EmbedForge never does (no device evidence)")
+        return out
