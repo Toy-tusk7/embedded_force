@@ -136,6 +136,54 @@ class SequenceBook:
         st.fields = out
         return ""
 
+    def _ground(self, st: Step, raw: Dict[str, Any], ledger: FactLedger, subject: str) -> str:
+        """A step may name a register address, value, read length or delay directly when it is already grounded: the
+        address is in the register map (or a layout), the written value decodes into that register's recorded fields, the
+        read covers recorded bytes, the delay equals a recorded time fact. Everything else must be a FACT id."""
+        from embedforge.truth.registers import RegisterBook
+        book = RegisterBook(self.path.parent)
+        known = book.known_addresses()
+
+        def raw_int(v: str) -> Optional[int]:
+            return None if not v or v.upper().startswith("FACT-") else parse_int(v)
+        r = raw_int(st.reg)
+        if st.reg and not st.reg.upper().startswith("FACT-"):
+            if r is None or r not in known:
+                return (f"reg {st.reg!r} is neither a FACT id nor a register/layout address you recorded (record_registers / "
+                        "record_layouts first)")
+            st.reg = f"0x{r:02X}"
+        addr = _fact_int(ledger, st.reg)
+        if st.op == "write" and st.value and not st.value.upper().startswith("FACT-") and not st.fields:
+            v = raw_int(st.value)
+            reg = book.register_at(addr, subject) or book.register_at(addr) if addr is not None else None
+            if v is None or reg is None:
+                return f"value {st.value!r} must be a FACT id (or the register must be in the register map)"
+            if reg.fields and v & ~reg.defined_mask & 0xFF:
+                return f"value {st.value} sets bits {v & ~reg.defined_mask & 0xFF:#04x} that no field of {reg.name} defines"
+            named = [f for f in reg.fields if f.values]
+            whole = [f for f in reg.fields if (f.hi, f.lo) == (7, 0)]
+            if whole and whole[0].values and not whole[0].value_name(v):
+                return f"value {st.value} is none of {reg.name}'s named values ({', '.join(f'{n}={vs[0]:#04x}' for n, vs in whole[0].values.items())})"
+            st.fields = {f.name: f.get(v) for f in reg.fields} if reg.fields else {}
+            st.value = "" if reg.fields else st.value
+            if not reg.fields:
+                return f"{reg.name} has no fields in the register map: record its fields, or give value as a FACT id"
+            del named
+        if st.mask and not st.mask.upper().startswith("FACT-"):
+            st.mask = ""   # fields say which bits matter
+        if st.op == "read" and st.value and not st.value.upper().startswith("FACT-"):
+            n = raw_int(st.value)
+            if n is None or addr is None or not all(a in known for a in range(addr, addr + n)):
+                return f"read length {st.value!r} must be a FACT id, or every byte {addr}..+{st.value} must be recorded registers/layouts"
+            st.value = str(n)
+        if st.op == "delay_min" and st.value and not st.value.upper().startswith("FACT-"):
+            want = delay_us(type("F", (), {"value": st.value, "unit": st.unit})(), st.unit)
+            match = next((f for f in ledger.facts.values() if want is not None and delay_us(f, "") == want), None)
+            if match is None:
+                return f"delay {st.value!r}{(' ' + st.unit) if st.unit else ''} is not a recorded time fact: record it with record_fact (unit ms/us) and cite the FACT id"
+            st.value, st.unit = match.id, ""
+        return ""
+
     def record(self, ledger: FactLedger, subject: str, name: str, entry: str, steps: List[Dict[str, Any]],
                source_id: str, order_quote: str, device: str = "") -> Dict[str, Any]:
         subject, name, entry = (subject or "").strip(), re.sub(r"[^A-Za-z0-9_]+", "_", (name or "").strip()).strip("_"), (entry or "").strip()
@@ -166,10 +214,14 @@ class SequenceBook:
                 problems.append(f"step {k}: {st.op} needs reg = the FACT id of the register address")
             if st.op == "delay_min" and not st.value:
                 problems.append(f"step {k}: delay_min needs value = the FACT id of the required delay")
+            ground = self._ground(st, raw, ledger, subject)
+            if ground:
+                problems.append(f"step {k}: {ground}")
+                continue
             for fld in ("reg", "value", "mask"):
                 fid = getattr(st, fld)
-                if not fid:
-                    continue
+                if not fid or not fid.upper().startswith("FACT-"):
+                    continue   # grounded by the register map (checked above)
                 fact = ledger.get(fid)
                 if fact is None:
                     problems.append(f"step {k}: {fld} {fid!r} is not a fact id in the ledger (record the value with record_fact first)")
@@ -180,14 +232,21 @@ class SequenceBook:
                 if fld == "value" and st.op == "delay_min" and delay_us(fact, st.unit) is None:
                     problems.append(f"step {k}: {fid} = {fact.value!r} has no time unit; record the fact with unit='ms' or 'us', or give unit in the step")
             parsed.append(st)
+        if device and not device.upper().startswith("FACT-"):
+            # a part name instead of the address fact: the address recorded for that part
+            from embedforge.truth.verifier import _ADDR_PROP_RE
+            cand = [f for f in ledger.facts.values() if f.subject.lower() == device.lower() and _ADDR_PROP_RE.search(f.property)
+                    and parse_int(str(f.value)) is not None]
+            device = cand[0].id if len(cand) == 1 or len({c.value for c in cand}) == 1 and cand else device
         if device:
             dev = ledger.get(device)
             if dev is None or parse_int(str(dev.value)) is None:
                 problems.append(f"device {device!r} must be the FACT id of the bus address (e.g. the I2C address)")
+        from embedforge.truth.registers import verbatim
         src = ledger.store.get(source_id)
         if src is None:
             problems.append(f"source_id {source_id!r} is not a stored source")
-        elif len(_squash(order_quote)) < 12 or _squash(order_quote) not in _squash(src.text):
+        elif len(_squash(order_quote)) < 12 or not verbatim(order_quote, src.text):
             problems.append("order_quote must be a verbatim passage (12+ chars) of that source stating the order/timing")
         if problems:
             return {"ok": False, "error": "; ".join(problems[:8])}
@@ -230,11 +289,16 @@ class FlowResult:
 
 
 def _fact_int(ledger: FactLedger, fid: str) -> Optional[int]:
+    """The number a step names: a fact's value, or a register-map address / read length given directly."""
+    if fid and not fid.upper().startswith("FACT-"):
+        return parse_int(fid)
     f = ledger.get(fid) if fid else None
     return parse_int(str(f.value)) if f is not None else None
 
 
 def _label(ledger: FactLedger, fid: str) -> str:
+    if fid and not fid.upper().startswith("FACT-"):
+        return fid
     f = ledger.get(fid)
     return f"{fid} ({f.subject}.{f.property}={f.value})" if f else fid
 

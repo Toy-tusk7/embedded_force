@@ -334,6 +334,20 @@ class ToolBelt:
         h = self._handlers.get(name)
         if h is None:
             return {"error": f"Unknown tool '{name}'. Available: {', '.join(self._handlers)}"}
+        if name in ("record_fact", "record_user_fact") and isinstance(args.get("facts"), (list, str)) and not args.get("quote"):
+            items = args["facts"]
+            if isinstance(items, str):
+                try:
+                    import json
+                    items = json.loads(items)
+                except ValueError:
+                    items = []
+            if name == "record_user_fact":   # the user's words are the conversation source
+                sid = self.store._by_url.get("user://conversation") or ""
+                items = [dict(i, source_id=i.get("source_id") or sid) for i in items if isinstance(i, dict)]
+            res = self.record_facts(items if isinstance(items, list) else [], str(args.get("source_id") or ""))
+            res["note"] = f"{name} records one fact; this list was recorded with record_facts."
+            return res
         import inspect
         sig = inspect.signature(h).parameters
         accepted = set(sig)

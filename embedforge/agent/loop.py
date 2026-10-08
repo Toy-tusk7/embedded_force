@@ -318,6 +318,12 @@ class AgentRunner:
                 if resp["reasoning"]:
                     s.emit("thinking", text=resp["reasoning"][:3000])
                 tool_calls = resp["tool_calls"]
+                if not tool_calls and "<tool_call>" in (resp["content"] or ""):
+                    # calls written as text (the provider did not parse them): run them as real calls
+                    from embedforge.agent.textcalls import parse_text_tool_calls
+                    parsed, rest = parse_text_tool_calls(resp["content"], [t["function"]["name"] for t in tools_for(meta)])
+                    if parsed:
+                        tool_calls, resp = parsed, {**resp, "content": rest}
                 truncated = resp.get("finish_reason") == "length" and not tool_calls
                 amsg: Dict[str, Any] = {"role": "assistant", "content": resp["content"] or ""}
                 if tool_calls:

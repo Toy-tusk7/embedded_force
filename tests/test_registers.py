@@ -226,6 +226,28 @@ def test_sequence_fields_compose_the_value_and_catch_sleep_mode(tmp_path):
     assert not [x for x in verify_project(p.root, ledger).findings if x.code.startswith("FLOW_") and x.severity == "ERROR"]
 
 
+def test_sequence_steps_may_use_values_the_register_map_grounds(tmp_path):
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+    steps = [{"op": "write", "reg": "0x7E", "value": "0xB6"}, {"op": "delay_min", "value": "2", "unit": "ms"},
+             {"op": "read", "reg": "0x31", "value": "4"}, {"op": "write", "reg": "0x1B", "value": "0x33", "mask": "0xFF"}]
+    res = SequenceBook(p.root).record(ledger, "BMPX", "power_up", "sensor_init", steps, src.id,
+                                      "Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.", device="BMPX")
+    assert res["ok"], res
+    st = res["sequence"]["steps"]
+    assert st[0]["fields"] == {"cmd": 0xB6} and st[1]["value"] == f["t"] and st[3]["fields"] == {"press_en": 1, "temp_en": 1, "mode": 3}
+    assert res["sequence"]["device"] == f["addr"]
+    rep = verify_project(p.root, ledger)
+    assert not [x for x in rep.findings if x.code.startswith("FLOW_") and x.severity == "ERROR"], [x.message for x in rep.findings]
+    # still refused: an address nobody recorded, bits no field defines, a delay that is no fact, a read past the recorded bytes
+    for bad, why in [({"op": "write", "reg": "0x55", "value": "0x01"}, "neither a FACT id"),
+                     ({"op": "write", "reg": "0x1B", "value": "0x83"}, "no field"),
+                     ({"op": "delay_min", "value": "5", "unit": "ms"}, "not a recorded time fact"),
+                     ({"op": "read", "reg": "0x31", "value": "21"}, "must be recorded")]:
+        r = SequenceBook(p.root).record(ledger, "BMPX", "x", "sensor_init", [bad], src.id,
+                                        "Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.")
+        assert not r["ok"] and why in r["error"], (bad, r)
+
+
 def test_value_fact_contradicting_fields_is_rejected(tmp_path):
     p, store, ledger, src, f = _setup(tmp_path, driver())
     wrong = ledger.record("BMPX", "pwr_normal", "0x03", src.id, "Table 2: Register 0x03 STATUS")["fact"]["id"]
