@@ -855,6 +855,22 @@ class ToolBelt:
             if isinstance(l, dict) and l.get("source_id"):
                 l["source_id"] = self._sid(l["source_id"])
         res = self._register_book().record_layouts(self.store, device, self._sid(source_id), lays)
+        retry = []
+        for rej in res.get("rejected") or []:
+            raw = next((l for l in lays if isinstance(l, dict) and l.get("name") == rej.get("layout")), None)
+            alt = self._source_with(str(raw.get("quote") or ""), str(raw.get("source_id") or self._sid(source_id))) \
+                if raw and "not verbatim" in str(rej.get("error")) else None
+            if alt:
+                retry.append(dict(raw, source_id=alt))
+        if retry:   # quoted from another stored source than the one cited
+            again = self._register_book().record_layouts(self.store, device, self._sid(source_id), retry)
+            done = {str(x).split(" ", 2)[1] for x in again.get("recorded") or []}
+            res["recorded"] = (res.get("recorded") or []) + (again.get("recorded") or [])
+            res["rejected"] = [r for r in res.get("rejected") or [] if r.get("layout") not in done] + (again.get("rejected") or [])
+            res["ok"] = bool(res["recorded"])
+            if not res["rejected"]:
+                res.pop("rejected", None)
+                res.pop("hint", None)
         for rej in res.get("rejected") or []:
             raw = next((l for l in lays if isinstance(l, dict) and l.get("name") == rej.get("layout")), None)
             if raw and re.search(r"quote", str(rej.get("error"))):
@@ -893,10 +909,26 @@ class ToolBelt:
                 break
         return out
 
+    def _source_with(self, quote: str, exclude: str) -> Optional[str]:
+        """Another stored (non-user) source in which the quote is verbatim: models often cite the wrong SRC id."""
+        from embedforge.truth.registers import verbatim
+        if not quote or len(quote) < 12:
+            return None
+        for s in self.store.sources.values():
+            if s.id != exclude and not s.url.startswith("user://") and verbatim(quote, s.text):
+                return s.id
+        return None
+
     def record_formula(self, device: str, source_id: str, name: str, steps: Any, quote: str, unit: str = "",
                        inputs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         res = self._register_book().record_formula(self.store, device, self._sid(source_id), name, steps, quote, unit,
                                                    inputs if isinstance(inputs, dict) else None)
+        if not res.get("ok") and "not verbatim" in str(res.get("error")):
+            alt = self._source_with(str(quote or ""), self._sid(source_id))
+            if alt:
+                res = self._register_book().record_formula(self.store, device, alt, name, steps, quote, unit,
+                                                           inputs if isinstance(inputs, dict) else None)
+                res["note"] = f"The quote is not in {self._sid(source_id)} but is verbatim in {alt}; recorded with {alt}."
         src = self.store.get(self._sid(source_id))
         if not res.get("ok") and src is not None and re.search(r"not verbatim|not in the quote", str(res.get("error"))):
             # the passage the formula comes from, so the model can quote it exactly instead of retyping it

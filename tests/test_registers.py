@@ -311,6 +311,18 @@ def test_formula_binds_the_quotes_own_names(tmp_path):
     assert ok["ok"] and "partial = (ut - par_t1)" in ok["formula"].lower(), ok
 
 
+def test_formula_quoted_from_another_stored_source_is_recorded_with_it(tmp_path):
+    p = Project("r5", tmp_path / "r5")
+    store = SourceStore(p.root)
+    store.add("https://github.com/boschsensortec/BMP3_SensorAPI/blob/master/bmp3.c", "bmp3.c", "int x = 1; /* other code */", kind="code")
+    ds = store.add("https://www.bosch-sensortec.com/x.pdf", "datasheet", DS, kind="pdf")
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    assert belt.call("record_layouts", {"device": "BMPX", "source_id": "SRC-001", "layouts": LAYOUTS[:1]})["ok"]   # cites the wrong SRC
+    r = belt.call("record_formula", {"device": "BMPX", "source_id": "SRC-001", "name": "PAR_T1", "steps": ["PAR_T1 = NVM_PAR_T1 / 2^-8"],
+                                     "quote": "PAR_T1 = NVM_PAR_T1 / 2^-8"})
+    assert r["ok"] and ds.id in r["note"], r
+
+
 def test_garbled_pdf_exponents_count_as_the_constant():
     from embedforge.truth.registers import _const_in_quote
     garbled = "𝑃𝑃𝑃𝑃𝑃𝑃_𝑇𝑇1 = 𝑁𝑁𝑁𝑁𝑁𝑁_𝑃𝑃𝑃𝑃𝑃𝑃_𝑇𝑇1\n2−8  𝑃𝑃𝑃𝑃𝑃𝑃_𝑇𝑇2 = 𝑁𝑁𝑁𝑁𝑁𝑁_𝑃𝑃𝑃𝑃𝑃𝑃_𝑇𝑇2\n230"

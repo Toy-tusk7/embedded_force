@@ -190,6 +190,19 @@ def _bits_in_quote(quote: str, hi: int, lo: int, fname: str = "") -> bool:
     return False
 
 
+def _stated_bits(quotes: List[str], fname: str) -> Optional[Tuple[int, int]]:
+    """The bit position a quote states for a field in its own row ('Bit 4..0 odr_sel' -> (4, 0)), if any."""
+    for q in quotes:
+        low = q.lower().translate(dict.fromkeys(map(ord, "‐‑‒–—−"), "-"))
+        for a, _b in _name_spans(low, fname):
+            m = re.search(r"(?:^|[^0-9a-z.])(?:bits?\s*)?(\d{1,2})(?:\s*(?:\.\.\.?|:|-|to)\s*(\d{1,2}))?[\s|:\]>)\-]*$", low[max(0, a - 16):a])
+            if m:
+                h = int(m.group(1))
+                l = int(m.group(2)) if m.group(2) else h
+                return (max(h, l), min(h, l))
+    return None
+
+
 def _name_spans(quote: str, name: str) -> List[Tuple[int, int]]:
     """Where `name` occurs in the quote, ignoring case, spaces, underscores and hyphens inside it."""
     chars = [re.escape(c) for c in name if c.isalnum()]
@@ -671,6 +684,11 @@ class RegisterBook:
                     return err
                 quotes.append(fq)
             whole = (hi, lo) == (7, 0) and raw.get("width") in (None, 8, "8")   # the whole register: no position to check
+            if whole:
+                stated = _stated_bits(quotes, fname)
+                if stated and stated != (7, 0):
+                    return (f"field {fname}: the datasheet gives it bit {stated[1]}" if stated[0] == stated[1] else
+                            f"field {fname}: the datasheet gives it bits {stated[0]}..{stated[1]}, not the whole register")
             if not whole and not any(_name_spans(q, fname) for q in quotes):
                 return f"field {fname}: its name is not in the quote(s)"
             if not whole and not any(_bits_in_quote(q, hi, lo, fname) for q in quotes):
@@ -847,6 +865,11 @@ class RegisterBook:
                 if tag and other and tag.groups() != other.groups():
                     return (f"{_hex(a)} holds {nm.upper()} per the datasheet ({_hex(a)}<{h}:{l}>), not {name}: "
                             "take each value's addresses from its own rows")
+                if _alnum(name) != nm:
+                    # raw register content keeps the datasheet's name (NVM_PAR_T1); a converted value (PAR_T1) is a formula
+                    shown = next((m.group(2).strip() for m in _ROW_RANGE.finditer(src.text) if int(m.group(1), 16) == a), nm.upper())
+                    return (f"name this layout {shown.replace(' ', '')!r} as the datasheet does ({_hex(a)} {shown}<{h}:{l}>): it "
+                            f"is the raw register content. A scaled or converted value is a record_formula on top of it.")
         for n in {nm for a, nm, h, l in table if a in mine}:
             nrows = {(a, h, l) for a, nm, h, l in table if nm == n and h - l == 7}
             if not nrows or not any(a in mine for a, _h, _l in nrows) or max(h for _a, h, _l in nrows) <= 7:
