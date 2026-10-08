@@ -27,11 +27,11 @@ _QUOTES = {ord("\u2018"): "'", ord("\u2019"): "'", ord("\u201c"): '"', ord("\u20
 
 def _squash(s: str) -> str:
     """Whitespace-free, case-folded form used for robust verbatim-quote containment."""
-    s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl").replace("\u00b5", "\u03bc")   # \u00b5s = \u03bcs
+    s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl").replace("\u00b5", "\u03bc")   # micro sign = Greek mu
     s = s.translate(_DASHES).translate(_QUOTES)
     # Markdown table/emphasis markup from the PDF converter ('| Bit 5..4 | mode |', '**Table 40**', '<br>') is layout,
     # not text: a quote matches with or without it
-    s = re.sub(r"<br\s*/?>|\*\*|[|`]", " ", s)
+    s = re.sub(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]", " ", s)   # 2<sup>osr_p</sup> = 2^osr_p
     # quote marks carry no meaning and PDFs use curly ones the model often drops: Register 0x1B “PWR_CTRL”
     return re.sub(r"[\s\"'`´]+", "", s).lower()
 

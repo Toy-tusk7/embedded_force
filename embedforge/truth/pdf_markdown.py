@@ -733,6 +733,16 @@ def page_markdown(page, chunk: dict, decoder: GlyphDecoder) -> str:
         md = md.replace(raw, fixes[raw])
     if formulas and not placed:
         md = _insert_formulas(md, page, formulas)
-    return md
+    return _plain_markup(md)
+
+
+_ITALIC = re.compile(r"(?<![\w\\])_([A-Za-z0-9][\w.\-/ ]{0,60}?[A-Za-z0-9.)])_(?![\w])")
+
+
+def _plain_markup(md: str) -> str:
+    """Markup that would end up in quotes and identifiers: italics around register names ('_press_xlsb_' reads as a
+    different name) and the shading / underline tags of code boxes and captions."""
+    md = re.sub(r"</?(?:mark|u)>", "", md)
+    return _ITALIC.sub(r"\1", md)
 
 

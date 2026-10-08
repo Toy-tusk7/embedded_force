@@ -212,6 +212,17 @@ def _name_spans(quote: str, name: str) -> List[Tuple[int, int]]:
     return [(m.start(), m.end()) for m in re.finditer(rx, quote, re.I)]
 
 
+def _stated_addrs(text: str, name: str) -> set:
+    """Addresses written right before a register's name, with only spacing, quote marks or table bars between them:
+    'Register 0x1B “PWR_CTRL”', '| 0x1B | PWR_C TRL |' (table cells wrap names), '0x1B PWR_CTRL'."""
+    chars = [re.escape(c) for c in name if c.isalnum()]
+    if len(chars) < 3:
+        return set()
+    rx = (r"(?<![0-9A-Za-z])0x([0-9A-Fa-f]{1,4})(?![0-9A-Za-z])[\s|\"'“”‘’]{0,8}(?<![A-Za-z0-9_])"
+          + r"[\s_\-]*".join(chars) + r"(?![A-Za-z0-9_])")
+    return {int(m.group(1), 16) for m in re.finditer(rx, text, re.I)}
+
+
 def _value_forms(v: int, width: int) -> List[str]:
     forms = {str(v), f"0x{v:x}", f"0x{v:02x}", f"{v:x}h", format(v, f"0{width}b") if width <= 16 else ""}
     return [f for f in forms if f]
@@ -666,6 +677,12 @@ class RegisterBook:
             return err
         if not (_name_spans(quote, name) or value_in_text(_hex(addr), quote)):
             return f"the quote mentions neither {name} nor {_hex(addr)}"
+        # the address the datasheet gives this name ('Register 0x1B “PWR_CTRL”', '| 0x1B | PWR_CTRL |'): in the quote, else
+        # anywhere in the source; a register quoted by name only cannot sit at another address
+        src = store.get(source_id)
+        stated = _stated_addrs(quote, name) or (_stated_addrs(src.text, name) if src is not None else set())
+        if stated and addr not in stated:
+            return f"the datasheet gives {name} at {', '.join(_hex(a) for a in sorted(stated))}, not {_hex(addr)}"
         fields: List[FieldDef] = []
         for fr in (raw.get("fields") or [])[:16]:
             fr = fr if isinstance(fr, dict) else {}

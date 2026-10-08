@@ -4,7 +4,8 @@ import struct
 
 import pytest
 
-from embedforge.truth.pdf_markdown import (Run, _math_variants, _rebuild_page, _render_line, formulas_from_runs,
+from embedforge.truth.ledger import _squash
+from embedforge.truth.pdf_markdown import (Run, _math_variants, _plain_markup, _rebuild_page, _render_line, formulas_from_runs,
                                            html_table_to_markdown, html_tables_to_markdown)
 
 
@@ -75,6 +76,16 @@ def test_garbled_box_is_rewritten_and_formula_follows_its_text():
     out = _rebuild_page(md, boxes, lines, [(35.0, 10.0, "T_conv = 1")])
     assert out == ("# Title\n\nThe time T_conv is set.\n\n*Formulas (reconstructed from the PDF's equation glyphs):*\n\n"
                    "`T_conv = 1`  \n\nNext paragraph.\n\n")
+
+
+def test_markup_that_would_change_names_is_removed():
+    md = "burst read from register _press_xlsb_ to _temp_msb_ . <mark>x = 1;</mark> <u>Table 24</u>"
+    assert _plain_markup(md) == "burst read from register press_xlsb to temp_msb . x = 1; Table 24"
+    row = "| 50 | 0x32 | NVM_PAR _T1<15:8> | NVM_PAR _T1 | 16 Bit | unsigned |"   # the PDF's own spacing stays
+    assert _plain_markup(row) == row
+    # quotes match with or without the converter's markup
+    assert _squash("2^osr_p * 2000µs") == _squash("2<sup>osr_p</sup> ∙ 2000μs".replace("∙", "*"))
+    assert _squash("| Bit 5..4 | mode | 01/10 | forced mode |") == _squash("Bit 5..4 mode 01/10 forced mode")
 
 
 def test_pdf_to_markdown_end_to_end(tmp_path):

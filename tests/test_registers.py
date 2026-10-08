@@ -296,6 +296,20 @@ def test_register_fields_must_match_the_table(tmp_path, field, why):
     assert not res["ok"] and why in res["rejected"][0]["error"], res
 
 
+def test_register_quoted_by_name_must_be_at_the_datasheet_address(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    reg = {"name": "PWR_CTRL", "addr": "0x1C", "quote": "Bit 5..4 mode 00 sleep mode 01/10 forced mode 11 normal mode",
+           "fields": [{"name": "mode", "bits": "5:4"}]}
+    res = book.record_registers(store, ledger, "BMPX", src.id, [dict(reg, quote=_q("Table 3", "11 normal mode"))])
+    assert not res["ok"] and "gives PWR_CTRL at 0x1B, not 0x1C" in res["rejected"][0]["error"], res
+    # the quote names the field only: the address comes from where the datasheet states the register
+    reg["fields"][0]["quote"] = reg["quote"]
+    res = book.record_registers(store, ledger, "BMPX", src.id, [dict(reg, quote="Table 3: Register 0x1B PWR_CTRL")])
+    assert not res["ok"], res
+    res = book.record_registers(store, ledger, "BMPX", src.id, [dict(reg, addr="0x1B", quote="Table 3: Register 0x1B PWR_CTRL")])
+    assert res["ok"], res
+
+
 def test_unstated_value_names_are_dropped_not_the_register(tmp_path):
     p, store, ledger, src, book = _book(tmp_path)
     q = _q("Table 3", "11 normal mode").replace("“", '"')
