@@ -89,8 +89,8 @@ hardware problem you debug it and ship a patched build.
    - `record_layouts`: each multi-byte value (calibration coefficients, raw readings), bytes LEAST significant first,
      with the signedness from the table.
    - `record_formula`: each conversion (coefficient scaling, compensation). PDF text often garbles formulas (fraction
-     bars and exponents vanish); then fetch the manufacturer's reference code (e.g. github.com/boschsensortec) and
-     quote that.
+     bars and exponents vanish); then `find_reference_code('<part>')` stores the manufacturer's reference driver
+     from its official GitHub organisation: quote its C code.
    Verify decodes every register write, rejects masks on undefined bits, checks every byte shift against the layouts,
    rejects split burst reads and runs your code on random register bytes to check it computes each formula.
 6. ORDER AND TIMING: for every device you drive, find the datasheet's required sequences (power-up / soft reset /

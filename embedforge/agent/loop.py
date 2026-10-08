@@ -23,7 +23,7 @@ from embedforge.truth import FactLedger, SourceStore
 PROGRESS_TOOLS = {"record_fact", "record_user_fact", "record_board_pins", "init_project", "init_betaflight", "query_board",
                   "write_file", "replace_in_file", "build", "verify", "record_facts", "record_sequence", "record_registers",
                   "record_layouts", "record_formula"}
-RESEARCH_TOOLS = {"web_search", "fetch_document"}
+RESEARCH_TOOLS = {"web_search", "fetch_document", "find_reference_code"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10

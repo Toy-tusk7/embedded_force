@@ -48,6 +48,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Download a datasheet/register-map PDF or web page by URL and store its full text. Only needed for URLs that "
         "web_search did not already store in full. Returns a source_id.",
         {"url": S}, ["url"]),
+    _fn("find_reference_code",
+        "Get the MANUFACTURER's own reference driver for a part from its official GitHub organisation (Bosch Sensortec, "
+        "ST, TDK InvenSense, Sensirion, Infineon, ADI, ...) and store its C sources as OFFICIAL_REPO sources. Use it when the "
+        "datasheet's formulas or tables are garbled in the PDF text: the reference code states the same conversions in "
+        "plain C. Then read_source and quote it like the datasheet.",
+        {"part": S, "vendor": S}, ["part"]),
     _fn("read_source",
         "Retrieve the most relevant verbatim excerpts of a stored source for a query (register names, addresses, "
         "'WHO_AM_I', 'slave address'...). Copy quotes from these excerpts exactly when recording facts.",
@@ -311,7 +317,8 @@ class ToolBelt:
         self._handlers: Dict[str, Callable[..., Any]] = {
             "resolve_target": self.resolve_target, "init_project": self.init_project, "init_betaflight": self.init_betaflight,
             "web_search": self.web_search,
-            "fetch_document": self.fetch_document, "read_source": self.read_source, "record_fact": self.record_fact,
+            "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
+            "read_source": self.read_source, "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
             "record_layouts": self.record_layouts, "record_formula": self.record_formula,
@@ -328,9 +335,19 @@ class ToolBelt:
         if h is None:
             return {"error": f"Unknown tool '{name}'. Available: {', '.join(self._handlers)}"}
         import inspect
-        accepted = set(inspect.signature(h).parameters)
+        sig = inspect.signature(h).parameters
+        accepted = set(sig)
         ignored = sorted(k for k in args if k not in accepted)
         call_args = {k: v for k, v in args.items() if k in accepted}
+        # one parameter under another name (query_board(designator='U3'), read_source(id=...)): use it for the one missing
+        spec = next((t["function"]["parameters"] for t in TOOL_SPECS if t["function"]["name"] == name), {})
+        missing = [k for k in (spec.get("required") or list(sig)[:1]) if k not in call_args]
+        ptype = ((spec.get("properties") or {}).get(missing[0]) or {}).get("type") if len(missing) == 1 else None
+        val = args[ignored[0]] if len(ignored) == 1 else None
+        if len(missing) == 1 and len(ignored) == 1 and ((ptype == "string" and isinstance(val, str) and val.strip())
+                                                        or (ptype == "integer" and isinstance(val, int) and not isinstance(val, bool))):
+            call_args[missing[0]] = args[ignored[0]]
+            ignored = [f"{ignored[0]} (used as {missing[0]})"]
         limit = 14000 if name == "query_board" else 7000
         try:
             res = _truncate(h(**call_args), limit=limit)
@@ -537,6 +554,13 @@ class ToolBelt:
                 "note": "Each result's `excerpt` is the passage that best matches your query. If it contains the value you need, "
                         "record_fact now with a verbatim quote copied from it; use read_source(source_id, query) for other passages."}
 
+    def find_reference_code(self, part: str, vendor: str = "") -> Dict[str, Any]:
+        from embedforge.truth.refcode import find_reference_code
+        res = find_reference_code(self.store, part, vendor)
+        for s in res.get("sources") or []:
+            self.session.emit("source", source_id=s["source_id"], title=s["url"].rsplit("/", 1)[-1], url=s["url"], tier=s["tier"], chars=s["chars"])
+        return res
+
     def fetch_document(self, url: str) -> Dict[str, Any]:
         if not str(url).lower().startswith(("http://", "https://")):
             board_sid = self.store._by_url.get(eda.BOARD_SOURCE_URL)
@@ -663,6 +687,12 @@ class ToolBelt:
             line = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(item.get("line") or "").strip())
             m = self._BOARD_LINE.match(line)
             g = re.search(r"(?<![A-Z0-9])(?:GPIO(\d+)|P([A-K])(\d{1,2}))(?![0-9])", m.group(3).upper()) if m else None
+            subject = m.group(1) if m else ""
+            if m and not g:
+                # a device-side line ('U3 pin 2 (SCK) -> net I2C_SCL -> ..., U1.17 (GPIO17)'): the MCU end names the pin
+                far = re.search(r"\b([A-Z]+\d+)\.\d+ \((?:GPIO(\d+)|P([A-K])(\d{1,2}))\)", line[m.end():].upper())
+                if far:
+                    subject, g = far.group(1), re.search(r"(?:GPIO(\d+)|P([A-K])(\d{1,2}))", far.group(0))
             why = ("give `define` (e.g. 'GYRO_1_CS_PIN')" if not label else
                    f"`define` must be a pin define name like 'MOTOR1_PIN', not '{define}'" if define and not self._DEFINE_NAME.match(define) else
                    "`line` must start like 'U1 pin 21 (GPIO14) -> …' (a pin line of a part, copied exactly)" if not m else
@@ -674,7 +704,7 @@ class ToolBelt:
                 continue
             value = f"GPIO{int(g.group(1))}" if g.group(1) else f"P{g.group(2)}{int(g.group(3))}"
             prop = define or (f"{fn}_pin" if not fn.endswith("_pin") else fn)
-            clash = next((f for f in self.ledger.facts.values() if f.subject == m.group(1) and f.property.upper() == prop.upper()
+            clash = next((f for f in self.ledger.facts.values() if f.subject == subject and f.property.upper() == prop.upper()
                           and str(f.value).upper() != value), None)
             if clash and item.get("replace") in (True, "true", "True", 1):
                 self.ledger.retire(clash.id, f"{prop} re-recorded as {value} from: {line}")
@@ -684,7 +714,7 @@ class ToolBelt:
                                  f"has one pin. If {clash.id} was bound to the wrong define, repeat this item with replace: true "
                                  f"to retire it."})
                 continue
-            res = self.ledger.record(m.group(1), prop, value, sid, line)
+            res = self.ledger.record(subject, prop, value, sid, line)
             if not res.get("ok"):
                 rejected.append({"define": label, "error": str(res.get("error"))[:200]})
                 continue

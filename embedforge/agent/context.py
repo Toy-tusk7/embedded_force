@@ -379,7 +379,7 @@ def driver_plan(project: Any, facts: List[Any], request: str) -> str:
         todo.append("record_layouts: every multi-byte value (calibration coefficients, raw readings), bytes least significant first")
     if not book.formulas:
         todo.append("record_formula: every conversion (coefficient scaling, compensation). If the PDF formulas are garbled, "
-                    "fetch the manufacturer's reference code (github.com/<vendor>) and quote that")
+                    "find_reference_code('<part>') stores the manufacturer's reference driver: quote its C code")
     if not SequenceBook(project.root).items:
         todo.append("record_sequence: the init order (reset, wait, calibration read, configuration) with write steps as "
                     "{op:'write', reg:FACT, fields:{...}}")

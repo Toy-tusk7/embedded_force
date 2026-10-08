@@ -257,6 +257,19 @@ def test_record_board_pins_takes_values_from_verbatim_lines(project):
     assert "one define has one pin" in clash["rejected"][0]["error"]
 
 
+def test_device_side_board_line_records_the_mcu_pin(project):
+    store = SourceStore(project.root)
+    store.add("user://board", "Board connectivity (fc)",
+              BOARD_REPORT + "U3 pin 2 (SCK) -> net I2C_SCL -> SCL.1, U1.17 (GPIO17)\n", kind="schematic", replace=True)
+    belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
+    res = belt.record_board_pins([{"define": "BARO_SCL_PIN", "line": "U3 pin 2 (SCK) -> net I2C_SCL -> SCL.1, U1.17 (GPIO17)"}])
+    fact = next(f for f in belt.ledger.facts.values() if f.property == "BARO_SCL_PIN")
+    assert res["ok"] and fact.subject == "U1" and fact.value == "GPIO17", res
+    # a single argument under another name is used for the one the tool is missing
+    r = belt.call("list_files", {"prefix": "src"})
+    assert "files" in r and r["ignored_args"] == ["prefix (used as path)"], r
+
+
 def test_record_board_pins_tags_matching_config_lines_only(project):
     _bf_project(project)
     belt = _board_belt(project)
