@@ -51,6 +51,13 @@ _LOCK = threading.Lock()
 
 
 def _extract_pdf_text(data: bytes) -> str:
+    try:   # Markdown for the datasheet analyzer when PyMuPDF/pymupdf4llm are installed
+        from embedforge.truth.pdf_markdown import pdf_to_markdown
+        md = pdf_to_markdown(data)
+        if md and md.strip():
+            return md
+    except Exception:
+        pass
     try:
         import pypdf
         reader = pypdf.PdfReader(io.BytesIO(data))
@@ -522,7 +529,7 @@ def chat(project_id: str, req: ChatRequest):
     if not msg:
         raise HTTPException(status_code=400, detail="Empty message")
     if not config.has_llm:
-        raise HTTPException(status_code=503, detail="No LLM provider configured (set NEBIUS_API_KEY or NVIDIA_API_KEY)")
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set ANTHROPIC_API_KEY, NEBIUS_API_KEY or NVIDIA_API_KEY)")
     if req.attachments:
         msg += f"\n\n[User uploaded attachments: {', '.join(req.attachments)}]"
     return _start_run(project_id, msg)
@@ -542,7 +549,7 @@ def debug(project_id: str, req: DebugRequest):
     parts.append("Diagnose using the existing project and ledger, research the datasheet/errata as needed, "
                  "fix the firmware if it is a software cause, rebuild and verify; otherwise tell me exactly what to check.")
     if not config.has_llm:
-        raise HTTPException(status_code=503, detail="No LLM provider configured (set NEBIUS_API_KEY or NVIDIA_API_KEY)")
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set ANTHROPIC_API_KEY, NEBIUS_API_KEY or NVIDIA_API_KEY)")
     return _start_run(project_id, "\n".join(parts))
 
 

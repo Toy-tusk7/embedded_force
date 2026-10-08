@@ -122,6 +122,9 @@ source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
 
 # Install EmbedForge in editable mode
 pip install -e .
+
+# Optional: datasheet PDFs -> Markdown (headings, tables, reconstructed equations; PyMuPDF is AGPL-3.0)
+pip install -e ".[pdf]"
 ```
 
 ### Environment Configuration
@@ -129,6 +132,10 @@ pip install -e .
 Copy `.env.example` to `.env` and fill in your keys (`.env` is git-ignored — never commit it):
 
 ```ini
+# Claude API (Anthropic): when set, runs use Claude instead of Nemotron
+ANTHROPIC_API_KEY=
+# EMBEDFORGE_PROVIDER=anthropic   # or nebius / nvidia, to force one provider
+
 # Nebius AI Cloud / Token Factory
 NEBIUS_API_KEY=your_nebius_api_key_here
 NEBIUS_BASE_URL=https://api.studio.nebius.ai/v1

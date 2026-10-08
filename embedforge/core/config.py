@@ -34,6 +34,20 @@ class EmbedForgeConfig(BaseModel):
     nvidia_base_url: str = Field(
         default_factory=lambda: os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     )
+    # Anthropic Claude API (the SDK also reads ANTHROPIC_API_KEY itself; ANTHROPIC_AUTH_TOKEN works too)
+    anthropic_api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
+    )
+    anthropic_model: str = Field(
+        default_factory=lambda: os.getenv("EMBEDFORGE_ANTHROPIC_MODEL", "claude-opus-5-5")
+    )
+    anthropic_effort: str = Field(   # low | medium | high | xhigh | max (Claude Opus 5.5 defaults to medium)
+        default_factory=lambda: os.getenv("EMBEDFORGE_EFFORT", "high")
+    )
+    # Force one provider for every run: anthropic | nebius | nvidia (empty: Claude when configured, else Nebius/NVIDIA)
+    llm_provider: str = Field(
+        default_factory=lambda: os.getenv("EMBEDFORGE_PROVIDER", "").strip().lower()
+    )
     agent_max_steps: int = Field(
         default_factory=lambda: int(os.getenv("EMBEDFORGE_MAX_STEPS", "60"))
     )
@@ -60,8 +74,12 @@ class EmbedForgeConfig(BaseModel):
         return bool(self.nvidia_api_key and self.nvidia_api_key.strip())
 
     @property
+    def has_anthropic(self) -> bool:
+        return bool(self.anthropic_api_key and self.anthropic_api_key.strip())
+
+    @property
     def has_llm(self) -> bool:
-        return self.has_nebius or self.has_nvidia
+        return self.has_anthropic or self.has_nebius or self.has_nvidia
 
     @property
     def has_tavily(self) -> bool:

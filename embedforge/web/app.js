@@ -1052,7 +1052,7 @@
       const c = await api('/api/config');
       S.config = c;
       const set = (id, ok, title) => { const el = $(id); el.classList.toggle('ok', !!ok); el.classList.toggle('bad', !ok); el.title = title; };
-      set('#svc-llm', c.llm_active, c.llm_active ? `LLM provider configured (${c.default_provider})` : 'No LLM key — set NEBIUS_API_KEY or NVIDIA_API_KEY');
+      set('#svc-llm', c.llm_active, c.llm_active ? `LLM provider configured (${c.default_provider})` : 'No LLM key — set ANTHROPIC_API_KEY, NEBIUS_API_KEY or NVIDIA_API_KEY');
       set('#svc-tavily', c.tavily_active, c.tavily_active ? 'Tavily search configured' : 'TAVILY_API_KEY missing');
       set('#svc-pio', c.platformio_available, 'PlatformIO: ' + ((c.toolchains || []).join(', ') || 'SDKs download per project'));
     } catch (_) {}

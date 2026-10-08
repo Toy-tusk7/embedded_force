@@ -1,4 +1,6 @@
-"""Tool-calling LLM client for OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM) used by the agent loop."""
+"""Tool-calling LLM client used by the agent loop: the Anthropic Claude API (Messages API, official SDK) and
+OpenAI-compatible providers (Nebius Token Factory, NVIDIA NIM). The loop speaks one message format (OpenAI-style
+role/content/tool_calls); the Claude path translates it to and from the Messages API."""
 
 import json
 import os
@@ -32,13 +34,30 @@ class Provider:
 
 def providers() -> Dict[str, Provider]:
     return {
+        "anthropic": Provider("anthropic", "Anthropic Claude API", "https://api.anthropic.com", config.anthropic_api_key),
         "nebius": Provider("nebius", "Nebius Token Factory", config.nebius_base_url.rstrip("/"), config.nebius_api_key),
         "nvidia": Provider("nvidia", "NVIDIA API (NIM)", config.nvidia_base_url.rstrip("/"), config.nvidia_api_key),
     }
 
 
 def default_provider() -> str:
+    """EMBEDFORGE_PROVIDER if set; otherwise Claude when its key is configured, then Nebius, then NVIDIA."""
+    if config.llm_provider in providers():
+        return config.llm_provider
+    if config.has_anthropic:
+        return "anthropic"
     return "nebius" if config.has_nebius or not config.has_nvidia else "nvidia"
+
+
+def resolve_provider(requested: Optional[str]) -> str:
+    """The provider a run uses: a forced EMBEDFORGE_PROVIDER wins; a project's saved choice is kept only while that
+    provider is configured and Claude is not (Claude, when configured, replaces Nemotron for now)."""
+    if config.llm_provider in providers():
+        return config.llm_provider
+    if config.has_anthropic:
+        return "anthropic"
+    p = providers().get(requested or "")
+    return requested if p is not None and p.configured else default_provider()
 
 
 # ------------------------------------------------------------------ model catalogue
@@ -74,6 +93,17 @@ def list_models(provider_id: str, force: bool = False) -> Dict[str, Any]:
         hit = _MODEL_CACHE.get(provider_id)
         if hit and not force and time.time() - hit["t"] < _MODEL_CACHE_TTL:
             return hit["v"]
+    if provider_id == "anthropic":
+        try:
+            import anthropic
+            ids = sorted({m.id for m in anthropic.Anthropic(api_key=p.api_key).models.list()})
+            out = {"provider": provider_id, "error": "",
+                   "models": [{"id": i, "provider": provider_id, "family": "anthropic", "nvidia": False, "size": "", "label": i} for i in ids]}
+        except Exception as e:
+            out = {"provider": provider_id, "models": [], "error": f"{type(e).__name__}: {str(e)[:200]}"}
+        with _MODEL_CACHE_LOCK:
+            _MODEL_CACHE[provider_id] = {"t": time.time(), "v": out}
+        return out
     try:
         with httpx.Client(timeout=20.0) as c:
             r = c.get(f"{p.base_url}/models", headers={"Authorization": f"Bearer {p.api_key}"})
@@ -91,12 +121,16 @@ def list_models(provider_id: str, force: bool = False) -> Dict[str, Any]:
 
 class AgentLLM:
     def __init__(self, model: Optional[str] = None, provider: Optional[str] = None):
-        pid = provider or default_provider()
+        pid = resolve_provider(provider)
         p = providers().get(pid)
         if p is None:
             raise LLMError(f"Unknown LLM provider '{pid}'.")
         self.provider = p
-        self.model = model or config.agent_model
+        if pid == "anthropic":
+            # a project saved with a Nemotron model keeps working: Claude runs with its own default model
+            self.model = model if model and model.startswith("claude-") else config.anthropic_model
+        else:
+            self.model = model if model and not model.startswith("claude-") else config.agent_model
         self.base_url = p.base_url
         self.api_key = p.api_key
 
@@ -104,6 +138,8 @@ class AgentLLM:
         """Nemotron reasoning models loop and repeat when run near-greedy. The Nemotron 3 model card samples at
         temperature 1.0 / top_p 0.95; older Nemotron reasoning models at 0.6 / 0.95. Other models keep a low temperature.
         EMBEDFORGE_TEMPERATURE / EMBEDFORGE_TOP_P override."""
+        if self.provider.id == "anthropic":
+            return {}   # Claude's current models take no sampling parameters (effort and adaptive thinking instead)
         mid = self.model.lower()
         nemotron = "nemotron" in mid
         default_t = (1.0 if re.search(r"nemotron-?3", mid) else 0.6) if nemotron else 0.1
@@ -128,6 +164,8 @@ class AgentLLM:
     ) -> Dict[str, Any]:
         if not self.api_key:
             raise LLMError(f"{self.provider.name} API key is not configured; the agent cannot reason without an LLM.")
+        if self.provider.id == "anthropic":
+            return self._chat_anthropic(messages, tools, max_tokens)
         payload: Dict[str, Any] = {"model": self.model, "messages": messages,
                                    "max_tokens": max_tokens or self.default_max_tokens(), **self.sampling()}
         if temperature is not None:
@@ -178,6 +216,170 @@ class AgentLLM:
                 time.sleep(min(2 ** attempt * 1.5, 20))
         logger.log_event("LLM_ERROR", f"gave up after {retries} attempts: {last}")
         raise LLMError(f"LLM unavailable after {retries} attempts: {last}")
+
+
+    # ------------------------------------------------------------------ Claude (Messages API)
+    _STATE_MARK = "PROJECT STATE"
+
+    def _chat_anthropic(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]],
+                        max_tokens: Optional[int]) -> Dict[str, Any]:
+        """One agent step on Claude. The harness rebuilds its context every step (a fresh state block, digests of old
+        tool results), so the history is not append-only: thinking blocks are never replayed (preserved thinking would
+        reject an edited history), the stable system prompt and the tools are prompt-cached, and the per-step state
+        block follows the cache breakpoint."""
+        import anthropic
+
+        system, msgs = to_anthropic_messages(messages)
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens or int(os.getenv("EMBEDFORGE_MAX_TOKENS") or 32000),
+            "system": system,
+            "messages": msgs,
+            "thinking": {"type": "adaptive", "display": "summarized"},   # summaries feed the UI's reasoning panel
+            "output_config": {"effort": config.anthropic_effort},
+            # on a safety decline the API re-runs the request on a fallback model it picks by refusal category
+            "betas": ["server-side-fallback-2026-07-01"],
+            "fallbacks": "default",
+        }
+        if tools:
+            kwargs["tools"] = to_anthropic_tools(tools)
+        client = anthropic.Anthropic(api_key=self.api_key, max_retries=4)
+        try:
+            with client.beta.messages.stream(**kwargs) as stream:   # streaming: long turns never hit HTTP timeouts
+                msg = stream.get_final_message()
+        except anthropic.AuthenticationError as e:
+            raise LLMError(f"Claude API key rejected: {e.message}")
+        except anthropic.PermissionDeniedError as e:
+            raise LLMError(f"Claude API permission denied: {e.message}")
+        except anthropic.BadRequestError as e:
+            raise LLMError(f"Claude API rejected the request ({self.model}): {e.message}")
+        except anthropic.RateLimitError as e:
+            raise LLMError(f"Claude API rate limit (after retries): {e.message}")
+        except anthropic.APIStatusError as e:
+            raise LLMError(f"Claude API error HTTP {e.status_code}: {e.message}")
+        except anthropic.APIConnectionError as e:
+            raise LLMError(f"Claude API unreachable: {e}")
+        return from_anthropic_message(msg)
+
+
+def to_anthropic_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OpenAI function specs -> Claude tool definitions (cached together with the system prompt, which renders after them)."""
+    out = []
+    for t in tools:
+        fn = t.get("function") or t
+        schema = dict(fn.get("parameters") or {"type": "object", "properties": {}})
+        schema.setdefault("type", "object")
+        out.append({"name": fn["name"], "description": fn.get("description", ""), "input_schema": schema})
+    return out
+
+
+def _tool_id(raw: Any) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", str(raw or "call"))[:64]
+
+
+def to_anthropic_messages(messages: List[Dict[str, Any]]):
+    """OpenAI-style history -> (system blocks, Claude messages). Tool calls become tool_use blocks, tool results are
+    gathered into one user message, consecutive same-role turns are merged and empty turns dropped."""
+    system_text = "\n\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "system")
+    cut = system_text.find(AgentLLM._STATE_MARK)
+    stable, state = (system_text[:cut], system_text[cut:]) if cut > 0 else (system_text, "")
+    system: List[Dict[str, Any]] = [{"type": "text", "text": stable.strip() or "You are EmbedForge.", "cache_control": {"type": "ephemeral"}}]
+    if state.strip():
+        system.append({"type": "text", "text": state.strip()})
+    out: List[Dict[str, Any]] = []
+
+    def push(role: str, blocks: List[Dict[str, Any]]) -> None:
+        if not blocks:
+            return
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": list(blocks)})
+
+    pending_tool_ids: set = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            continue
+        if role == "assistant":
+            blocks: List[Dict[str, Any]] = []
+            text = str(m.get("content") or "").strip()
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                try:
+                    args = parse_tool_args(fn.get("arguments"))
+                except ValueError:
+                    args = {}
+                tid = _tool_id(tc.get("id"))
+                pending_tool_ids.add(tid)
+                blocks.append({"type": "tool_use", "id": tid, "name": fn.get("name") or "unknown", "input": args})
+            push("assistant", blocks)
+        elif role == "tool":
+            tid = _tool_id(m.get("tool_call_id"))
+            if tid not in pending_tool_ids:
+                continue   # no matching tool_use in the history sent: the API would reject it
+            content = str(m.get("content") or "")
+            push("user", [{"type": "tool_result", "tool_use_id": tid, "content": content or "(empty)",
+                           **({"is_error": True} if content.startswith('{"error"') else {})}])
+        else:
+            text = m.get("content")
+            if isinstance(text, list):
+                push("user", [b if isinstance(b, dict) else {"type": "text", "text": str(b)} for b in text])
+            elif str(text or "").strip():
+                push("user", [{"type": "text", "text": str(text)}])
+    if not out or out[0]["role"] != "user":
+        out.insert(0, {"role": "user", "content": [{"type": "text", "text": "Continue the task."}]})
+    # every tool_use needs its tool_result in the next user turn: answer any that the history lost
+    for i, m in enumerate(out):
+        if m["role"] != "assistant":
+            continue
+        ids = [b["id"] for b in m["content"] if b["type"] == "tool_use"]
+        nxt = out[i + 1] if i + 1 < len(out) else None
+        have = {b.get("tool_use_id") for b in (nxt["content"] if nxt and nxt["role"] == "user" else [])}
+        missing = [x for x in ids if x not in have]
+        if missing:
+            results = [{"type": "tool_result", "tool_use_id": x, "content": "(result not kept in context)"} for x in missing]
+            if nxt and nxt["role"] == "user":
+                nxt["content"][:0] = results
+            else:
+                out.insert(i + 1, {"role": "user", "content": results})
+    return system, out
+
+
+def from_anthropic_message(msg: Any) -> Dict[str, Any]:
+    """A Claude message -> the loop's response shape (content, reasoning, tool_calls, finish_reason, usage)."""
+    texts, thoughts, calls = [], [], []
+    for b in msg.content:
+        t = getattr(b, "type", "")
+        if t == "text":
+            texts.append(b.text)
+        elif t == "thinking":
+            if getattr(b, "thinking", ""):
+                thoughts.append(b.thinking)
+        elif t == "tool_use":
+            calls.append({"id": b.id, "type": "function",
+                          "function": {"name": b.name, "arguments": json.dumps(b.input if isinstance(b.input, dict) else {})}})
+    stop = getattr(msg, "stop_reason", None)
+    content = "\n".join(x for x in texts if x).strip()
+    if stop == "max_tokens":
+        calls = []   # a tool input cut off at the token limit parses as a partial object: never run it
+    if stop == "refusal":
+        details = getattr(msg, "stop_details", None)
+        cat = getattr(details, "category", None) if details else None
+        calls = []   # a declined turn's tool calls may be cut off mid-input: never run them
+        content = (content + "\n\n" if content else "") + f"[The model declined this request{f' ({cat})' if cat else ''}.]"
+    u = getattr(msg, "usage", None)
+    cached = (getattr(u, "cache_read_input_tokens", 0) or 0) if u else 0
+    created = (getattr(u, "cache_creation_input_tokens", 0) or 0) if u else 0
+    usage = {"prompt_tokens": ((getattr(u, "input_tokens", 0) or 0) + cached + created) if u else 0,
+             "completion_tokens": (getattr(u, "output_tokens", 0) or 0) if u else 0,
+             "cache_read_input_tokens": cached, "cache_creation_input_tokens": created}
+    finish = {"end_turn": "stop", "tool_use": "tool_calls", "max_tokens": "length", "stop_sequence": "stop",
+              "pause_turn": "stop", "refusal": "refusal"}.get(stop or "", stop)
+    return {"content": content, "reasoning": "\n\n".join(thoughts).strip(), "tool_calls": calls,
+            "finish_reason": finish, "usage": usage}
 
 
 def parse_tool_args(raw: Any) -> Dict[str, Any]:
