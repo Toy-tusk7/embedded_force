@@ -177,6 +177,16 @@ def test_correct_driver_has_no_meaning_errors(tmp_path):
     assert any("PWR_CTRL (0x1B) <- 0x33: mode=3 (normal), temp_en=1, press_en=1" in w for w in summary["writes"]), summary["writes"]
 
 
+def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+    book = RegisterBook(p.root)
+    reg = book.register_at(0x00)
+    reg.id_value = None   # recorded without id_value: the probe must still get past `if (id != 0x50) return;`
+    book._save()
+    summary, codes, found = _codes(p, ledger)
+    assert codes == [] and all("matches the code" in s for s in summary["formulas"]), summary["formulas"]
+
+
 @pytest.mark.parametrize("code, expected", [
     (driver(read="uint8_t d[6]; rd(REG_DATA, d, 6); uint32_t ut = ((uint32_t)d[3] << 16) | ((uint32_t)d[4] << 8) | d[5];"), "LAYOUT_SHIFT"),
     (driver(read="uint8_t d[3]; rd(0x07, d, 3); uint32_t ut = ((uint32_t)d[2] << 16) | ((uint32_t)d[1] << 8) | d[0];"), "REG_BURST_SPLIT"),

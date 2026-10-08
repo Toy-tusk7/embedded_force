@@ -1028,9 +1028,14 @@ def _device_addrs(ledger: Optional[FactLedger], device: str) -> set:
     return out
 
 
-def _probe_vector(book: RegisterBook, seed: int) -> Dict[int, int]:
+def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int]] = None) -> Dict[int, int]:
+    """Register bytes for a probe run: random layout bytes, ID registers at their ID (recorded, or the constant the code
+    compares them with), status flags 'ready', error flags clear."""
     rnd = random.Random(seed)
     vec: Dict[int, int] = {}
+    for r in book.registers.values():
+        if r.id_value is None and re.search(r"id|who_?am_?i", r.name, re.I) and (expects or {}).get(r.addr) is not None:
+            vec[r.addr] = expects[r.addr] & 0xFF
     for l in book.layouts.values():
         for p in l.parts:
             vec.setdefault(p.addr, rnd.randrange(256))
@@ -1198,8 +1203,9 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         detail: Dict[str, str] = {}
         loc: Dict[str, Tuple[str, int]] = {}
         read_regs: set = set()
+        expects = {rx.reg: c for _, w in walkers for rx, c, _f, _l in w.obs_compares}
         for seed in (1, 2):
-            vec = _probe_vector(book, seed)
+            vec = _probe_vector(book, seed, expects)
             expected = evaluate_formulas(book, vec)
             observed: List[Tuple[Any, str, str]] = []
             for entries, _ in walkers:

@@ -1276,6 +1276,7 @@ class Walker:
         self._rxq: Dict[str, List[Any]] = {}                # Arduino Wire: bytes waiting for Wire.read()
         self.obs_shifts: List[Tuple[RxByte, int, str, int]] = []  # (read byte, left shift, file, line): how bytes are assembled
         self.obs_masks: List[Tuple[RxByte, int, str, int]] = []   # (read byte, mask, file, line): which bits are tested
+        self.obs_compares: List[Tuple[RxByte, int, str, int]] = []   # (read byte, constant, file, line): == / != tests
         self.outputs: List[Tuple[Any, int]] = []            # numbers the code prints (Serial.print, printf, ...)
         self.globals: Dict[str, Any] = {}                   # file-scope variables written during the walk
         self.values: List[Tuple[Any, str, str]] = []        # probe mode: every number the code computes (value, file:line, where)
@@ -1865,6 +1866,9 @@ class Walker:
 
     def observe(self, op: str, a: Any, b: Any, file: str, line: int) -> None:
         """How the code uses bytes read from registers: shifts (assembling multi-byte values) and masks (testing bits)."""
+        if op in ("==", "!=") and (isinstance(a, RxByte) and is_int(b) or isinstance(b, RxByte) and is_int(a)):
+            rx_, c = (a, b) if isinstance(a, RxByte) else (b, a)
+            self.obs_compares.append((rx_, c, file, line))   # e.g. chip_id != 0x50: the value the code expects
         if op == "<<" and isinstance(a, RxByte) and is_int(b):
             self.obs_shifts.append((a, b, file, line))
         elif op == "&" and (isinstance(a, RxByte) and is_int(b) or isinstance(b, RxByte) and is_int(a)):
