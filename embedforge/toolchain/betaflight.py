@@ -599,6 +599,11 @@ def _build(project_dir: Path, on_line: LineSink, timeout_s: int, board_hint: str
                     res.artifacts[ext] = str(dst)
                 except OSError as e:
                     res.error = f"Built, but could not copy {wpath}: {e}"
+        if "hex" not in res.artifacts and "elf" in res.artifacts:  # RP2350 builds make .uf2/.elf; derive the .hex
+            from embedforge.toolchain.fwformat import elf_to_hex
+            hex_path = Path(res.artifacts["elf"]).with_suffix(".hex")
+            if elf_to_hex(Path(res.artifacts["elf"]), hex_path):
+                res.artifacts["hex"] = str(hex_path)
         if not res.artifacts:
             res.ok = False
             res.error = res.error or "Build finished but no firmware files were found in obj/."

@@ -366,8 +366,9 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 1500) ->
             if p.exists():
                 res.artifacts[ext] = str(p)
         if "hex" not in res.artifacts and "elf" in res.artifacts:
+            from embedforge.toolchain.fwformat import elf_to_hex
             hex_path = bdir / "firmware.hex"
-            if make_hex(Path(res.artifacts["elf"]), hex_path):
+            if make_hex(Path(res.artifacts["elf"]), hex_path) or elf_to_hex(Path(res.artifacts["elf"]), hex_path):
                 res.artifacts["hex"] = str(hex_path)
         if "hex" not in res.artifacts:
             res.error = "Build succeeded but no .hex could be produced for this target (see .bin/.elf)."

@@ -437,3 +437,43 @@ def test_build_script_isolates_projects_that_share_a_board_name():
     assert s.index("rm -rf obj/main/RP2350B_RP2354B") > guard and s.index("make CONFIG=") > s.index(".embedforge_config_dir")
     assert "rm -f obj/main/betaflight_RP2350B_RP2354B.elf" in s                     # always relink: fresh outputs only
     assert f"obj/betaflight_{betaflight.BF_TAG}_RP2350B_RP2354B.uf2" in s and "obj/*_RP2354B.uf2" not in s
+
+# ------------------------------------------------------------------ firmware formats (.hex from .elf / .uf2)
+def _tiny_elf(segments, entry=0x10000101):
+    import struct as st
+    phoff, n = 52, len(segments)
+    data_off = phoff + 32 * n
+    hdr = b"\x7fELF" + bytes([1, 1, 1]) + bytes(9) + st.pack("<HHIIIIIHHHHHH", 2, 40, 1, entry, phoff, 0, 0, 52, 32, n, 40, 0, 0)
+    ph, body, off = b"", b"", data_off
+    for addr, blob in segments:
+        ph += st.pack("<8I", 1, off, addr, addr, len(blob), len(blob), 5, 4)
+        body += blob
+        off += len(blob)
+    return hdr + ph + body
+
+
+def test_hex_from_elf_round_trips_and_crosses_64k_boundaries():
+    from embedforge.toolchain import fwformat
+    blob = bytes(range(256)) * 300                                   # 76.8 KB: crosses a 64 KB address boundary
+    segs, entry = fwformat.elf_segments(_tiny_elf([(0x1000FFF0, blob), (0x20000000, b"\x01\x02\x03")]))
+    text = fwformat.to_ihex(segs, entry)
+    assert text.startswith(":020000041000") and text.rstrip().endswith(":00000001FF")
+    back, e2 = fwformat.parse_ihex(text)
+    assert back == segs and e2 == entry
+    assert all(len(bytes.fromhex(l[1:])) - 5 <= 16 for l in text.split())          # 16-byte data records
+    bad = text.replace(":10", ":11", 1)
+    with pytest.raises(ValueError):
+        fwformat.parse_ihex(bad)                                                      # checksums are checked
+
+
+def test_uf2_payload_matches_elf_image():
+    import struct as st
+    from embedforge.toolchain import fwformat
+    image = bytes((i * 7) & 0xFF for i in range(600))
+    blocks = b""
+    for i, off in enumerate(range(0, len(image), 256)):
+        chunk = image[off:off + 256]
+        blk = st.pack("<8I", 0x0A324655, 0x9E5D5157, 0x2000, 0x10000000 + off, len(chunk), i, 3, 0xE48BFF59) + chunk
+        blocks += blk.ljust(508, b"\x00") + st.pack("<I", 0x0AB16F30)
+    segs, fam = fwformat.uf2_segments(blocks)
+    assert fam == 0xE48BFF59 and segs == [(0x10000000, image)]
