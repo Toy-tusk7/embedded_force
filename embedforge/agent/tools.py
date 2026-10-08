@@ -984,6 +984,30 @@ class ToolBelt:
                 res = self._register_book().record_formula(self.store, device, alt, name, steps, quote, unit,
                                                            inputs if isinstance(inputs, dict) else None)
                 res["note"] = f"The quote is not in {self._sid(source_id)} but is verbatim in {alt}; recorded with {alt}."
+        unknown = re.search(r"unknown name\(s\) ([\w, ]+)\.", str(res.get("error") or ""))
+        if not res.get("ok") and unknown:
+            # where the stored sources assign those names (a converted coefficient is defined somewhere: quote that)
+            found = []
+            for n in [x.strip() for x in unknown.group(1).split(",") if x.strip()][:3]:
+                hits = []
+                for s in self.store.sources.values():
+                    if s.url.startswith("user://"):
+                        continue
+                    for m in re.finditer(rf"(?:->|\.|\b){re.escape(n)}\s*=(?!=)([^;\n]*)", s.text, re.I):
+                        rhs = m.group(1)
+                        # a computed value (a conversion) ranks before a plain copy of register bytes
+                        score = (2 if re.search(r"[/*]", rhs) else 0) + (1 if re.search(r"\d\.\d|temp_var|pow|<<|>>", rhs) else 0)
+                        a = m.start()
+                        for _ in range(4):   # a few lines of context above (constants such as temp_var = 0.00390625f)
+                            a = s.text.rfind("\n", 0, max(0, a - 1))
+                        b = s.text.find("\n", m.end())
+                        hits.append((-score, s.id, s.text[a + 1:b if b > 0 else m.end() + 200].strip()[:500]))
+                for sc, sid, passage in sorted(hits)[:2]:
+                    found.append({"name": n, "source_id": sid, "passage": passage})
+            if found:
+                res["where_defined"] = found
+                res["hint"] = ("These names are assigned in the stored sources shown: record each as its own record_formula "
+                               "from that passage first (quote it exactly), then this formula.")
         src = self.store.get(self._sid(source_id))
         if not res.get("ok") and src is not None and re.search(r"not verbatim|not in the quote", str(res.get("error"))):
             # the passage the formula comes from, so the model can quote it exactly instead of retyping it
