@@ -89,6 +89,11 @@ def obj_key(v: Any) -> Optional[str]:
         return v.text
     if isinstance(v, Ptr) and v.offset == 0 and len(v.arr.items) == 1 and isinstance(v.arr.items[0], (Sym, Obj)):
         return obj_key(v.arr.items[0])
+    # a pointer into (or an array decaying to its first) struct of an array of structs: p->reg, cfg->reg
+    if isinstance(v, Ptr) and 0 <= v.offset < len(v.arr.items) and isinstance(v.arr.items[v.offset], Obj):
+        return v.arr.items[v.offset].name
+    if isinstance(v, Arr) and v.items and isinstance(v.items[0], Obj):
+        return v.items[0].name
     return None
 
 
@@ -477,6 +482,9 @@ class FlowModel:
         self.unit_macros: Dict[str, Dict[str, Macro]] = {}
         self.unit_consts: Dict[str, Dict[str, List[Tok]]] = {}
         self.unit_arrays: Dict[str, Dict[str, List[Tok]]] = {}
+        self.struct_fields: Dict[str, List[str]] = {}   # struct tag / typedef name -> member names in order
+        self.var_structs: Dict[str, List[str]] = {}     # variable declared with an unnamed struct -> its member names
+        self.global_files: Dict[str, str] = {}          # file-scope variable -> the file that defines it
         self._file = ""
         for name, text in sorted(files.items()):
             self._file = name
@@ -706,7 +714,13 @@ class FlowModel:
                     self._typedef_name(toks, end)
                     kw = next((k2 for k2 in range(i - 1, max(-1, i - 6), -1) if toks[k2].text in ("class", "struct", "union")), None)
                     owner = toks[kw + 1].text if kw is not None and kw + 1 < i and toks[kw + 1].kind == "id" else cls
-                    self._fields(toks[i + 1:end])
+                    members = self._fields(toks[i + 1:end])
+                    if "struct" in head and members:   # field order: struct tag, typedef name, or the variable declared with it
+                        if kw is not None and kw + 1 < i and toks[kw + 1].kind == "id":
+                            self.struct_fields[toks[kw + 1].text] = members
+                        after = toks[end + 1] if end + 1 < n and toks[end + 1].kind == "id" else None
+                        if after is not None:
+                            (self.struct_fields if "typedef" in head else self.var_structs)[after.text] = members
                     # class bodies may contain inline methods: scan inside, as methods of that class
                     self._scan(fname, toks[i + 1:end], owner if "class" in head or "struct" in head else cls)
                     i = end + 1
@@ -781,6 +795,7 @@ class FlowModel:
                             size = decl[lb + 1:rb]
                         self.global_vars[name_tok.text] = (size, part[peq + 1:] if peq < len(part) else None)
                         self.global_types[name_tok.text] = type_name
+                        self.global_files[name_tok.text] = fname
                         if k2 == 0:
                             name_at = next((k3 for k3, x in enumerate(seg) if x is name_tok), 0)
                             seg_type = " ".join(x.text for x in seg[:name_at] if x.text not in ("static", "volatile", "struct"))
@@ -808,9 +823,11 @@ class FlowModel:
                     continue
             i += 1
 
-    def _fields(self, body: List[Tok]) -> None:
-        """Member declarations of a struct/class body (depth 0, not methods): uint16_t par_t1; int8_t a, b; float x[3];"""
+    def _fields(self, body: List[Tok]) -> List[str]:
+        """Member declarations of a struct/class body (depth 0, not methods): uint16_t par_t1; int8_t a, b; float x[3];
+        Returns the member names in declaration order (what a positional initializer { a, b } fills)."""
         seg: List[Tok] = []
+        names: List[str] = []
         depth = 0
         for tk in body:
             if tk.text in ("{", "("):
@@ -818,32 +835,37 @@ class FlowModel:
             elif tk.text in ("}", ")"):
                 depth -= 1
             if depth == 0 and tk.text == ";":
-                self._field_decl(seg)
+                names += self._field_decl(seg)
                 seg = []
             elif depth == 0 and tk.text == ":" and seg and seg[-1].text in ("public", "private", "protected"):
                 seg = []
             elif depth >= 0:
                 seg.append(tk)
-        return None
+        return names
 
-    def _field_decl(self, seg: List[Tok]) -> None:
+    def _field_decl(self, seg: List[Tok]) -> List[str]:
         texts = [x.text for x in seg]
         if not seg or any(x in texts for x in ("(", "{", "typedef", "using", "friend", "enum", "return")):
-            return
+            return []
         parts = _split_args(seg)
         first = parts[0]
         cut = next((k for k, x in enumerate(first) if x.text in ("[", "=", ":")), len(first))
         if cut < 2 or first[cut - 1].kind != "id":
-            return
+            return []
         type_text = " ".join(x.text for x in first[:cut - 1] if x.text not in ("static", "volatile", "const", "mutable", "struct", "union"))
         if not type_text:
-            return
+            return []
         names = [first[cut - 1].text] + [next((x.text for x in p if x.kind == "id"), "") for p in parts[1:]]
         for nm in names:
             if not nm:
                 continue
             prev = self.field_types.get(nm, type_text)
             self.field_types[nm] = type_text if prev == type_text else None   # same name, different types: unknown
+        return [nm for nm in names if nm]
+
+    def struct_of(self, type_text: str) -> Optional[List[str]]:
+        """Member names, in order, of the struct type named in a declaration's type ('const reg_val_t', 'struct cfg')."""
+        return next((self.struct_fields[w] for w in type_text.split() if w in self.struct_fields), None)
 
     @staticmethod
     def _ctor_params_end(toks: List[Tok], name_i: int) -> Optional[int]:
@@ -1280,8 +1302,15 @@ class Evaluator:
                 end = _match(self.toks, self.i)
                 inner = self.toks[start + 1:end]
                 self.i = end + 1
+                # sizes are counted in elements of the array they measure, so sizeof(a) / sizeof(a[0]) is a's length
+                if len(inner) >= 4 and inner[0].kind == "id" and inner[1].text == "[" and _match(inner, 1, "[", "]") == len(inner) - 1:
+                    arr = self.env.get(inner[0].text)
+                    if isinstance(arr, Arr) or inner[0].text in self.m.global_vars or inner[0].text in self.m.global_arrays:
+                        return 1
                 if len(inner) == 1 and inner[0].kind == "id":
                     v = self.env.get(inner[0].text)
+                    if v is None and self.w is not None and inner[0].text in self.m.global_vars:
+                        v = self.w.global_value(inner[0].text)
                     if isinstance(v, Arr):
                         return len(v.items)
                     name = inner[0].text
@@ -1300,6 +1329,12 @@ class Evaluator:
                     if name in ("uint32_t", "int32_t", "int", "float"):
                         return 4
                 return Sym("sizeof")
+            nxt, br = self._peek(), self._peek(1)
+            if nxt is not None and nxt.kind == "id" and br is not None and br.text == "[":   # sizeof a[0]: one element
+                end = _match(self.toks, self.i + 1, "[", "]")
+                if isinstance(self.env.get(nxt.text), Arr) or nxt.text in self.m.global_vars or nxt.text in self.m.global_arrays:
+                    self.i = end + 1
+                    return 1
             v = self._unary()
             return len(v.items) if isinstance(v, Arr) else Sym("sizeof")
         if t.text == "(":
@@ -1541,8 +1576,12 @@ class Walker:
         """A file-scope variable: zero-initialised (as C does) or from its initializer, created on first use."""
         if name not in self.globals:
             size_toks, init_toks = self.m.global_vars[name]
-            if init_toks:
-                v = Evaluator(self.m, {}, (), None).eval(init_toks)
+            file = self.m.global_files.get(name, "")
+            members = self.m.var_structs.get(name) or self.m.struct_of(self.m.global_type_text.get(name, ""))
+            if init_toks and members and init_toks[0].text == "{":
+                v = self.struct_value(name, members, init_toks, size_toks is not None, file)
+            elif init_toks:
+                v = Evaluator(self.m, {}, (), None, True, file).eval(init_toks)
                 v = Arr(list(v.items)) if isinstance(v, Arr) else v
             elif size_toks is not None:
                 size = Evaluator(self.m, {}, (), None).eval(size_toks) if size_toks else 0
@@ -1552,6 +1591,35 @@ class Walker:
                 v = Obj(name) if kind is None else (0.0 if kind[0] == "float" else 0)
             self.globals[name] = v
         return self.globals[name]
+
+    def struct_value(self, key: str, members: List[str], init: List[Tok], is_array: bool, file: str,
+                     env: Optional[Dict[str, Any]] = None, chain: Tuple[str, ...] = ()) -> Any:
+        """A struct (or array of structs) from its brace initializer: positional `{reg, val}` and designated
+        `{ .addr = 0x76 }` members; members it does not name are 0, as in C. Each struct is an Obj whose fields the walk
+        tracks (`cfg[1].val`, `dev.addr`)."""
+        if not init or init[0].text != "{":
+            return Evaluator(self.m, env or {}, chain, self, True, file).eval(init)
+        inner = init[1:_match(init, 0, "{", "}")]
+        if is_array:
+            items = [x for x in _split_args(inner) if x]
+            return Arr([self.struct_value(f"{key}[{k}]", members, item, False, file, env, chain) for k, item in enumerate(items)])
+        for m in members:
+            self.fields[(key, m)] = 0
+        pos = 0
+        for item in _split_args(inner):
+            if not item:
+                continue
+            if len(item) >= 4 and item[0].text == "." and item[1].kind == "id" and item[2].text == "=":
+                member, expr = item[1].text, item[3:]
+                pos = members.index(member) + 1 if member in members else pos
+            elif pos < len(members):
+                member, expr = members[pos], item
+                pos += 1
+            else:
+                break
+            v = Evaluator(self.m, env or {}, chain, self, True, file).eval(expr)
+            self.fields[(key, member)] = c_convert(self.m.field_types.get(member) or "", v)
+        return Obj(key)
 
     def this(self) -> Optional[Tuple[Any, str]]:
         return self._this[-1] if self._this else None
@@ -1878,14 +1946,20 @@ class Walker:
         """Declarations and expressions: track local variables and buffers, and evaluate calls in order."""
         if not toks:
             return
+        parts = _split_args(toks)
+        if len(parts) > 1 and not self._is_decl(toks):   # comma expression (a loop step 'i++, p++'): each part in order
+            for part in parts:
+                self._expr_stmt(part, env, chain, guaranteed, file)
+            return
         texts = [t.text for t in toks]
-        # i++ / ++i / i-- / --i as a statement (loop steps)
+        # i++ / ++i / i-- / --i as a statement (loop steps); a pointer steps to the next element
         if len(toks) == 2 and ("++" in texts or "--" in texts):
             name_tok = toks[0] if toks[1].text in ("++", "--") else toks[1]
             op = toks[1].text if toks[1].text in ("++", "--") else toks[0].text
             if name_tok.kind == "id":
                 cur = Evaluator(self.m, env, chain, self, guaranteed, file).eval([name_tok])
-                self._assign([name_tok], (cur + (1 if op == "++" else -1)) if isinstance(cur, (int, float)) else Sym(name_tok.text), env, chain, guaranteed, file)
+                nxt = Evaluator._binop("+" if op == "++" else "-", cur, 1) if isinstance(cur, (int, float, Ptr)) else Sym(name_tok.text)
+                self._assign([name_tok], nxt, env, chain, guaranteed, file)
                 return
         ev = Evaluator(self.m, env, chain, self, guaranteed, file)
         # declarations:  [qualifiers] type name [N] = init , name2 = init2 ;
@@ -1893,7 +1967,8 @@ class Walker:
             decl_start = self._decl_names_start(toks)
             decl_type = " ".join(x.text for x in toks[:decl_start] if x.text not in ("static", "const", "volatile", "register", "constexpr", "struct"))
             fn_name = chain[-1] if chain else ""
-            for part in _split_args(toks[decl_start:]):
+            type_ptr = any(x.text == "*" for x in toks[:decl_start])   # 'uint8_t *p = ...': the '*' ends up in the type part
+            for n_part, part in enumerate(_split_args(toks[decl_start:])):
                 if not part:
                     continue
                 pt = [x.text for x in part]
@@ -1901,9 +1976,14 @@ class Walker:
                 if name_tok is None:
                     continue
                 name = name_tok.text
-                ptr_decl = "*" in pt[:pt.index(name)] if name in pt else False
+                ptr_decl = ("*" in pt[:pt.index(name)] if name in pt else False) or (type_ptr and n_part == 0)
                 if not ptr_decl:
                     self._ltypes[(fn_name, name)] = decl_type
+                members = self.m.struct_of(decl_type) if not ptr_decl else None
+                if "=" in pt and members and pt[pt.index("=") + 1:pt.index("=") + 2] == ["{"]:
+                    eq = pt.index("=")   # a struct, or an array of structs, from a brace initializer
+                    env[name] = self.struct_value(name, members, part[eq + 1:], "[" in pt[:eq], file, env, chain)
+                    continue
                 if "=" in pt:
                     eq = pt.index("=")
                     val = Evaluator(self.m, env, chain, self, guaranteed, file).eval(part[eq + 1:])
@@ -2013,7 +2093,8 @@ class Walker:
         if k >= len(toks) or toks[k].kind != "id":
             return False
         first = toks[k].text
-        is_type = first in _TYPE_WORDS or bool(_TYPE_RE.match(first)) or first in self.m.types or first.endswith("_t")
+        is_type = (first in _TYPE_WORDS or bool(_TYPE_RE.match(first)) or first in self.m.types or first.endswith("_t")
+                   or (k >= 1 and toks[k - 1].text == "struct" and first in self.m.struct_fields))
         if not is_type:
             return False
         rest = toks[k + 1:]

@@ -405,6 +405,70 @@ IDIOMS: Dict[str, Tuple[str, List[Tuple[str, str]], List[Tuple[str, str, str, st
           "vTaskDelay((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1);", "vTaskDelay(pdMS_TO_TICKS(ms) + 1);")]),
     "two_files_same_names": ("pico_i2c", [
         ("#define DM388_ADDR 0x76   /* @F(addr)@ */", "#define DEV 0x76   /* @F(addr)@ */\n#define DM388_ADDR DEV")], []),
+    "init_table": ("pico_i2c", [
+        ("    write_reg(DM388_OSR_REG, DM388_OSR_VALUE);\n    write_reg(DM388_ODR_REG, DM388_ODR_VALUE);\n" + _PWR_WRITE,
+         "    for (size_t i = 0; i < sizeof(dm388_config) / sizeof(dm388_config[0]); i++) {\n"
+         "        write_reg(dm388_config[i].reg, dm388_config[i].val);\n    }\n"),
+        ("int dm388_init(void) {",
+         "static const struct { uint8_t reg; uint8_t val; } dm388_config[] = {\n"
+         "    {DM388_OSR_REG, DM388_OSR_VALUE},\n    {DM388_ODR_REG, DM388_ODR_VALUE},\n    {DM388_PWR_REG, DM388_PWR_NORMAL},\n};\n\n"
+         "int dm388_init(void) {")],
+        [("table_order", "the table enables the measurement before configuring OSR",
+          "    {DM388_OSR_REG, DM388_OSR_VALUE},\n    {DM388_ODR_REG, DM388_ODR_VALUE},\n    {DM388_PWR_REG, DM388_PWR_NORMAL},\n",
+          "    {DM388_PWR_REG, DM388_PWR_NORMAL},\n    {DM388_OSR_REG, DM388_OSR_VALUE},\n    {DM388_ODR_REG, DM388_ODR_VALUE},\n"),
+         ("table_short_loop", "the loop stops before the last table entry",
+          "i < sizeof(dm388_config) / sizeof(dm388_config[0]);", "i < sizeof(dm388_config) / sizeof(dm388_config[0]) - 1;")]),
+    "local_table": ("pico_i2c", [
+        ("    write_reg(DM388_OSR_REG, DM388_OSR_VALUE);\n    write_reg(DM388_ODR_REG, DM388_ODR_VALUE);\n" + _PWR_WRITE,
+         "    const reg_val_t cfg[] = {\n        { .reg = DM388_OSR_REG, .val = DM388_OSR_VALUE },\n"
+         "        { .reg = DM388_ODR_REG, .val = DM388_ODR_VALUE },\n        { .reg = DM388_PWR_REG, .val = DM388_PWR_NORMAL },\n    };\n"
+         "    const reg_val_t *p = cfg;\n    for (size_t i = 0; i < sizeof cfg / sizeof cfg[0]; i++, p++) {\n"
+         "        if (write_reg(p->reg, p->val) != 0) return -3;\n    }\n"),
+        ("int dm388_init(void) {", "typedef struct { uint8_t reg; uint8_t val; } reg_val_t;\n\nint dm388_init(void) {")],
+        [("local_table_value", "the table writes ODR 0x03",
+          "{ .reg = DM388_ODR_REG, .val = DM388_ODR_VALUE }", "{ .reg = DM388_ODR_REG, .val = DM388_ODR_VALUE + 1 }")]),
+    "device_handle": ("pico_i2c", [
+        ("static int write_reg(uint8_t reg, uint8_t val) {",
+         "typedef struct { i2c_inst_t *bus; uint8_t addr; } dm388_dev_t;\n"
+         "static dm388_dev_t dm388_dev = { .bus = i2c0, .addr = DM388_ADDR };\n"
+         "static int write_reg(uint8_t reg, uint8_t val) {"),
+        ("i2c_write_blocking(i2c0, DM388_ADDR, buf, 2, false)", "i2c_write_blocking(dm388_dev.bus, dm388_dev.addr, buf, 2, false)"),
+        ("i2c_write_blocking(i2c0, DM388_ADDR, &reg, 1, true)", "i2c_write_blocking(dm388_dev.bus, dm388_dev.addr, &reg, 1, true)"),
+        ("i2c_read_blocking(i2c0, DM388_ADDR, buf, len, false)", "i2c_read_blocking(dm388_dev.bus, dm388_dev.addr, buf, len, false)")],
+        [("handle_wrong_address", "the handle holds address 0x77",
+          ".addr = DM388_ADDR }", ".addr = DM388_ADDR + 1 }")]),
+    "retry_chip_id": ("pico_i2c", [
+        ("    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) return -1;\n    if (id != DM388_CHIP_ID) return -2;\n",
+         "    int tries = 0;\n    while (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0 || id != DM388_CHIP_ID) {\n"
+         "        if (++tries >= 3) return -2;\n        delay_ms(1);\n    }\n")],
+        [("retry_wrong_register", "the retry loop reads register 0x01 for the chip ID",
+          "while (read_regs(DM388_CHIP_ID_REG, &id, 1)", "while (read_regs(DM388_CHIP_ID_REG + 1, &id, 1)")]),
+    "field_macros": ("pico_i2c", [
+        (_PWR_WRITE, "    write_reg(DM388_PWR_REG, PWR_PRESS_EN | PWR_TEMP_EN | PWR_MODE_NORMAL);\n"),
+        ("int dm388_init(void) {",
+         "#define PWR_PRESS_EN     (1u << 0)\n#define PWR_TEMP_EN      (1u << 1)\n#define PWR_MODE_NORMAL  (3u << 4)\n\nint dm388_init(void) {")],
+        [("field_forced_mode", "the mode field macro selects forced mode",
+          "#define PWR_MODE_NORMAL  (3u << 4)", "#define PWR_MODE_NORMAL  (1u << 4)"),
+         ("field_no_temp", "temperature measurement is not enabled",
+          "PWR_PRESS_EN | PWR_TEMP_EN | PWR_MODE_NORMAL", "PWR_PRESS_EN | PWR_MODE_NORMAL")]),
+    "literal_scales": ("pico_i2c", [
+        ("par_t1 = (float)nvm_par_t1 / powf(2.0f, -8.0f);", "par_t1 = (float)nvm_par_t1 * 256.0f;"),
+        ("par_t2 = (float)nvm_par_t2 / powf(2.0f, 30.0f);", "par_t2 = (float)nvm_par_t2 / 1073741824.0f;"),
+        ("par_t3 = (float)nvm_par_t3 / powf(2.0f, 48.0f);", "par_t3 = ldexpf((float)nvm_par_t3, -48);")],
+        [("literal_typo", "2^30 typed as 107374182.4",
+          "/ 1073741824.0f;", "/ 107374182.4f;"),
+         ("ldexp_sign", "ldexpf scales by 2^48 instead of 2^-48",
+          "ldexpf((float)nvm_par_t3, -48)", "ldexpf((float)nvm_par_t3, 48)")]),
+    "calib_struct": ("pico_i2c", [
+        ("static float par_t1, par_t2, par_t3;", "static struct { float par_t1, par_t2, par_t3; } calib;"),
+        ("    par_t1 = (float)nvm_par_t1", "    calib.par_t1 = (float)nvm_par_t1"),
+        ("    par_t2 = (float)nvm_par_t2", "    calib.par_t2 = (float)nvm_par_t2"),
+        ("    par_t3 = (float)nvm_par_t3", "    calib.par_t3 = (float)nvm_par_t3"),
+        ("(float)uncomp_temp - par_t1;", "(float)uncomp_temp - calib.par_t1;"),
+        ("partial_data1 * par_t2;", "partial_data1 * calib.par_t2;"),
+        ("* par_t3;", "* calib.par_t3;")],
+        [("struct_swapped", "the conversion uses par_t3 where par_t2 belongs",
+          "partial_data1 * calib.par_t2;", "partial_data1 * calib.par_t3;")]),
     "goto_cleanup": ("pico_i2c", [
         ("    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) return -1;\n    if (id != DM388_CHIP_ID) return -2;\n",
          "    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) goto fail;\n    if (id != DM388_CHIP_ID) goto fail;\n"),
