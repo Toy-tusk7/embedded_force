@@ -67,7 +67,10 @@ def delay_us(fact: Any, unit_hint: str = "") -> Optional[float]:
     m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Zµμ]*)", raw.replace(",", "."))
     if not m:
         return None
-    unit = (m.group(2) or getattr(fact, "unit", "") or unit_hint or "").strip().lower()
+    # the fact's own unit, else the unit its quote writes after the value ('wait 2 ms'); the step's hint only as a last resort
+    from embedforge.truth.ledger import unit_after
+    quoted = unit_after(getattr(fact, "quote", "") or "", m.group(1)) if getattr(fact, "quote", "") else None
+    unit = (m.group(2) or getattr(fact, "unit", "") or quoted or unit_hint or "").strip().lower()
     scale = _UNIT_US.get(unit)
     if scale is None:
         return None
@@ -314,11 +317,22 @@ def _fields_value(reg: Any, fields: Dict[str, int]) -> Tuple[int, int]:
     return want, mask
 
 
-def _step_target(step: Step, ledger: FactLedger, book: Any) -> Tuple[Optional[int], Optional[int]]:
+def _register(book: Any, addr: Optional[int], subject: str) -> Any:
+    """The sequence's own part's register at that address (a board can have two parts with a register there); any part's
+    when the register map names this part differently."""
+    if book is None or addr is None:
+        return None
+    own = book.register_at(addr, subject) if subject else None
+    if own is not None or (subject and any(r.device.lower() == subject.lower() for r in book.registers.values())):
+        return own
+    return book.register_at(addr)
+
+
+def _step_target(step: Step, ledger: FactLedger, book: Any, subject: str = "") -> Tuple[Optional[int], Optional[int]]:
     """(want, mask) for a write step: from its fields (register map) or from its value/mask facts."""
     if step.fields and book is not None:
         addr = _fact_int(ledger, step.reg)
-        reg = book.register_at(addr) if addr is not None else None
+        reg = _register(book, addr, subject)
         if reg is not None:
             return _fields_value(reg, step.fields)
     want = _fact_int(ledger, step.value) if step.value else None
@@ -326,7 +340,7 @@ def _step_target(step: Step, ledger: FactLedger, book: Any) -> Tuple[Optional[in
     return want, mask
 
 
-def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None) -> str:
+def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None, subject: str = "") -> str:
     """'' (no), 'yes', 'unresolved' (could be: register or value unknown at build time), 'value' (right register, other value)."""
     reg = _fact_int(ledger, step.reg)
     if step.op in ("read", "poll"):
@@ -343,7 +357,7 @@ def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None) -> str:
     if step.op == "write":
         if e.kind != "write":
             return ""
-        want, mask = _step_target(step, ledger, book)
+        want, mask = _step_target(step, ledger, book, subject)
         saw_reg = False
         unresolved = not is_int(e.reg)
         for r, v in writes_of(e):
@@ -418,7 +432,7 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
             continue
         hit = unres = value_hit = None
         for k in range(pos, len(events)):
-            m = _matches(step, events[k], ledger, book)
+            m = _matches(step, events[k], ledger, book, seq.subject)
             if m == "yes":
                 hit = k
                 break
@@ -428,7 +442,7 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
                 value_hit = k
         desc = f"{step.op} {_label(ledger, step.reg)}" + (f" = {_label(ledger, step.value)}" if step.value and step.op == "write" and not step.fields else "")
         if step.fields:
-            w, _m = _step_target(step, ledger, book)
+            w, _m = _step_target(step, ledger, book, seq.subject)
             desc += f" with {', '.join(f'{n}={v}' for n, v in step.fields.items())}" + (f" (0x{w:02X} in those bits)" if w is not None else "")
         if hit is not None:
             e = events[hit]
@@ -439,14 +453,14 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
                                         desc + ("" if e.guaranteed else " — only inside an if/loop"), e.file, e.entry_line))
             pos, last_idx = hit + 1, hit
             continue
-        earlier = next((k for k in range(0, pos) if _matches(step, events[k], ledger, book) == "yes"), None)
+        earlier = next((k for k in range(0, pos) if _matches(step, events[k], ledger, book, seq.subject) == "yes"), None)
         if earlier is not None:
             e = events[earlier]
             res.steps.append(StepResult(num, step.op, "order", f"{desc} happens at {e.file}:{e.entry_line}, before step {num - 1}", e.file, e.entry_line))
         elif value_hit is not None:
             e = events[value_hit]
             rnum = _fact_int(ledger, step.reg)
-            rdef = book.register_at(rnum) if book is not None and rnum is not None else None
+            rdef = _register(book, rnum, seq.subject)
             got = ", ".join((f"0x{v:02X}" + (f" ({rdef.decode(v)})" if rdef is not None and rdef.fields else "")) if is_int(v) else repr(v)
                             for _, v in writes_of(e) if is_int(_) and _ == rnum) if e.kind == "write" else f"length {e.length}"
             res.steps.append(StepResult(num, step.op, "value", f"{desc}: the code uses {got}", e.file, e.entry_line))

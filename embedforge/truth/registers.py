@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from embedforge.truth.flow import FlowModel, RxByte, Walker, is_int, writes_of
-from embedforge.truth.ledger import FactLedger, _squash, parse_int, value_in_text
+from embedforge.truth.ledger import FactLedger, _mapped, _squash, _word, parse_int, value_in_text
 from embedforge.truth.source_store import SourceStore
 
 MAX_QUOTE = 2000
@@ -70,19 +70,29 @@ def verbatim(quote: str, text: str) -> bool:
     if "/*" in text or "//" in text:
         variants.append((re.sub(r"/\*.*?\*/|//[^\n]*", " ", q, flags=re.S), True))
     for qq, strip in variants:
-        tt = _squashed(text, strip)
         parts = [_squash(p) for p in _GAP.split(qq) if _squash(p)]
         if not parts or (len(parts) > 1 and min(len(p) for p in parts) < 8):
             continue
-        pos, ok = None, True
-        for p in parts:
-            i = tt.find(p, pos or 0)
-            if i < 0 or (pos is not None and i - pos > 1500):
-                ok = False
-                break
-            pos = i + len(p)
-        if ok:
-            return True
+        if strip:
+            tt, idx = _squashed(text, strip), None
+        else:   # word boundaries at both ends: 'Bit 5..4' is not a quote of 'Bit 15..4'
+            tt, idx = _mapped(text)
+        start = tt.find(parts[0])
+        while start >= 0:
+            pos, ok = start + len(parts[0]), True
+            for p in parts[1:]:
+                i = tt.find(p, pos)
+                if i < 0 or i - pos > 1500:
+                    ok = False
+                    break
+                pos = i + len(p)
+            if ok and idx is not None:
+                a, b = idx[start], idx[pos - 1] + 1
+                ok = not (_word(parts[0][0]) and a > 0 and _word(text[a - 1])) and \
+                    not (_word(parts[-1][-1]) and b < len(text) and _word(text[b]))
+            if ok:
+                return True
+            start = tt.find(parts[0], start + 1)
     return False
 
 
@@ -221,6 +231,23 @@ def _stated_addrs(text: str, name: str) -> set:
     rx = (r"(?<![0-9A-Za-z])0x([0-9A-Fa-f]{1,4})(?![0-9A-Za-z])[\s|\"'“”‘’]{0,8}(?<![A-Za-z0-9_])"
           + r"[\s_\-]*".join(chars) + r"(?![A-Za-z0-9_])")
     return {int(m.group(1), 16) for m in re.finditer(rx, text, re.I)}
+
+
+_REG_HEADER = re.compile(r"Register\s+(0x[0-9A-Fa-f]+)\b", re.I)
+
+
+def own_section(quote: str, addr: int) -> str:
+    """The part of a quote that describes the register at `addr`: a quote running from one register's table into the
+    next ('Register 0x1B PWR_CTRL … Table 41: Register 0x1C OSR … Bit 5..3 osr_t') must not lend the other register's
+    fields. Without a header for addr in the quote, all of it."""
+    heads = [(m.start(), int(m.group(1), 16)) for m in _REG_HEADER.finditer(quote)]
+    own = [s for s, a in heads if a == addr]
+    if not own:
+        return quote
+    first = own[0]
+    start = first if any(a != addr for s, a in heads if s < first) else 0
+    end = next((s for s, a in heads if s > first and a != addr), len(quote))
+    return quote[start:end]
 
 
 def _value_forms(v: int, width: int) -> List[str]:
@@ -838,7 +865,7 @@ class RegisterBook:
             if hi > 7 and raw.get("width") not in (16, 32):
                 return f"field {fname}: bit {hi} is beyond an 8-bit register"
             fq = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(fr.get("quote") or ""))
-            quotes = [quote]
+            quotes = [own_section(quote, addr)]
             if fq:
                 err = _quote_ok(store, str(fr.get("source_id") or source_id), fq, f"{name}.{fname}")
                 if err:
@@ -1288,26 +1315,30 @@ def _close(a: float, b: float) -> bool:
 
 
 def evaluate_formulas(book: RegisterBook, vec: Dict[int, int]) -> Dict[str, float]:
-    env: Dict[str, float] = {l.name.lower(): float(l.decode(lambda a: vec.get(a, 0))) for l in book.layouts.values()}
+    """Each formula's value on the probe input, keyed by formula id. Names resolve within the formula's own device: two
+    parts on one board may both have a 'T' or a 'UT'."""
     out: Dict[str, float] = {}
-    pending = list(book.formulas.values())
-    for _ in range(len(pending) + 1):
-        rest = []
-        for f in pending:
-            local = dict(env)
-            try:
-                for var, expr in f.steps:
-                    local[var.lower()] = float(eval_expr(_parse(expr), local))
-            except KeyError:
-                rest.append(f)
-                continue
-            except (ValueError, ZeroDivisionError, OverflowError, TypeError, SyntaxError):
-                continue
-            env[f.name.lower()] = local[f.steps[-1][0].lower()]
-            out[f.name] = env[f.name.lower()]
-        if not rest or len(rest) == len(pending):
-            break
-        pending = rest
+    for dev in {f.device.lower() for f in book.formulas.values()}:
+        env: Dict[str, float] = {l.name.lower(): float(l.decode(lambda a: vec.get(a, 0)))
+                                 for l in book.layouts.values() if l.device.lower() == dev}
+        pending = [f for f in book.formulas.values() if f.device.lower() == dev]
+        for _ in range(len(pending) + 1):
+            rest = []
+            for f in pending:
+                local = dict(env)
+                try:
+                    for var, expr in f.steps:
+                        local[var.lower()] = float(eval_expr(_parse(expr), local))
+                except KeyError:
+                    rest.append(f)
+                    continue
+                except (ValueError, ZeroDivisionError, OverflowError, TypeError, SyntaxError):
+                    continue
+                env[f.name.lower()] = local[f.steps[-1][0].lower()]
+                out[f.id] = env[f.name.lower()]
+            if not rest or len(rest) == len(pending):
+                break
+            pending = rest
     return out
 
 
@@ -1324,6 +1355,23 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
 
     def mine(addr: Any) -> bool:   # an event/byte of a device this book describes
         return not all_addrs or not is_int(addr) or addr in all_addrs
+
+    dev_of: Dict[int, set] = {}
+    for d, addrs in dev_addrs.items():
+        for a in addrs:
+            dev_of.setdefault(a, set()).add(d.lower())
+
+    def at(addr: Any) -> Optional[set]:
+        """The devices traffic at this bus address talks to; None when it cannot tell (SPI, callbacks, unknown address)."""
+        return dev_of.get(addr) if is_int(addr) else None
+
+    def reg_at(r: int, addr: Any) -> Optional[RegisterDef]:   # the register map of the device at that address, not another part's
+        devs = at(addr)
+        return next((x for x in book.registers.values() if x.addr == r and (not devs or x.device.lower() in devs)), None)
+
+    def parts_at(r: int, addr: Any) -> List[Tuple[LayoutDef, int]]:
+        devs = at(addr)
+        return [(l, k) for l, k in book.layout_part(r) if not devs or l.device.lower() in devs]
 
     walkers: List[Tuple[List[str], Walker]] = []
     for entries in entry_points(model):
@@ -1347,7 +1395,7 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             for r, v in writes_of(e):
                 if not (is_int(r) and is_int(v)):
                     continue
-                reg = book.register_at(r)
+                reg = reg_at(r, e.addr)
                 key = (e.file, e.line, r, v)
                 if reg is None or key in seen_w:
                     continue
@@ -1379,8 +1427,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     seen_m = set()
     for _, w in walkers:
         for rx, mask, file, line in w.obs_masks:
-            reg = book.register_at(rx.reg)
-            if reg is None or not reg.fields or not mine(rx.dev) or book.layout_part(rx.reg):
+            reg = reg_at(rx.reg, rx.dev)
+            if reg is None or not reg.fields or not mine(rx.dev) or parts_at(rx.reg, rx.dev):
                 continue
             bad = mask & ~reg.defined_mask & 0xFF
             key = (rx.reg, mask, file, line)
@@ -1397,13 +1445,14 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         for rx, shift, file, line in w.obs_shifts:
             if not mine(rx.dev):
                 continue
-            for lay, k in book.layout_part(rx.reg):
+            parts = parts_at(rx.reg, rx.dev)
+            for lay, k in parts:
                 p = lay.parts[k]
                 if (p.hi, p.lo) != (7, 0) or lay.width <= 8 and shift == 0:
                     continue
                 want = lay.offset_of(k)
                 key = (rx.reg, shift, file, line)
-                if shift != want and key not in seen_s and not any(sh == shift for l2, k2 in book.layout_part(rx.reg) for sh in [l2.offset_of(k2)]):
+                if shift != want and key not in seen_s and not any(sh == shift for l2, k2 in parts for sh in [l2.offset_of(k2)]):
                     seen_s.add(key)
                     findings.append(RegFinding("ERROR", "LAYOUT_SHIFT", file, line,
                                                f"the byte read from {_hex(rx.reg)} is shifted left by {shift}, but in {lay.name} ({lay.id}) it is "
@@ -1416,7 +1465,7 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     for b in book.bursts.values():
         for _, w in walkers:
             for e in w.events:
-                if e.kind != "read" or not is_int(e.reg) or not mine(e.addr):
+                if e.kind != "read" or not is_int(e.reg) or not mine(e.addr) or (at(e.addr) and b.device.lower() not in at(e.addr)):
                     continue
                 n = e.length if is_int(e.length) else 1
                 if e.reg > b.end or e.reg + n - 1 < b.start:
@@ -1431,7 +1480,10 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
 
     # 5. formulas: probe runs with concrete register bytes
     if book.formulas:
-        results: Dict[str, List[Optional[str]]] = {f.name: [] for f in book.formulas.values()}
+        results: Dict[str, List[Optional[str]]] = {f.id: [] for f in book.formulas.values()}   # by id: names repeat across parts
+
+        def same_dev(items: Any, f: FormulaDef) -> List[Any]:
+            return [x for x in items if x.device.lower() == f.device.lower()]
         detail: Dict[str, str] = {}
         loc: Dict[str, Tuple[str, int]] = {}
         read_regs: set = set()
@@ -1448,14 +1500,14 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                 observed += [v for v in pw.values if isinstance(v[0], (int, float))]
                 read_regs |= {e.reg + k for e in pw.events if e.kind == "read" and is_int(e.reg) for k in range(e.length if is_int(e.length) else 1)}
             for f in book.formulas.values():
-                want = expected.get(f.name)
+                want = expected.get(f.id)
                 if want is None:
-                    results[f.name].append(None)
+                    results[f.id].append(None)
                     continue
                 hit = next((o for o in observed if _close(float(o[0]), want)), None)
-                results[f.name].append(f"{hit[1]} ({hit[2]})" if hit else "")
-                if not hit and f.name not in detail:
-                    inputs_used = [l for l in book.layouts.values() if re.search(rf"\b{re.escape(l.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
+                results[f.id].append(f"{hit[1]} ({hit[2]})" if hit else "")
+                if not hit and f.id not in detail:
+                    inputs_used = [l for l in same_dev(book.layouts.values(), f) if re.search(rf"\b{re.escape(l.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
                     raw = []
                     for l in inputs_used:
                         rv = float(l.decode(lambda a: vec.get(a, 0)))
@@ -1463,14 +1515,14 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                         if o is not None:
                             raw.append(f"{l.name} = {rv:g} at {o[1]} ({o[2]})")
                             fl, _, ln = str(o[1]).rpartition(":")
-                            loc.setdefault(f.name, (fl, int(ln) if ln.isdigit() else 0))
-                    deps = [g.name for g in book.formulas.values() if g.name != f.name and re.search(rf"\b{re.escape(g.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
-                    detail[f.name] = (f"on probe input the formula gives {want:.7g}, a value the code never computes"
+                            loc.setdefault(f.id, (fl, int(ln) if ln.isdigit() else 0))
+                    deps = [g.name for g in same_dev(book.formulas.values(), f) if g.name != f.name and re.search(rf"\b{re.escape(g.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
+                    detail[f.id] = (f"on probe input the formula gives {want:.7g}, a value the code never computes"
                                       + (f"; the code has the raw {'; '.join(raw[:2])} — the conversion is missing or different" if raw and len(f.steps) <= 2 else "")
                                       + (f" (it uses {', '.join(deps)}: fix those first)" if deps else ""))
         for f in book.formulas.values():
-            res = results[f.name]
-            inputs = {p.addr for l in book.layouts.values() if l.name.lower() in " ".join(e for _, e in f.steps).lower() for p in l.parts}
+            res = results[f.id]
+            inputs = {p.addr for l in same_dev(book.layouts.values(), f) if l.name.lower() in " ".join(e for _, e in f.steps).lower() for p in l.parts}
             deps_read = not inputs or inputs & read_regs
             if all(r for r in res if r is not None) and any(res):
                 summary["formulas"].append(f"{f.id} {f.name}: matches the code at {res[0]}")
@@ -1488,8 +1540,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            "Check that its inputs are recorded layouts or formulas; report it to the user if they are."))
             else:
                 summary["formulas"].append(f"{f.id} {f.name}: MISMATCH")
-                findings.append(RegFinding("ERROR", "FORMULA_MISMATCH", *loc.get(f.name, ("", 0)),
-                                           f"{f.id} {f.text() if len(f.steps) == 1 else f.name}: {detail.get(f.name, 'matches only one of two probe inputs')}.",
+                findings.append(RegFinding("ERROR", "FORMULA_MISMATCH", *loc.get(f.id, ("", 0)),
+                                           f"{f.id} {f.text() if len(f.steps) == 1 else f.name}: {detail.get(f.id, 'matches only one of two probe inputs')}.",
                                            "Implement the recorded formula exactly (inputs from the layouts, constants and order of operations), "
                                            "or re-record the formula if the datasheet / reference code says otherwise."))
     return summary, findings
@@ -1502,9 +1554,18 @@ def coverage_findings(project_dir: Path, ledger: Optional[FactLedger], model: Fl
         return []
     out, seen = [], set()
     known = book.known_addresses() | {a for b in book.bursts.values() for a in range(b.start, b.end + 1)}
-    addrs = set()
+    per_dev: Dict[str, set] = {}   # a register of one part does not map the same address on another part
+    for x in book.registers.values():
+        per_dev.setdefault(x.device.lower(), set()).add(x.addr)
+    for l in book.layouts.values():
+        per_dev.setdefault(l.device.lower(), set()).update(p.addr for p in l.parts)
+    for b in book.bursts.values():
+        per_dev.setdefault(b.device.lower(), set()).update(range(b.start, b.end + 1))
+    addrs, dev_of = set(), {}
     for d in {x.device for x in book.registers.values()} | {x.device for x in book.layouts.values()}:
-        addrs |= _device_addrs(ledger, d)
+        for a in _device_addrs(ledger, d):
+            addrs.add(a)
+            dev_of.setdefault(a, set()).add(d.lower())
     for entries in entry_points(model):
         try:
             w = model.run(entries)
@@ -1514,9 +1575,11 @@ def coverage_findings(project_dir: Path, ledger: Optional[FactLedger], model: Fl
             if e.kind not in ("read", "write") or (addrs and is_int(e.addr) and e.addr not in addrs):
                 continue
             regs = [r for r, _ in writes_of(e)] if e.kind == "write" else ([e.reg] if is_int(e.reg) else [])
+            devs = dev_of.get(e.addr) if is_int(e.addr) else None
+            mapped = set().union(*(per_dev.get(d, set()) for d in devs)) if devs else known
             for r in regs:
-                if is_int(r) and r not in known and (r, e.kind) not in seen:
-                    seen.add((r, e.kind))
+                if is_int(r) and r not in mapped and (r, e.kind, e.addr) not in seen:
+                    seen.add((r, e.kind, e.addr))
                     out.append(RegFinding("ERROR", "REG_UNMAPPED", *where(model, e),
                                           f"the code {'writes' if e.kind == 'write' else 'reads'} register {_hex(r)}, which is not in the register map, "
                                           "so the meaning of its value is unchecked.",

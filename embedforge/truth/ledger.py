@@ -36,6 +36,95 @@ def _squash(s: str) -> str:
     return re.sub(r"[\s\"'`´]+", "", s).lower()
 
 
+_MARKUP = re.compile(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]")
+_DROP = re.compile(r"[\s\"'`´]")
+
+
+def _squash_map(s: str) -> Tuple[str, List[int]]:
+    """_squash(s), and for each of its characters the index in s it came from."""
+    chars: List[Tuple[str, int]] = []
+    for i, c in enumerate(s):
+        if c == "­":
+            continue
+        rep = {"ﬁ": "fi", "ﬂ": "fl", "µ": "μ"}.get(c, c.translate(_DASHES).translate(_QUOTES))
+        chars.extend((r, i) for r in rep)
+    t = "".join(c for c, _ in chars)
+    kept: List[Tuple[str, int]] = []
+    pos = 0
+    for m in _MARKUP.finditer(t):
+        kept.extend(chars[pos:m.start()])
+        pos = m.end()
+    kept.extend(chars[pos:])
+    out: List[Tuple[str, int]] = []
+    for c, i in kept:
+        if not _DROP.match(c):
+            out.extend((x, i) for x in c.lower())
+    return "".join(c for c, _ in out), [i for _, i in out]
+
+
+_ANCHOR_CACHE: Dict[int, Tuple[str, Optional[List[int]]]] = {}
+
+
+def _mapped(text: str) -> Tuple[str, Optional[List[int]]]:
+    key = hash(text)
+    hit = _ANCHOR_CACHE.get(key)
+    if hit is None:
+        squashed, idx = _squash_map(text)
+        hit = (squashed, idx) if squashed == _squash(text) else (_squash(text), None)
+        if len(_ANCHOR_CACHE) > 16:
+            _ANCHOR_CACHE.clear()
+        _ANCHOR_CACHE[key] = hit
+    return hit
+
+
+def _word(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def anchor(quote: str, text: str) -> Optional[Tuple[int, int]]:
+    """Where a quote stands in the source text: (start, end) of the first occurrence that begins and ends on word
+    boundaries — '2 ms after power-on' is not a quote of 'wait 12 ms after power-on'. None when it is not there."""
+    q = _squash(quote)
+    if not q:
+        return None
+    squashed, idx = _mapped(text)
+    pos = squashed.find(q)
+    if idx is None:   # the character map disagrees with _squash (exotic case folding): containment only
+        return (0, len(text)) if pos >= 0 else None
+    while pos >= 0:
+        a, b = idx[pos], idx[pos + len(q) - 1] + 1
+        if not (_word(q[0]) and a > 0 and _word(text[a - 1])) and not (_word(q[-1]) and b < len(text) and _word(text[b])):
+            return a, b
+        pos = squashed.find(q, pos + 1)
+    return None
+
+
+_UNIT_NAMES = {"s": "s", "sec": "s", "second": "s", "seconds": "s", "ms": "ms", "msec": "ms", "millisecond": "ms",
+               "milliseconds": "ms", "us": "us", "µs": "us", "μs": "us", "usec": "us", "microsecond": "us", "microseconds": "us",
+               "ns": "ns", "nanoseconds": "ns", "hz": "Hz", "khz": "kHz", "mhz": "MHz", "v": "V", "mv": "mV", "a": "A", "ma": "mA",
+               "µa": "uA", "μa": "uA", "ua": "uA", "°c": "°C", "c": "°C"}
+_UNIT_AFTER = re.compile(r"^[\s|]{0,4}(µs|μs|us|ms|ns|sec|s|[kKM]?Hz|mV|V|mA|[µμu]A|A|°C)(?![A-Za-z])")
+
+
+def norm_unit(unit: str) -> str:
+    u = (unit or "").strip()
+    if u in ("MHz", "mHz"):   # mega vs milli: case matters here
+        return "MHz" if u == "MHz" else "mHz"
+    return _UNIT_NAMES.get(u.lower(), u)
+
+
+def unit_after(text: str, value: str) -> Optional[str]:
+    """The unit written right after the value in text ('2 ms', '| 2 | ms |'), normalised; None if there is none."""
+    for form, rx, _conf in value_variants(value):
+        if form not in ("number", "decimal"):
+            continue
+        for m in re.finditer(rx, text.lower().translate(_DASHES)):
+            u = _UNIT_AFTER.match(text[m.end():m.end() + 12])
+            if u:
+                return norm_unit(u.group(1))
+    return None
+
+
 def parse_int(value: str) -> Optional[int]:
     v = str(value).strip().lower().replace("_", "")
     try:
@@ -81,8 +170,13 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
 
 def value_in_text(value: str, text: str) -> Optional[Tuple[str, str]]:
     low = text.lower().translate(_DASHES)
+    negative = str(value).strip().startswith("-")
     for form, rx, conf in value_variants(value):
-        if re.search(rx, low):
+        for m in re.finditer(rx, low):
+            k = m.start()
+            # '-40 °C' states minus forty, not 40 (a range '1-40' still states 40)
+            if not negative and k > 0 and low[k - 1] == "-" and (k < 2 or not low[k - 2].isalnum()):
+                continue
             return form, conf
     return None
 
@@ -177,7 +271,11 @@ class FactLedger:
             return {"ok": False, "error": f"Quote too short (<{MIN_QUOTE_CHARS} chars). Quote the full sentence/table row."}
         if len(quote) > MAX_QUOTE_CHARS:
             return {"ok": False, "error": f"Quote too long (>{MAX_QUOTE_CHARS} chars). Quote only the relevant row/sentence."}
-        if _squash(quote) not in _squash(src.text):
+        span = anchor(quote, src.text)
+        if span is None:
+            if _squash(quote) in _squash(src.text):
+                return {"ok": False, "error": (f"REJECTED: the quote starts or ends inside a word or number of {source_id} (e.g. "
+                                               "'2 ms' inside '12 ms'). Quote whole words and numbers.")}
             return {
                 "ok": False,
                 "error": (
@@ -185,13 +283,17 @@ class FactLedger:
                     "exactly from the source text (use read_source to get exact text)."
                 ),
             }
-        match = value_in_text(value, quote)
+        stated_text = src.text[span[0]:span[1]]   # the value is checked in the source's own text, not the model's copy
+        match = value_in_text(value, stated_text)
         if match is None:
             return {
                 "ok": False,
                 "error": f"REJECTED: value '{value}' does not appear inside the quoted text, so the quote does not support it.",
             }
         form, conf = match
+        stated_unit = unit_after(stated_text, value) if unit else None
+        if stated_unit and norm_unit(unit) != stated_unit and norm_unit(unit) in set(_UNIT_NAMES.values()) | {"mHz"}:
+            return {"ok": False, "error": f"REJECTED: the quote gives {value} {stated_unit}, not {value} {unit}."}
         tier = TrustTier(src.tier)
         warnings: List[str] = []
         if not is_authoritative(tier):

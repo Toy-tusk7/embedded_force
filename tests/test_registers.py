@@ -401,6 +401,55 @@ def test_a_check_that_crashes_fails_verify(tmp_path, monkeypatch):
     assert not rep.passed and any(x.code == "REGISTER_CHECK_ERROR" and x.severity == "ERROR" for x in rep.findings)
 
 
+def test_quotes_are_anchored_to_whole_words_and_the_value_and_unit_are_read_from_the_source(tmp_path):
+    p = Project("r6", tmp_path / "r6")
+    store = SourceStore(p.root)
+    src = store.add("https://www.bosch-sensortec.com/z.pdf", "datasheet",
+                    "After reset wait 12 ms after power-on. Operating range -40 to 85 °C. Start-up time | 2 | ms |", kind="pdf")
+    ledger = FactLedger(p.root, store)
+    r = ledger.record("BMPX", "startup", "2", src.id, "2 ms after power-on")          # a substring of '12 ms'
+    assert not r["ok"] and "inside a word or number" in r["error"], r
+    assert not ledger.record("BMPX", "t_min", "40", src.id, "Operating range -40 to 85")["ok"]   # minus forty
+    assert ledger.record("BMPX", "t_max", "85", src.id, "Operating range -40 to 85")["ok"]
+    r = ledger.record("BMPX", "startup", "2", src.id, "Start-up time | 2 | ms", unit="us")
+    assert not r["ok"] and "gives 2 ms" in r["error"], r
+    assert ledger.record("BMPX", "startup", "2", src.id, "Start-up time | 2 | ms", unit="ms")["ok"]
+    from embedforge.truth.registers import verbatim
+    assert verbatim("0x1B PWR_CTRL", DS) and not verbatim("1B PWR_CTRL", DS)
+
+
+def test_delay_unit_comes_from_the_quote_before_the_steps_hint():
+    from types import SimpleNamespace
+    from embedforge.truth.sequences import delay_us
+    fact = SimpleNamespace(value="2", unit="", quote="write softreset to CMD, wait 2 ms")
+    assert delay_us(fact, "us") == 2000
+
+
+def test_a_quote_running_into_the_next_register_does_not_lend_its_fields(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    q = _q("Table 3", "Bit 5..3 osr_t 000 x1")   # PWR_CTRL's table, then OSR's
+    res = book.record_registers(store, ledger, "BMPX", src.id, [{"name": "PWR_CTRL", "addr": "0x1B", "quote": q,
+                                                                 "fields": [{"name": "osr_t", "bits": "5:3"}]}])
+    assert not res["ok"] and "osr_t" in res["rejected"][0]["error"], res
+
+
+def test_two_parts_with_a_register_at_the_same_address_are_kept_apart(tmp_path):
+    p, store, ledger, src, f = _setup(tmp_path, driver(read=GOOD_READ + " wr2(0x1B, 0x18);"), formulas=False)
+    imu = store.add("https://invensense.tdk.com/imux-datasheet.pdf", "IMU datasheet",
+                    "The I2C address of the IMUX is 0x68.\nRegister 0x1B GYRO_CONFIG\nBit 4..3 fs_sel full scale\n", kind="pdf")
+    assert ledger.record("IMUX", "i2c_address", "0x68", imu.id, "The I2C address of the IMUX is 0x68.")["ok"]
+    r = RegisterBook(p.root).record_registers(store, ledger, "IMUX", imu.id, [
+        {"name": "GYRO_CONFIG", "addr": "0x1B", "quote": "Register 0x1B GYRO_CONFIG\nBit 4..3 fs_sel", "fields": [{"name": "fs_sel", "bits": "4:3"}]}])
+    assert r["ok"], r
+    code = driver(read=GOOD_READ + " wr2(0x1B, 0x18);").replace(
+        "void sensor_init() {", "static void wr2(uint8_t r, uint8_t v) { Wire.beginTransmission(0x68); Wire.write(r); Wire.write(v); "
+                                "Wire.endTransmission(); }\nvoid sensor_init() {")
+    (p.root / "src" / "main.cpp").write_text(code, encoding="utf-8")
+    summary, codes, found = _codes(p, ledger)
+    assert any("GYRO_CONFIG (0x1B) <- 0x18" in w for w in summary["writes"]), summary["writes"]
+    assert not any("PWR_CTRL (0x1B) <- 0x18" in w for w in summary["writes"]), summary["writes"]
+
+
 def test_formula_binds_the_quotes_own_names(tmp_path):
     p, store, ledger, src, book = _book(tmp_path)
     assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
