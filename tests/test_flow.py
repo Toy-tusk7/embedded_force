@@ -174,6 +174,60 @@ def test_spi_read_data_carries_its_register():
     assert [e.describe() for e in w.events if e.kind == "read"] == ["read 0x04 x2"]
 
 
+def test_c_idioms_keep_their_values():
+    code = """
+enum class Reg : uint8_t { CTRL = 0xF4 };
+static int16_t be16(const uint8_t *b) { return (int16_t)((b[0] << 8) | b[1]); }
+static float scale(int8_t raw) { return raw * 2.0f; }
+static uint8_t pick(int m) { switch (m) { case 0: return 0x00; case 3: return 0x27; default: return 0x01; } }
+void init(void) {
+    i2c_write_blocking(i2c0, 0x76, (uint8_t[]){static_cast<uint8_t>(Reg::CTRL), pick(3)}, 2, false);
+    uint8_t buf[4] = {0xF5, 0xA0, 0, 0};
+    i2c_write_blocking(i2c0, 0x76, &buf[0], 2, false);
+    const uint8_t *p = buf;
+    p += 1;
+    uint8_t raw[2] = {0xFF, 0x38};
+    uint8_t out[3]; size_t i = 0;
+    out[i++] = 1; out[i++] = 2;
+    printf("%d %f %d %d", be16(raw), scale(0xF0), *p, (int)i);
+}"""
+    w = FlowModel({"a.cpp": code}).run(["init"])
+    assert [e.describe() for e in w.events if e.kind == "write"] == ["write 0xF4 <- 0x27", "write 0xF5 <- 0xA0"]
+    printed = [v for v, _ in w.outputs]
+    assert printed == [-200, -32.0, 0xA0, 2], printed   # signed return, int8_t parameter, pointer into buf, i++ twice
+
+
+def test_read_modify_write_keeps_the_bits_it_decides():
+    from embedforge.truth.flow import Part
+    code = """void init(void) { uint8_t v = 0; i2c_write_blocking(i2c0, 0x76, (uint8_t[]){0x1C}, 1, true);
+  i2c_read_blocking(i2c0, 0x76, &v, 1, false); v = (uint8_t)((v & ~0x3F) | 0x0B);
+  i2c_write_blocking(i2c0, 0x76, (uint8_t[]){0x1C, v}, 2, false); }"""
+    w = FlowModel({"a.c": code}).run(["init"])
+    v = [e for e in w.events if e.kind == "write"][-1].data[0]
+    assert isinstance(v, Part) and v.mask & 0xFF == 0x3F and v.value == 0x0B
+
+
+@pytest.mark.parametrize("code, expected", [
+    ("""void init(void) { digitalWrite(10, LOW); SPI.transfer(0x7E); SPI.transfer(0xB6); digitalWrite(10, HIGH); }""",
+     ["write 0x7E <- 0xB6"]),
+    ("""void init(void) { i2c_cmd_handle_t c = i2c_cmd_link_create(); i2c_master_start(c);
+  i2c_master_write_byte(c, (0x76 << 1) | I2C_MASTER_WRITE, true); i2c_master_write_byte(c, 0x7E, true);
+  i2c_master_write_byte(c, 0xB6, true); i2c_master_stop(c); i2c_master_cmd_begin(I2C_NUM_0, c, 100); i2c_cmd_link_delete(c); }""",
+     ["write 0x7E <- 0xB6"]),
+])
+def test_arduino_spi_and_esp_idf_command_links_are_traced(code, expected):
+    assert [e.describe() for e in FlowModel({"a.cpp": code}).trace("init").events] == expected
+
+
+def test_tasks_and_callbacks_are_walked_after_main():
+    from embedforge.truth.registers import entry_points
+    code = """static void sensor_task(void *arg) { read_data(); }
+void read_data(void) { }
+static void IRAM_ATTR drdy_isr(void *arg) { }
+void app_main(void) { xTaskCreate(sensor_task, "s", 4096, NULL, 5, NULL); gpio_isr_handler_add(4, drdy_isr, NULL); }"""
+    assert entry_points(FlowModel({"main.c": code})) == [["app_main", "sensor_task", "drdy_isr"]]
+
+
 # ------------------------------------------------------------------ sequence checking
 
 

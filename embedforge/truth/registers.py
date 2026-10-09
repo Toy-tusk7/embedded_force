@@ -34,7 +34,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from embedforge.truth.flow import FlowModel, RxByte, Walker, is_int, writes_of
+from embedforge.truth.flow import FlowModel, Part, RxByte, Walker, is_int, writes_of
 from embedforge.truth.ledger import FactLedger, _index, _squash, bounded, parse_int, value_in_text
 from embedforge.truth.source_store import SourceStore
 
@@ -1270,14 +1270,41 @@ class RegFinding:
     suggestion: str = ""
 
 
+_ISR_RE = re.compile(r"(_IRQHandler|_ISR|_isr|_Callback|_callback|_cb|_handler)$")
+
+
+def callbacks(model: FlowModel) -> List[str]:
+    """Functions the program runs without calling them by name: tasks and threads (xTaskCreate(sensor_task, ...)),
+    interrupt and timer callbacks (attachInterrupt(pin, isr, ...), HAL_*_Callback, *_IRQHandler)."""
+    names = {n for n in model.functions if "::" not in n}
+    called, referenced = set(), []
+    for fns in model.functions.values():
+        for fn in fns:
+            b = fn.body
+            for k, t in enumerate(b):
+                if t.kind != "id" or t.text not in names or t.text == fn.name.split("::")[-1]:
+                    continue
+                nxt = b[k + 1].text if k + 1 < len(b) else ""
+                prev = b[k - 1].text if k else ""
+                if nxt == "(":
+                    called.add(t.text)
+                elif prev not in (".", "->") and t.text not in referenced:
+                    referenced.append(t.text)   # used as a value: handed to an RTOS, a timer or an interrupt API
+    out = [n for n in referenced if n not in called and n not in ("setup", "loop", "main", "app_main")]
+    out += sorted(n for n in names if _ISR_RE.search(n) and n not in called and n not in out)
+    return out[:12]
+
+
 def entry_points(model: FlowModel) -> List[List[str]]:
-    """Programs to walk: setup()+loop() (Arduino), main/app_main, otherwise every function nothing else calls."""
+    """Programs to walk: setup()+loop() (Arduino) or main/app_main, then the tasks and callbacks they hand to the RTOS or
+    to interrupts; otherwise every function nothing else calls."""
     names = set(model.functions)
+    extra = callbacks(model)
     if "setup" in names:
-        return [["setup"] + (["loop"] if "loop" in names else [])]
+        return [["setup"] + (["loop"] if "loop" in names else []) + extra]
     for n in ("main", "app_main"):
         if n in names:
-            return [[n]]
+            return [[n] + extra]
     called = set()
     for fns in model.functions.values():
         for fn in fns:
@@ -1316,6 +1343,17 @@ def _device_addrs(ledger: Optional[FactLedger], device: str) -> set:
         if n is not None and 0 < n < 0x400 and f.subject.lower() == device.lower() and _ADDR_PROP_RE.search(f.property):
             out.add(n)
     return out
+
+
+def _spi_dummy_fact(ledger: Optional[FactLedger], devices: List[str]) -> Optional[int]:
+    """Dummy bytes an SPI read returns before the data, if the datasheet's statement of it is on record."""
+    names = {d.lower() for d in devices}
+    for f in (ledger.facts.values() if ledger is not None else []):
+        if f.subject.lower() in names and re.search(r"dummy", f.property, re.I):
+            n = parse_int(str(f.value))
+            if n is not None and 0 <= n <= 4:
+                return n
+    return None
 
 
 def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int]] = None) -> Dict[int, int]:
@@ -1413,10 +1451,11 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         devs = at(addr)
         return [(l, k) for l, k in book.layout_part(r) if not devs or l.device.lower() in devs]
 
+    stated_dummy = _spi_dummy_fact(ledger, devices)   # the datasheet's SPI dummy bytes, when recorded
     walkers: List[Tuple[List[str], Walker]] = []
     for entries in entry_points(model):
         try:
-            walkers.append((entries, model.run(entries)))
+            walkers.append((entries, model.run(entries, spi_dummy=stated_dummy or 0)))
         except RecursionError:   # code that was not looked at must not pass as checked
             findings.append(RegFinding("ERROR", "REGISTER_CHECK_ERROR", "", 0,
                                        f"Tracing {' + '.join(entries)} exceeded the recursion limit, so its register use is unchecked.",
@@ -1424,9 +1463,10 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     # SPI parts differ in whether a read returns a dummy byte before the data (Bosch BMP388/BMI160 do): judge the code
     # under both readings, and report a byte-level error only if it is wrong under both
     spi = any(e.bus == "spi" and e.kind == "read" for _, w in walkers for e in w.events)
-    dummies = (0, 1) if spi else (0,)
+    guess = spi and stated_dummy is None
+    dummies = (0, 1) if guess else (stated_dummy or 0,)
     alt: List[Tuple[List[str], Walker]] = []
-    if spi:
+    if guess:
         for entries, _ in walkers:
             try:
                 alt.append((entries, model.run(entries, spi_dummy=1)))
@@ -1444,6 +1484,17 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             if e.kind != "write" or not mine(e.addr):
                 continue
             for r, v in writes_of(e):
+                if is_int(r) and isinstance(v, Part):   # read-modify-write: reserved bits it sets for certain
+                    reg = reg_at(r, e.addr)
+                    extra = v.value & v.mask & 0xFF & ~(reg.defined_mask if reg is not None else 0xFF)
+                    if reg is not None and reg.fields and extra and (e.file, e.line, r) not in seen_w:
+                        seen_w.add((e.file, e.line, r))
+                        wf, wl = where(model, e)
+                        findings.append(RegFinding("WARNING", "REG_RESERVED_BITS", wf, wl,
+                                                   f"{reg.name} ({_hex(r)}) is written with bit(s) {_hex(extra)} set, which no field of "
+                                                   f"{reg.id} defines ({', '.join(f.label() for f in reg.fields)}).",
+                                                   "Write only defined fields (reserved bits are usually kept or written 0)."))
+                    continue
                 if not (is_int(r) and is_int(v)):
                     continue
                 reg = reg_at(r, e.addr)
@@ -1535,6 +1586,17 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                                f"Read all {b.end - b.start + 1} bytes from {_hex(b.start)} in one transaction and take the values "
                                                "from that buffer."))
                     break
+
+    # SPI reads must carry the read flag: without bit 7 the part takes the register byte as a write command
+    seen_f = set()
+    for _, w in walkers:
+        for e in w.events:
+            if e.kind == "read" and e.note == "spi_no_read_flag" and (e.file, e.line) not in seen_f:
+                seen_f.add((e.file, e.line))
+                findings.append(RegFinding("ERROR", "SPI_READ_FLAG", *where(model, e),
+                                           f"register {_hex(e.reg)} is read over SPI without bit 7 (0x80) set in the register byte, so "
+                                           "the part takes it as a write command.",
+                                           "Send (reg | 0x80) to start an SPI read, as the datasheet's SPI protocol section requires."))
 
     # 5. formulas: probe runs with concrete register bytes
     if book.formulas:

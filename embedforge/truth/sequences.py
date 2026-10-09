@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from embedforge.truth.flow import Event, FlowModel, Trace, is_int, writes_of
+from embedforge.truth.flow import Event, FlowModel, Part, Trace, is_int, writes_of
 from embedforge.truth.ledger import FactLedger, parse_int
 
 OPS = ("write", "read", "delay_min", "poll")
@@ -369,6 +369,16 @@ def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None, subject
             saw_reg = True
             if want is None:
                 return "yes"
+            if isinstance(v, Part):   # a read-modify-write: judge the bits it decides
+                m = (mask if mask is not None else 0xFF) & 0xFF
+                if (v.value ^ want) & v.mask & m:
+                    continue   # a decided bit is wrong
+                reg_def = _register(book, r, subject)
+                fields = reg_def.defined_mask if reg_def is not None and reg_def.fields else 0xFF
+                if m & fields & ~v.mask == 0:   # every field bit the step sets is decided (reserved bits may be kept)
+                    return "yes"
+                unresolved = True
+                continue
             if not is_int(v):
                 unresolved = True
                 continue
