@@ -345,6 +345,62 @@ def test_formulas_need_their_constants_and_inputs_on_record(tmp_path):
     assert ok["ok"] and "nvm_par_t1 / 2**-8" in ok["formula"], ok
 
 
+def test_formula_must_compute_what_the_quote_states(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
+    fq = "Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T2 = NVM_PAR_T2 / 2^30"
+    # every one of these reuses the quote's numbers, and every one is a different formula
+    for wrong in ("PAR_T1 = NVM_PAR_T1 / 2^8", "PAR_T1 = NVM_PAR_T1 * 2^-8", "PAR_T1 = NVM_PAR_T1 / 2^30"):
+        r = book.record_formula(store, "BMPX", src.id, "PAR_T1", [wrong], fq)
+        assert not r["ok"] and "does not compute what the quote states" in r["error"], (wrong, r)
+    assert book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 * 256"], fq)["ok"]   # the same value
+
+
+def test_formula_structure_reads_lost_superscripts_and_ignores_what_does_not_parse():
+    from embedforge.truth.registers import formula_structure_problem
+    q = "PAR_P1 = (NVM_PAR_P1 - 214) / 220"   # a PDF text layer without superscripts
+    assert formula_structure_problem(["PAR_P1 = (NVM_PAR_P1 - 2^14) / 2^20"], q, "PAR_P1") is None
+    assert "does not compute" in formula_structure_problem(["PAR_P1 = NVM_PAR_P1 - 2^14 / 2^20"], q, "PAR_P1")
+    assert formula_structure_problem(["X = (A - B) / C"], "X = A - B\nC", "X") is None        # fraction bar lost: no claim
+    assert formula_structure_problem(["T = 2^osr * 2000"], "T = 2<sup>osr</sup> * 2000", "T") is None
+    # steps are compared in order with the quote's own sequence
+    seq = "partial_data1 = uncomp_temp - par_t1; partial_data2 = partial_data1 * par_t2; t_lin = partial_data2 + partial_data1 * partial_data1 * par_t3"
+    good = ["partial_data1 = uncomp_temp - par_t1", "partial_data2 = partial_data1 * par_t2",
+            "calib_data->t_lin = partial_data2 + (partial_data1 * partial_data1) * par_t3"]
+    assert formula_structure_problem(good, seq, "T_LIN") is None
+    assert "step 3" in formula_structure_problem(good[:2] + ["t_lin = partial_data2 + partial_data1 * par_t3"], seq, "T_LIN")
+
+
+def test_value_names_take_only_the_adjacent_value():
+    from embedforge.truth.registers import _value_near
+    row = "Bit 5..4 mode 00 sleep mode 01/10 forced mode 11 normal mode"
+    assert _value_near(row, "sleep", 0, 2) and not _value_near(row, "sleep", 1, 2)   # 01 is forced's
+    assert _value_near(row, "forced", 1, 2) and _value_near(row, "forced", 2, 2) and not _value_near(row, "forced", 3, 2)
+    md = "| Bit 5..4 | mode | 01/10 | forced mode |  |\n|  |  | 11 normal | mode |  |"
+    assert _value_near(md, "forced", 2, 2) and _value_near(md, "normal", 3, 2) and not _value_near(md, "normal", 2, 2)
+    text = "normal mode = 0b11, sleep: 00"
+    assert _value_near(text, "normal", 3, 2) and _value_near(text, "sleep", 0, 2)
+
+
+def test_register_written_without_fields_is_an_error(tmp_path):
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+    r = RegisterBook(p.root).record_registers(store, ledger, "BMPX", src.id, [{"name": "PWR_CTRL", "addr": "0x1B", "quote": _q("Table 3", "11 normal mode")}])
+    assert r["ok"], r
+    summary, codes, found = _codes(p, ledger)
+    assert "REG_FIELDS_MISSING" in codes, codes
+
+
+def test_a_check_that_crashes_fails_verify(tmp_path, monkeypatch):
+    import embedforge.truth.registers as regs
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+
+    def boom(*a, **k):
+        raise RuntimeError("tracer bug")
+    monkeypatch.setattr(regs, "check_registers", boom)
+    rep = verify_project(p.root, ledger)
+    assert not rep.passed and any(x.code == "REGISTER_CHECK_ERROR" and x.severity == "ERROR" for x in rep.findings)
+
+
 def test_formula_binds_the_quotes_own_names(tmp_path):
     p, store, ledger, src, book = _book(tmp_path)
     assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]

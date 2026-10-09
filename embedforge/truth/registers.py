@@ -224,18 +224,27 @@ def _stated_addrs(text: str, name: str) -> set:
 
 
 def _value_forms(v: int, width: int) -> List[str]:
-    forms = {str(v), f"0x{v:x}", f"0x{v:02x}", f"{v:x}h", format(v, f"0{width}b") if width <= 16 else ""}
+    forms = {str(v), f"0x{v:x}", f"0x{v:02x}", f"{v:x}h", format(v, f"0{width}b") if width <= 16 else "",
+             "0b" + format(v, f"0{width}b") if width <= 16 else "", "0b" + format(v, "b")}
     return [f for f in forms if f]
 
 
-def _value_near(quote: str, name: str, v: int, width: int, reach: int = 14) -> bool:
-    """A named value is stated right next to its name: '11 normal mode', '0xB6 softreset', 'normal = 0b11'."""
+_VAL_LIST = r"(?:0x[0-9a-f]+|0b[01]+|[0-9a-f]+h|[0-9]+)(?:\s*/\s*(?:0x[0-9a-f]+|0b[01]+|[0-9a-f]+h|[0-9]+))*"
+_VALUE_BEFORE = re.compile(rf"(?:^|[^0-9a-z.])({_VAL_LIST})[\s|:=>\-,(]*$")
+_VALUE_AFTER = re.compile(rf"^\s*(?:(?:mode|state|setting|value)\s*)?(?:=|:|\(|->|→)\s*({_VAL_LIST})(?![0-9a-z])")
+
+
+def _value_near(quote: str, name: str, v: int, width: int, reach: int = 16) -> bool:
+    """A named value is stated right next to its name: the value token directly before it ('11 normal mode',
+    '| 0xB6 | softreset') or after it with an assignment mark ('normal = 0b11', 'sleep: 00'). A value further away is a
+    neighbouring row's: in '00 sleep mode 01/10 forced', 01 is forced's, not sleep's."""
     low = quote.lower()
+    forms = {f.lower() for f in _value_forms(v, width)}
     for a, b in _name_spans(quote, name):
-        for win in (low[max(0, a - reach):a], low[b:b + reach]):
-            for f in _value_forms(v, width):
-                if re.search(rf"(?<![0-9a-z]){re.escape(f.lower())}(?![0-9a-z])", win):
-                    return True
+        for rx, win in ((_VALUE_BEFORE, low[max(0, a - reach):a]), (_VALUE_AFTER, low[b:b + reach])):
+            m = rx.search(win)
+            if m and any(tok.strip() in forms for tok in m.group(1).split("/")):
+                return True
     return False
 
 
@@ -450,6 +459,141 @@ def _const_in_quote(quote: str, value: float, exp: Optional[int]) -> bool:
         if exp < 0 and any(abs(x - 2.0 ** -exp) <= 1e-9 * 2.0 ** -exp for x in nums):
             return True   # x * 2^-8 stated as x / 256
     return False
+
+
+_STMT_LHS = re.compile(r"(?<![\w>.])((?:[A-Za-z_]\w*\s*(?:->|\.)\s*)*[A-Za-z_]\w*)\s*=(?!=)")
+_PROSE_CUT = re.compile(r"\s(?:and|or|where|with|for|when|if|which|is|are|the|to|as|in|of|then|while|respectively)\b|[,;]\s")
+_AMBIGUOUS_POW = re.compile(r"(?<![\w.^*])2(-?\d{1,2})(?![\w.])")   # '214' / '2-8': 2^14 / 2^-8 with the superscript lost
+
+
+def _quote_statements(quote: str) -> List[Tuple[str, str]]:
+    """The formulas a quote itself states, as (assigned name, expression text): 'PAR_P1 = (NVM_PAR_P1 - 2^14) / 2^20' from
+    a converted datasheet, 'calib_data->t_lin = partial_data2 + ...' from reference code. Text that does not parse
+    cleanly (a lost fraction bar, prose, garbled math fonts) states nothing here."""
+    import unicodedata
+    q = unicodedata.normalize("NFKC", _unescape(quote))
+    q = re.sub(r"<sup>(.*?)</sup>", r"^(\1)", q)
+    q = re.sub(r"<sub>(.*?)</sub>", r"_\1", q)
+    q = re.sub(r"</?\w+>", " ", q)
+    q = re.sub(r"/\*.*?\*/|//[^\n]*", " ", q, flags=re.S)
+    q = re.sub(r"\*\*(?=[A-Za-z_(])|(?<=[A-Za-z_)])\*\*|[`|]", " ", q)   # Markdown bold, code spans, table bars
+    q = q.translate({ord("∙"): "*", ord("⋅"): "*", ord("·"): "*", ord("×"): "*", ord("÷"): "/"})
+    marks = list(_STMT_LHS.finditer(q))
+    out: List[Tuple[str, str]] = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(q)
+        rhs = q[m.end():end].split(";", 1)[0]
+        for text in (rhs, rhs[:c.start()] if (c := _PROSE_CUT.search(rhs)) else None):
+            text = re.sub(r"\s+", " ", text or "").strip().rstrip(".,:")
+            if not text:
+                continue
+            try:
+                _parse(text)
+            except (SyntaxError, ValueError):
+                continue
+            out.append((re.sub(r"^.*(?:->|\.)\s*", "", m.group(1)).strip().lower(), text))
+            break
+    return out
+
+
+def _variants(text: str) -> List[ast.AST]:
+    """The expression, plus readings where '2k' / '2-k' is the power 2^k / 2^-k whose superscript the PDF lost."""
+    spots = list(_AMBIGUOUS_POW.finditer(text))[:5]
+    out = []
+    for mask in range(1 << len(spots)):
+        t, shift = text, 0
+        for j, sp in enumerate(spots):
+            if mask >> j & 1:
+                new = f"2^({sp.group(1)})"
+                t = t[:sp.start() + shift] + new + t[sp.end() + shift:]
+                shift += len(new) - (sp.end() - sp.start())
+        try:
+            out.append(_parse(t))
+        except (SyntaxError, ValueError):
+            pass
+    return out
+
+
+def _close(a: float, b: float) -> bool:
+    return abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
+
+
+def formula_structure_problem(steps: List[Any], quote: str, name: str) -> Optional[str]:
+    """A recorded formula must compute what the quote states, not merely reuse its numbers: each step whose variable the
+    quote assigns is evaluated on sample inputs next to the quote's own expression for that variable (earlier steps and
+    earlier quote statements feed later ones). '/ 2^8' recorded for a quote that says '/ 2^-8' is rejected; an
+    algebraically equal rewrite ('* 2^8') is not. Steps the quote states in no parseable form are left to the constant check."""
+    import random
+    stmts = _quote_statements(quote)
+    if not stmts:
+        return None
+    parsed_steps = []
+    for s in steps:
+        s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", str(s).strip().rstrip(";"))
+        m = _STEP_RE.match(s) or (_STEP_RE.match(f"{name} = {s}") if len(steps) == 1 else None)
+        if not m:
+            return None
+        try:
+            parsed_steps.append((m.group(1).lower(), m.group(2).strip(), _parse(m.group(2))))
+        except (SyntaxError, ValueError):
+            return None
+    quote_trees = []
+    for lhs, text in stmts:
+        quote_trees.append((lhs, text, _parse(text), _variants(text)))
+    names = {n for _, _, t in parsed_steps for n in _names(t)} | {n for _, _, t, _ in quote_trees for n in _names(t)}
+    names |= {v for v, _, _ in parsed_steps} | {lhs for lhs, _, _, _ in quote_trees}
+    bases = []
+    for seed in (11, 23, 37):
+        r = random.Random(seed)
+        bases.append({n: float(r.randint(3, 4000)) for n in sorted(names)})
+
+    def run(seq, base):   # sequential values: each statement sees the ones before it
+        env, vals = dict(base), []
+        for var, tree in seq:
+            try:
+                v = float(eval_expr(tree, env))
+                env[var] = v
+            except (ArithmeticError, ValueError, KeyError, TypeError):
+                v = None
+            vals.append((dict(env), v))
+        return vals
+    step_runs = [run([(v, t) for v, _, t in parsed_steps], b) for b in bases]
+    quote_envs = [[env for env, _ in run([(lhs, t) for lhs, _, t, _ in quote_trees], b)] for b in bases]
+    seen: Dict[str, int] = {}
+    for k, (var, text, _tree) in enumerate(parsed_steps):
+        idxs = [i for i, (lhs, _, _, _) in enumerate(quote_trees) if lhs == var]
+        if not idxs:
+            continue
+        j = seen.get(var, 0)
+        seen[var] = j + 1
+        if j < len(idxs):
+            idxs = [idxs[j]] + [i for i in idxs if i != idxs[j]]
+        decided = False
+        for i in idxs:
+            for variant in quote_trees[i][3]:
+                pairs = []
+                for b, base in enumerate(bases):
+                    sv = step_runs[b][k][1]
+                    env = dict(quote_envs[b][i - 1]) if i > 0 else dict(base)
+                    try:
+                        qv = float(eval_expr(variant, env))
+                    except (ArithmeticError, ValueError, KeyError, TypeError):
+                        continue
+                    if sv is not None:
+                        pairs.append((sv, qv))
+                if pairs:
+                    decided = True
+                    if all(_close(a, b) for a, b in pairs):
+                        break
+            else:
+                continue
+            break
+        else:
+            if decided:
+                lhs, qtext = quote_trees[idxs[0]][0], quote_trees[idxs[0]][1]
+                return (f"step {k + 1} ({var} = {text}) does not compute what the quote states: {lhs} = {qtext}. Copy the "
+                        "quote's expression — its operators, grouping and the signs of its exponents — not just its numbers.")
+    return None
 
 
 def eval_expr(tree: ast.AST, env: Dict[str, float]) -> float:
@@ -986,6 +1130,9 @@ class RegisterBook:
         if missing_consts:
             return {"ok": False, "error": f"constant(s) {', '.join(sorted(set(missing_consts)))} are not in the quote. Quote the "
                                           "text that states the formula (the datasheet, or the manufacturer's reference code)."}
+        problem = formula_structure_problem(orig_steps, quote, name)
+        if problem:
+            return {"ok": False, "error": problem}
         with self._lock:
             old = self.formula(name) if (self.formula(name) and self.formula(name).device.lower() == device.lower()) else None
             fid = old.id if old else self._next(self.formulas, "FRM")
@@ -1182,15 +1329,17 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     for entries in entry_points(model):
         try:
             walkers.append((entries, model.run(entries)))
-        except RecursionError:
-            continue
+        except RecursionError:   # code that was not looked at must not pass as checked
+            findings.append(RegFinding("ERROR", "REGISTER_CHECK_ERROR", "", 0,
+                                       f"Tracing {' + '.join(entries)} exceeded the recursion limit, so its register use is unchecked.",
+                                       "Report it to the user; flattening deeply nested code may help."))
     summary: Dict[str, Any] = {"entries": [" + ".join(e) for e, _ in walkers], "writes": [], "layouts": [], "formulas": []}
     used = {e.addr for _, w in walkers for e in w.events if is_int(e.addr)}
     if all_addrs and not used & all_addrs:
         all_addrs = set()   # the code talks to another address: judge all its device traffic (a wrong address must not hide errors)
 
     # 1. register writes, decoded
-    seen_w = set()
+    seen_w, fieldless = set(), set()
     for _, w in walkers:
         for e in w.events:
             if e.kind != "write" or not mine(e.addr):
@@ -1205,6 +1354,13 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                 seen_w.add(key)
                 wf, wl = where(model, e)
                 summary["writes"].append(f"{wf}:{wl} {reg.name} ({_hex(r)}) <- {_hex(v)}: {reg.decode(v)}")
+                if not reg.fields and r == e.reg and reg.id not in fieldless:
+                    fieldless.add(reg.id)   # a record without fields would make every value it is written pass unchecked
+                    findings.append(RegFinding("ERROR", "REG_FIELDS_MISSING", wf, wl,
+                                               f"{reg.name} ({_hex(r)}) <- {_hex(v)}, but {reg.id} records no fields, so what this "
+                                               "value sets is unchecked.",
+                                               "record_registers again for this register with its fields (name and bits from its "
+                                               "table; a whole-register value is one field with bits '7:0')."))
                 extra = v & ~reg.defined_mask & 0xFF
                 if reg.fields and extra:
                     findings.append(RegFinding("WARNING", "REG_RESERVED_BITS", wf, wl,
@@ -1326,6 +1482,10 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            "Call the measurement code from setup()/loop()/main so it can be checked."))
             elif any(r is None for r in res):
                 summary["formulas"].append(f"{f.id} {f.name}: could not be evaluated")
+                findings.append(RegFinding("WARNING", "FORMULA_UNCHECKED", "", 0,
+                                           f"{f.id} {f.name}: the recorded formula could not be evaluated on the probe input, so the "
+                                           "code's conversion was not compared with it.",
+                                           "Check that its inputs are recorded layouts or formulas; report it to the user if they are."))
             else:
                 summary["formulas"].append(f"{f.id} {f.name}: MISMATCH")
                 findings.append(RegFinding("ERROR", "FORMULA_MISMATCH", *loc.get(f.name, ("", 0)),

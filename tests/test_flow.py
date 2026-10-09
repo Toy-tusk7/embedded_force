@@ -143,6 +143,37 @@ bool init(void) { uint8_t id = 0; rd(0x00, &id, 1); if (id != 0x50) { return fal
     assert [e.guaranteed for e in t.events] == [True, False, True, True, True, True]   # the delay is inside a data-dependent if
 
 
+@pytest.mark.parametrize("code", [
+    # pico-sdk full-duplex SPI: rx[1] holds register 0x00 (rx[0] was clocked in during the command byte)
+    """bool init(void) { uint8_t tx[2] = {0x80, 0}; uint8_t rx[2] = {0}; spi_write_read_blocking(spi0, tx, rx, 2);
+  if (rx[1] != 0x50) return false; uint8_t w[2] = {0x1B, 0x33}; spi_write_blocking(spi0, w, 2); return true; }""",
+    # command byte, then spi_read_blocking
+    """bool init(void) { uint8_t r = 0x80; uint8_t id[1] = {0}; spi_write_blocking(spi0, &r, 1); spi_read_blocking(spi0, 0, id, 1);
+  if (id[0] != 0x50) return false; uint8_t w[2] = {0x1B, 0x33}; spi_write_blocking(spi0, w, 2); return true; }""",
+    # Zephyr: the byte lands in *value, and 0 is success
+    """int init(const struct i2c_dt_spec *s) { uint8_t id = 0; if (i2c_reg_read_byte_dt(s, 0x00, &id)) return -5;
+  if (id != 0x50) return -19; if (i2c_reg_write_byte_dt(s, 0x1B, 0x33)) return -5; return 0; }""",
+    # STM32 HAL returns HAL_OK (0), not a byte count
+    """int init(void) { uint8_t c[2] = {0x7E, 0xB6}; if (HAL_I2C_Master_Transmit(&hi2c1, 0x76 << 1, c, 2, 100)) return -1;
+  uint8_t w[2] = {0x1B, 0x33}; HAL_I2C_Master_Transmit(&hi2c1, 0x76 << 1, w, 2, 100); return 0; }""",
+    # an unknown vendor function handed an empty buffer fills it
+    """bool init(void) { uint8_t id[1] = {0}; vendor_read(0x76, 0x00, id, 1); if (id[0] != 0x50) return false;
+  uint8_t w[2] = {0x1B, 0x33}; i2c_write_blocking(i2c0, 0x76, w, 2, false); return true; }""",
+])
+def test_read_buffers_are_filled_so_an_id_check_does_not_end_the_trace(code):
+    # before: the buffer kept its initializer, `id != 0x50` was always true and every later step looked missing
+    events = [e.describe() for e in FlowModel({"a.c": code}).trace("init").events]
+    assert "write 0x1B <- 0x33" in events, events
+
+
+def test_spi_read_data_carries_its_register():
+    code = """float t(void) { uint8_t tx[3] = {0x84, 0, 0}; uint8_t rx[3]; spi_write_read_blocking(spi0, tx, rx, 3);
+  return (rx[2] << 8) | rx[1]; }"""
+    w = FlowModel({"a.c": code}).run(["t"])
+    assert sorted((s[0].reg, s[1]) for s in w.obs_shifts) == [(0x04, 0), (0x05, 8)]   # rx[1] is 0x04, rx[2] is 0x05
+    assert [e.describe() for e in w.events if e.kind == "read"] == ["read 0x04 x2"]
+
+
 # ------------------------------------------------------------------ sequence checking
 
 

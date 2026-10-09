@@ -1820,6 +1820,7 @@ class Walker:
                 return self._inline(fn, args, ev, line)
             self.opaque.add(f"{name}()")
             self._opaque_n += 1
+            _opaque_fill(name, args)
             return Sym(f"{name}()")
         if prim is not None:
             return prim(self, args, ev, line)
@@ -1831,6 +1832,7 @@ class Walker:
             return self._inline(fn, args, ev, line, arg_toks=arg_toks)
         self.opaque.add(f"{name}()")
         self._opaque_n += 1
+        _opaque_fill(name, args)
         return Sym(f"{name}()")
 
     def _inline(self, fn: Function, args: List[Any], ev: Evaluator, line: int, this: Optional[Tuple[Any, str]] = None,
@@ -1852,7 +1854,8 @@ class Walker:
         if kw.get("kind") == "write" and kw.get("reg") is None and kw.get("data") and is_int(kw["data"][0]):
             first = kw["data"][0]   # the register a following read starts at (SPI: bit 7 is the read flag)
             self.ptr[repr(kw.get("addr"))] = first & 0x7F if kw.get("bus") == "spi" else first
-        if kw.get("kind") == "write" and self.probe is not None:
+        spi_read_cmd = kw.get("bus") == "spi" and kw.get("reg") is None and kw.get("data") and is_int(kw["data"][0]) and kw["data"][0] & 0x80
+        if kw.get("kind") == "write" and self.probe is not None and not spi_read_cmd:   # an SPI read command writes nothing
             data, reg = list(kw.get("data") or []), kw.get("reg")
             if reg is None and data and is_int(data[0]):
                 reg, data = (data[0] & 0x7F if kw.get("bus") == "spi" else data[0]), data[1:]
@@ -1925,14 +1928,22 @@ def _delay(scale: int):
     return h
 
 
-def _write_buf(addr_i: int, buf_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0):
+def _ret(n: Any, ok: Optional[int]) -> Any:
+    """What a bus call returns on success: pico-sdk the byte count, HAL / ESP-IDF / Zephyr a status where 0 is success
+    (so `if (i2c_write_dt(...)) return -EIO;` is not an error path that is always taken)."""
+    if ok is not None:
+        return ok
+    return n if is_int(n) else Sym("ret")
+
+
+def _write_buf(addr_i: int, buf_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, ok: Optional[int] = None):
     def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
         addr = a[addr_i] if addr_i >= 0 and addr_i < len(a) else None
         if is_int(addr) and addr_shift:
             addr >>= addr_shift
         n = a[len_i] if len_i < len(a) else None
         w.emit(ev, line, kind="write", addr=addr, data=as_bytes(a[buf_i] if buf_i < len(a) else None, n), length=n, bus=bus)
-        return n if is_int(n) else Sym("ret")
+        return _ret(n, ok)
     return h
 
 
@@ -1949,7 +1960,7 @@ def taint(v: Any, n: Any = None, w: Optional["Walker"] = None, reg: Any = None, 
         target.items[k] = w.rx(reg, k - base, dev) if w is not None else Sym("rx")
 
 
-def _read_buf(addr_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, dst_i: int = 2):
+def _read_buf(addr_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, dst_i: int = 2, ok: Optional[int] = None):
     def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
         addr = a[addr_i] if addr_i >= 0 and addr_i < len(a) else None
         if is_int(addr) and addr_shift:
@@ -1958,7 +1969,7 @@ def _read_buf(addr_i: int, len_i: int, bus: str = "i2c", addr_shift: int = 0, ds
         if dst_i < len(a):
             taint(a[dst_i], n, w, w.ptr.get(repr(addr)), addr)
         w.emit(ev, line, kind="read", addr=addr, length=n, bus=bus)
-        return n if is_int(n) else Sym("ret")
+        return _ret(n, ok)
     return h
 
 
@@ -2010,11 +2021,45 @@ def _write_read(addr_i: int, wbuf_i: int, wlen_i: int, rlen_i: int, bus: str = "
     return h
 
 
-def _spi_write_read(buf_i: int, len_i: int):
+def _reg_read_byte(addr_i: int, reg_i: int, dst_i: int):
+    """Zephyr i2c_reg_read_byte(dev, addr, reg, &value): one register byte into *value."""
+    def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
+        addr = a[addr_i] if 0 <= addr_i < len(a) else None
+        reg = a[reg_i] if reg_i < len(a) else None
+        if dst_i < len(a):
+            taint(a[dst_i], 1, w, reg, addr)
+        w.emit(ev, line, kind="read", addr=addr, reg=reg, length=1, note="mem")
+        return 0
+    return h
+
+
+def _spi_transfer(tx_i: int, rx_i: Optional[int], len_i: int, ok: Optional[int] = None):
+    """An SPI write, or a full-duplex transfer that also fills rx. The byte clocked in while the command byte goes out is
+    junk; after a read command (bit 7 set) the rest is the register data from that register on."""
     def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
         n = a[len_i] if len_i < len(a) else None
-        w.emit(ev, line, kind="write", data=as_bytes(a[buf_i] if buf_i < len(a) else None, n), length=n, bus="spi")
-        return n
+        tx = as_bytes(a[tx_i] if tx_i < len(a) else None, n)
+        w.emit(ev, line, kind="write", data=tx, length=n, bus="spi")
+        if rx_i is not None and rx_i < len(a):
+            dst, off = _buf_slot(a[rx_i])
+            first = tx[0] if tx else None
+            if dst is not None and is_int(first) and first & 0x80:
+                taint(Ptr(dst, off + 1), n - 1 if is_int(n) else None, w, first & 0x7F)
+                taint(Ptr(dst, off), 1)
+            else:
+                taint(a[rx_i], n)
+        return _ret(n, ok)
+    return h
+
+
+def _spi_read(dst_i: int, len_i: int, ok: Optional[int] = None):
+    """spi_read_blocking / HAL_SPI_Receive: the data of the register the previous write pointed at."""
+    def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
+        n = a[len_i] if len_i < len(a) else None
+        if dst_i < len(a):
+            taint(a[dst_i], n, w, w.ptr.get(repr(None)))
+        w.emit(ev, line, kind="read", length=n, bus="spi")
+        return _ret(n, ok)
     return h
 
 
@@ -2063,8 +2108,8 @@ _PRIMITIVES = {
     "i2c_write_timeout_per_char_us": _write_buf(1, 2, 3),
     "i2c_read_blocking": _read_buf(1, 3), "i2c_read_timeout_us": _read_buf(1, 3), "i2c_read_blocking_until": _read_buf(1, 3),
     "i2c_read_timeout_per_char_us": _read_buf(1, 3),
-    "spi_write_blocking": _spi_write_read(1, 2), "spi_write_read_blocking": _spi_write_read(1, 3),
-    "spi_read_blocking": lambda w, a, ev, line: (w.emit(ev, line, kind="read", length=a[3] if len(a) > 3 else None, bus="spi"), 0)[1],
+    "spi_write_blocking": _spi_transfer(1, None, 2), "spi_write_read_blocking": _spi_transfer(1, 2, 3),
+    "spi_read_blocking": _spi_read(2, 3),
     "sleep_ms": _delay(1000), "sleep_us": _delay(1), "busy_wait_us": _delay(1), "busy_wait_us_32": _delay(1), "busy_wait_ms": _delay(1000),
     # Arduino
     "delay": _delay(1000), "delayMicroseconds": _delay(1),
@@ -2072,22 +2117,23 @@ _PRIMITIVES = {
     "HAL_I2C_Mem_Write": _mem_write(1, 2, 4, 5, addr_shift=1), "HAL_I2C_Mem_Read": _mem_read(1, 2, 5, addr_shift=1, dst_i=4),
     "HAL_I2C_Mem_Write_IT": _mem_write(1, 2, 4, 5, addr_shift=1), "HAL_I2C_Mem_Read_IT": _mem_read(1, 2, 5, addr_shift=1, dst_i=4),
     "HAL_I2C_Mem_Write_DMA": _mem_write(1, 2, 4, 5, addr_shift=1), "HAL_I2C_Mem_Read_DMA": _mem_read(1, 2, 5, addr_shift=1, dst_i=4),
-    "HAL_I2C_Master_Transmit": _write_buf(1, 2, 3, addr_shift=1), "HAL_I2C_Master_Receive": _read_buf(1, 3, addr_shift=1, dst_i=2),
-    "HAL_SPI_Transmit": _spi_write_read(1, 2), "HAL_SPI_TransmitReceive": _spi_write_read(1, 3),
+    "HAL_I2C_Master_Transmit": _write_buf(1, 2, 3, addr_shift=1, ok=0), "HAL_I2C_Master_Receive": _read_buf(1, 3, addr_shift=1, dst_i=2, ok=0),
+    "HAL_SPI_Transmit": _spi_transfer(1, None, 2, ok=0), "HAL_SPI_TransmitReceive": _spi_transfer(1, 2, 3, ok=0),
+    "HAL_SPI_Receive": _spi_read(1, 2, ok=0),
     "HAL_Delay": _delay(1000), "osDelay": _delay(1000),
     # ESP-IDF
-    "i2c_master_write_to_device": _write_buf(1, 2, 3), "i2c_master_read_from_device": _read_buf(1, 3),
+    "i2c_master_write_to_device": _write_buf(1, 2, 3, ok=0), "i2c_master_read_from_device": _read_buf(1, 3, ok=0),
     "i2c_master_write_read_device": _write_read(1, 2, 3, 5),
-    "i2c_master_transmit": _write_buf(-1, 1, 2), "i2c_master_receive": _read_buf(-1, 2, dst_i=1),
+    "i2c_master_transmit": _write_buf(-1, 1, 2, ok=0), "i2c_master_receive": _read_buf(-1, 2, dst_i=1, ok=0),
     "i2c_master_transmit_receive": _write_read(-1, 1, 2, 4),
     "esp_rom_delay_us": _delay(1), "ets_delay_us": _delay(1), "vTaskDelay": _vtask_delay, "pdMS_TO_TICKS": _passthrough,
     # Zephyr
     "i2c_reg_write_byte": _reg_write_byte(1, 2, 3), "i2c_reg_write_byte_dt": _reg_write_byte(-1, 1, 2),
-    "i2c_reg_read_byte": _mem_read(1, 2, 99), "i2c_reg_read_byte_dt": _mem_read(-1, 1, 99),
+    "i2c_reg_read_byte": _reg_read_byte(1, 2, 3), "i2c_reg_read_byte_dt": _reg_read_byte(-1, 1, 2),
     "i2c_burst_read": _mem_read(1, 2, 4, dst_i=3), "i2c_burst_read_dt": _mem_read(-1, 1, 3, dst_i=2),
     "i2c_burst_write": _mem_write(1, 2, 3, 4), "i2c_burst_write_dt": _mem_write(-1, 1, 2, 3),
-    "i2c_write": lambda w, a, ev, line: _write_buf(3, 1, 2)(w, a, ev, line) if len(a) >= 4 else _write_buf(-1, 1, 2)(w, a, ev, line),
-    "i2c_write_dt": _write_buf(-1, 1, 2), "i2c_read_dt": _read_buf(-1, 2, dst_i=1),
+    "i2c_write": lambda w, a, ev, line: _write_buf(3, 1, 2, ok=0)(w, a, ev, line) if len(a) >= 4 else _write_buf(-1, 1, 2, ok=0)(w, a, ev, line),
+    "i2c_write_dt": _write_buf(-1, 1, 2, ok=0), "i2c_read_dt": _read_buf(-1, 2, dst_i=1, ok=0),
     "i2c_write_read": _write_read(1, 2, 3, 5), "i2c_write_read_dt": _write_read(-1, 1, 2, 4),
     "k_msleep": _delay(1000), "k_usleep": _delay(1), "k_busy_wait": _delay(1), "k_sleep": _k_sleep,
     "K_MSEC": lambda w, a, ev, line: _us(a[0] if a else None, 1000), "K_USEC": lambda w, a, ev, line: a[0] if a else None,
@@ -2095,8 +2141,6 @@ _PRIMITIVES = {
     "usleep": _delay(1), "msleep": _delay(1000), "mdelay": _delay(1000), "udelay": _delay(1), "delay_ms": _delay(1000), "delay_us": _delay(1),
 }
 _PRIMITIVES.update(_CONST_HELPERS)
-_PRIMITIVES["i2c_reg_read_byte"] = lambda w, a, ev, line: (w.emit(ev, line, kind="read", addr=a[1] if len(a) > 1 else None, reg=a[2] if len(a) > 2 else None, length=1, note="mem"), 0)[1]
-_PRIMITIVES["i2c_reg_read_byte_dt"] = lambda w, a, ev, line: (w.emit(ev, line, kind="read", reg=a[1] if len(a) > 1 else None, length=1, note="mem"), 0)[1]
 
 _WIRE_METHODS = {"beginTransmission", "write", "endTransmission", "requestFrom", "read", "available"}
 _PRINT_FUNCS = {"print", "println", "printf", "sprintf", "snprintf", "printFloat", "ESP_LOGI", "ESP_LOGD", "LOG_INF", "LOG_DBG", "printk"}
@@ -2108,6 +2152,24 @@ def _buf_slot(v: Any) -> Tuple[Optional[Arr], int]:
     if isinstance(v, Arr):
         return v, 0
     return None, 0
+
+
+_READ_ONLY_CALLS = {"memcmp", "strlen", "strnlen", "strcmp", "strncmp", "strchr", "crc8", "crc16", "crc32", "atoi", "strtol"}
+_FRESH_ELEM = re.compile(r"^\w+\[\d+\]$")
+
+
+def _opaque_fill(name: str, args: List[Any]) -> None:
+    """An unknown function handed a buffer that holds no data yet (zero-initialised or never written) is most likely
+    filling it — a receive buffer (Wire.readBytes, a vendor read API): afterwards its bytes are unknown, not still zero,
+    so a check such as `if (id != 0x60) return false;` is not decided by the initializer."""
+    if name in _READ_ONLY_CALLS:
+        return
+    for a in args:
+        dst, off = _buf_slot(a)
+        items = dst.items[off:] if dst is not None else []
+        if items and all((isinstance(x, Sym) and (x.text == "uninit" or _FRESH_ELEM.match(x.text))) or
+                         (is_int(x) and x == 0) for x in items):
+            taint(a, None)
 
 
 def _memcpy(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
@@ -2176,7 +2238,8 @@ def _BUSIO_STYLE(w: Walker, name: str, a: List[Any], ev: Evaluator, line: int) -
         if len(a) > 2:
             taint(a[2], a[3] if len(a) > 3 else None, w, wb[0] if wb else None)
         w.emit(ev, line, kind="read", length=a[3] if len(a) > 3 else None, note="busio")
-    else:
+    else:   # read(buf, len): the register the previous write pointed at
+        taint(a[0], a[1] if len(a) > 1 else None, w, w.ptr.get(repr(None)))
         w.emit(ev, line, kind="read", length=a[1] if len(a) > 1 else None, note="busio")
     return 1
 

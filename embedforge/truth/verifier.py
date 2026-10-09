@@ -184,8 +184,8 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
         rel = str(path.relative_to(project_dir)).replace("\\", "/")
         try:
             text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
+        except UnicodeDecodeError:   # still checked: a Latin-1 comment must not hide the file's constants
+            text = path.read_bytes().decode("latin-1")
         # a FACT tag in a comment on the previous line also covers the next line
         prev_tags: List[str] = []
         for ln, parts in enumerate(_strip_comments(text), start=1):
@@ -322,8 +322,10 @@ def _check_registers(project_dir: Path, ledger: FactLedger, report: VerifyReport
         model = FlowModel.from_dir(project_dir)
         summary, found = check_registers(project_dir, ledger, model)
         found = found + coverage_findings(project_dir, ledger, model)
-    except Exception as e:  # never hide the rest of verify
-        report.findings.append(Finding("WARNING", "REGISTER_CHECK_ERROR", "", 0, f"The register check could not run: {type(e).__name__}: {e}"))
+    except Exception as e:  # never hide the rest of verify, and never pass code the check could not look at
+        report.findings.append(Finding("ERROR", "REGISTER_CHECK_ERROR", "", 0, f"The register check could not run: {type(e).__name__}: {e}",
+                                       suggestion="This is an EmbedForge analysis failure, not necessarily a bug in the code: "
+                                                  "report it to the user; simplifying the construct named above may help."))
         return
     report.registers = summary
     for f in found:
@@ -368,8 +370,10 @@ def _check_flows(project_dir: Path, ledger: FactLedger, report: VerifyReport) ->
     try:
         model = FlowModel.from_dir(project_dir)
         flows, found = check_flows(project_dir, ledger, model)
-    except Exception as e:  # a flow-check bug must never hide the rest of verify
-        report.findings.append(Finding("WARNING", "FLOW_CHECK_ERROR", "", 0, f"The flow check could not run: {type(e).__name__}: {e}"))
+    except Exception as e:  # a flow-check bug must never hide the rest of verify, nor let unchecked code pass
+        report.findings.append(Finding("ERROR", "FLOW_CHECK_ERROR", "", 0, f"The flow check could not run: {type(e).__name__}: {e}",
+                                       suggestion="This is an EmbedForge analysis failure, not necessarily a bug in the code: "
+                                                  "report it to the user; simplifying the construct named above may help."))
         return 0
     report.flows = flows
     for sev, code, file, line, msg, sug in found:
@@ -385,7 +389,13 @@ def _check_flows(project_dir: Path, ledger: FactLedger, report: VerifyReport) ->
         entries = [name for name in model.functions if "::" not in name and (_ENTRY_RE.search(name) or name in ("main", "setup", "app_main"))]
         reported = set()
         for name in entries[:40]:
-            for e in model.trace(name).events:
+            try:
+                events = model.trace(name).events
+            except Exception as e:   # e.g. RecursionError on deeply nested code: say so, do not crash verify
+                report.findings.append(Finding("ERROR", "FLOW_CHECK_ERROR", "", 0,
+                                               f"Tracing {name}() failed: {type(e).__name__}: {str(e)[:200]}"))
+                continue
+            for e in events:
                 f = addr_facts.get(e.addr) if isinstance(e.addr, int) else None
                 if f is None or e.kind != "write" or f.subject.lower() in covered or f.subject.lower() in reported:
                     continue
