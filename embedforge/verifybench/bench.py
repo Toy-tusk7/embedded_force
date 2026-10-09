@@ -15,7 +15,7 @@ from embedforge.agent.workspace import Project
 from embedforge.truth import FactLedger, SourceStore, verify_project
 from embedforge.truth.registers import RegisterBook
 from embedforge.truth.sequences import SequenceBook
-from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, driver, mutants
+from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, MUST_FAIL, driver, mutants
 
 DATASHEET = (Path(__file__).parent / "datasheet.md").read_text(encoding="utf-8")
 DEVICE = "DM388"
@@ -52,8 +52,9 @@ def _row(text: str) -> str:
     return DATASHEET[DATASHEET.rfind("\n", 0, i) + 1:DATASHEET.find("\n", i)]
 
 
-def build_truth(root: Path) -> Dict[str, str]:
-    """Record the DM388 ground truth into a project at `root`; returns key -> FACT id. Every record must pass its gate."""
+def build_truth(root: Path, facts_only: bool = False) -> Dict[str, str]:
+    """Record the DM388 ground truth into a project at `root`; returns key -> FACT id. Every record must pass its gate.
+    facts_only: the facts but no register map and no sequence (what a careless run leaves behind)."""
     p = Project("verifybench", root)
     store = SourceStore(p.root)
     src = store.add("https://example.com/dm388-datasheet.pdf", "DM388 datasheet", DATASHEET, kind="pdf")
@@ -64,6 +65,8 @@ def build_truth(root: Path) -> Dict[str, str]:
         if not r.get("ok"):
             raise RuntimeError(f"ground truth fact {key} rejected: {r.get('error')}")
         ids[key] = r["fact"]["id"]
+    if facts_only:
+        return ids
     book = RegisterBook(p.root)
     regs = [
         {"name": "CHIP_ID", "addr": "0x00", "id_value": "0x50", "quote": _cut("Table 3: Register 0x00", "fixed to 0x50 |"),
@@ -152,12 +155,19 @@ def _verify(template: Path, work: Path, file_name: str, code: str) -> List[str]:
 
 def run(frameworks: Optional[List[str]] = None, with_mutants: bool = True, workdir: Optional[Path] = None) -> List[Case]:
     base = Path(workdir or tempfile.mkdtemp(prefix="verifybench-"))
-    template = base / "truth"
-    if template.exists():
-        shutil.rmtree(template)
+    template, bare = base / "truth", base / "facts_only"
+    for t in (template, bare):
+        if t.exists():
+            shutil.rmtree(t)
     ids = build_truth(template)
+    build_truth(bare, facts_only=True)
     cases: List[Case] = []
-    for fw in frameworks or list(FRAMEWORKS) + list(IDIOMS):
+    names = frameworks or list(FRAMEWORKS) + list(IDIOMS) + list(MUST_FAIL)
+    for fw in [n for n in names if n in MUST_FAIL]:   # unchecked code must not pass
+        name, src = driver(fw)
+        errors = _verify(bare, base / "run", name, _fill(src, ids))
+        cases.append(Case(fw, "must_fail", "verify cannot check this code, so it must not pass", not errors, errors, caught=bool(errors)))
+    for fw in [n for n in names if n not in MUST_FAIL]:
         name, src = driver(fw)
         errors = _verify(template, base / "run", name, _fill(src, ids))
         cases.append(Case(fw, "", "correct driver", not errors, errors))
@@ -173,10 +183,13 @@ def run(frameworks: Optional[List[str]] = None, with_mutants: bool = True, workd
 
 def summary(cases: List[Case]) -> Dict[str, object]:
     correct = [c for c in cases if not c.mutation]
-    muts = [c for c in cases if c.mutation]
+    muts = [c for c in cases if c.mutation and c.mutation != "must_fail"]
+    blocked = [c for c in cases if c.mutation == "must_fail"]
     return {
         "correct_passed": sum(c.passed for c in correct), "correct_total": len(correct),
         "false_errors": {c.framework: c.errors for c in correct if not c.passed},
         "caught": sum(bool(c.caught) for c in muts), "mutants": len(muts),
         "missed": [f"{c.framework}/{c.mutation}: {c.what}" for c in muts if not c.caught],
+        "unchecked_blocked": sum(bool(c.caught) for c in blocked), "unchecked_total": len(blocked),
+        "unchecked_passed": [c.framework for c in blocked if not c.caught],
     }

@@ -396,10 +396,27 @@ IDIOMS: Dict[str, Tuple[str, List[Tuple[str, str]], List[Tuple[str, str, str, st
 }
 
 
+# Code verify cannot check must not pass: drivers verified against facts only (no sequence, no register map), or that
+# talk to the bus through calls the analysis does not model. name -> (framework, edits); each must FAIL verify.
+MUST_FAIL: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {
+    "i2c_without_records": ("pico_i2c", []),
+    "spi_without_records": ("pico_spi", []),
+    "arduino_spi_without_records": ("arduino_spi", []),
+    "unmodelled_bus_call": ("pico_i2c", [("i2c_write_blocking(i2c0, DM388_ADDR, buf, 2, false) == 2",
+                                          "i2c_write_burst_blocking(i2c0, DM388_ADDR, buf, 2) == 2")]),
+    "unmodelled_spi_call": ("zephyr", [
+        ("static int write_reg(uint8_t reg, uint8_t val) { return i2c_reg_write_byte_dt(&dm388, reg, val); }",
+         "static const struct spi_dt_spec bus = SPI_DT_SPEC_GET(DT_NODELABEL(dm388), SPI_WORD_SET(8), 0);\n"
+         "static int write_reg(uint8_t reg, uint8_t val) {\n    uint8_t tx[2] = {reg & 0x7F, val};\n"
+         "    struct spi_buf b = {.buf = tx, .len = 2};\n    struct spi_buf_set s = {.buffers = &b, .count = 1};\n"
+         "    return spi_write_dt(&bus, &s);\n}")]),
+}
+
+
 def driver(framework: str) -> Tuple[str, str]:
     """(file name, source with @F(key)@ placeholders) of the correct driver for a framework or idiom variant."""
-    if framework in IDIOMS:
-        base, edits, _ = IDIOMS[framework]
+    if framework in IDIOMS or framework in MUST_FAIL:
+        base, edits = IDIOMS[framework][:2] if framework in IDIOMS else MUST_FAIL[framework]
         name, src = driver(base)
         for old, new in edits:
             assert old in src, f"{framework}: {old!r} not in the {base} driver"

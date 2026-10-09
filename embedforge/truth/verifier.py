@@ -11,6 +11,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
+from embedforge.truth.flow import is_int
 from embedforge.truth.ledger import FactLedger, parse_int
 
 SRC_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc", ".ino", ".s", ".S"}
@@ -331,8 +332,11 @@ def _check_registers(project_dir: Path, ledger: FactLedger, report: VerifyReport
     for f in found:
         report.findings.append(Finding(f.severity, f.code, f.file, f.line, f.message, suggestion=f.suggestion))
     if RegisterBook(project_dir).empty():
-        configured ={x.message.split(" (address")[0] for x in report.findings if x.code == "FLOW_UNSPECIFIED"}
+        configured = {x.message.split(" (address")[0] for x in report.findings
+                      if x.code == "FLOW_UNSPECIFIED" and not x.message.startswith("An SPI device")}
         configured |= _configured_devices(project_dir, ledger, report)
+        if getattr(report, "spi_configured", False):
+            configured.add("The SPI device")
         for dev in sorted(configured):
             report.findings.append(Finding(
                 "ERROR", "REG_MAP_MISSING", "", 0,
@@ -378,31 +382,61 @@ def _check_flows(project_dir: Path, ledger: FactLedger, report: VerifyReport) ->
     report.flows = flows
     for sev, code, file, line, msg, sug in found:
         report.findings.append(Finding(sev, code, file, line, msg, suggestion=sug))
-    # coverage: a device the code configures needs its datasheet sequence on record
-    covered = {r.subject.lower() for r in SequenceBook(project_dir).items.values()}
+    # coverage: a device the code configures needs its datasheet sequence on record, and bus traffic the analysis
+    # cannot follow must not pass as checked
+    sequences = SequenceBook(project_dir).items.values()
+    covered = {r.subject.lower() for r in sequences}
     addr_facts = {}
     for f in ledger.facts.values():
         n = parse_int(str(f.value))
         if n is not None and 0 < n < 0x400 and _ADDR_PROP_RE.search(f.property):
             addr_facts.setdefault(n, f)
-    if addr_facts:
-        entries = [name for name in model.functions if "::" not in name and (_ENTRY_RE.search(name) or name in ("main", "setup", "app_main"))]
-        reported = set()
-        for name in entries[:40]:
-            try:
-                events = model.trace(name).events
-            except Exception as e:   # e.g. RecursionError on deeply nested code: say so, do not crash verify
-                report.findings.append(Finding("ERROR", "FLOW_CHECK_ERROR", "", 0,
-                                               f"Tracing {name}() failed: {type(e).__name__}: {str(e)[:200]}"))
-                continue
-            for e in events:
-                f = addr_facts.get(e.addr) if isinstance(e.addr, int) else None
-                if f is None or e.kind != "write" or f.subject.lower() in covered or f.subject.lower() in reported:
-                    continue
-                reported.add(f.subject.lower())
+    entries = [name for name in model.functions if "::" not in name and (_ENTRY_RE.search(name) or name in ("main", "setup", "app_main"))]
+    reported, opaque_seen = set(), set()
+    spi_write = None
+    for name in entries[:40]:
+        try:
+            tr = model.trace(name)
+        except Exception as e:   # e.g. RecursionError on deeply nested code: say so, do not crash verify
+            report.findings.append(Finding("ERROR", "FLOW_CHECK_ERROR", "", 0,
+                                           f"Tracing {name}() failed: {type(e).__name__}: {str(e)[:200]}"))
+            continue
+        for o in tr.opaque:
+            call = o[:-2] if o.endswith("()") else o
+            if _BUS_CALL_RE.match(call) and call not in opaque_seen:
+                opaque_seen.add(call)
                 report.findings.append(Finding(
-                    "ERROR", "FLOW_UNSPECIFIED", e.file, e.entry_line,
-                    f"{f.subject} (address {f.value}, {f.id}) is configured in {name}() but no datasheet sequence was recorded, "
-                    "so the order and timing of its init are not checked.",
-                    suggestion="record_sequence with the datasheet's required init/reset order (steps citing register, value and delay facts)."))
+                    "ERROR", "FLOW_OPAQUE_BUS", "", 0,
+                    f"{name}() talks to the bus through {call}(), which verify does not model, so that traffic (registers, "
+                    "values, order) is unchecked.",
+                    suggestion="Use a bus call verify follows (pico-sdk i2c_write_blocking/i2c_read_blocking/spi_*_blocking, "
+                               "HAL_I2C_Mem_Read/Write, HAL_SPI_*, ESP-IDF i2c_master_*, Zephyr i2c_burst_read_dt/"
+                               "i2c_reg_write_byte_dt, Arduino Wire/SPI.transfer), or report it to the user."))
+        for e in tr.events:
+            if e.kind == "write" and e.bus == "spi" and is_int(e.reg) and spi_write is None:
+                spi_write = (name, e)
+            f = addr_facts.get(e.addr) if isinstance(e.addr, int) else None
+            if f is None or e.kind != "write" or f.subject.lower() in covered or f.subject.lower() in reported:
+                continue
+            reported.add(f.subject.lower())
+            report.findings.append(Finding(
+                "ERROR", "FLOW_UNSPECIFIED", e.file, e.entry_line,
+                f"{f.subject} (address {f.value}, {f.id}) is configured in {name}() but no datasheet sequence was recorded, "
+                "so the order and timing of its init are not checked.",
+                suggestion="record_sequence with the datasheet's required init/reset order (steps citing register, value and delay facts)."))
+    if spi_write is not None:   # SPI traffic carries no bus address: any SPI register write needs the sequence and the map
+        report.spi_configured = True
+        if not covered:
+            name, e = spi_write
+            report.findings.append(Finding(
+                "ERROR", "FLOW_UNSPECIFIED", e.file, e.entry_line,
+                f"An SPI device is configured in {name}() (register {e.reg:#04x}) but no datasheet sequence was recorded, so the "
+                "order and timing of its init are not checked.",
+                suggestion="record_sequence with the datasheet's required init/reset order (steps citing register, value and delay facts)."))
     return sum(1 for r in report.flows for s in r["steps"] if s["status"] == "matched")
+
+
+# bus transfers through SDK calls the flow model does not follow (i2c_write_burst_blocking, spi_write_dt, i2c_transfer_dt,
+# spi_device_polling_transmit, HAL_I2C_Master_Seq_Transmit_IT): their register traffic would go unchecked
+_BUS_CALL_RE = re.compile(r"^(?:[A-Za-z0-9]+_)*(?:i2c|spi|twi|smbus)\w*?(?:read|write|transfer|transceive|xfer|transmit|receive|"
+                          r"cmd_begin|exec)\w*$", re.I)

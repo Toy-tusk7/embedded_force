@@ -7,3 +7,4 @@ def test_verify_passes_correct_drivers_and_catches_every_planted_bug(tmp_path):
     s = summary(run(workdir=tmp_path))
     assert s["correct_passed"] == s["correct_total"], s["false_errors"]
     assert s["caught"] == s["mutants"], s["missed"]
+    assert s["unchecked_blocked"] == s["unchecked_total"], s["unchecked_passed"]   # code verify cannot check never passes
