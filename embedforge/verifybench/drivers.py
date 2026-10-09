@@ -204,7 +204,7 @@ static int write_reg(uint8_t reg, uint8_t val) {
 static int read_regs(uint8_t reg, uint8_t *buf, size_t len) {
     return i2c_master_write_read_device(I2C_NUM_0, DM388_ADDR, &reg, 1, buf, len, pdMS_TO_TICKS(100)) == ESP_OK ? 0 : -1;
 }
-static void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+static void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms) + 1); }   /* + 1: the current tick is already partly over */
 """, r"""
 void app_main(void) {
     if (dm388_init() != 0) return;
@@ -243,7 +243,7 @@ static int read_regs(uint8_t reg, uint8_t *buf, size_t len) {
     i2c_cmd_link_delete(cmd);
     return ret == ESP_OK ? 0 : -1;
 }
-static void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
+static void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms) + 1); }   /* + 1: the current tick is already partly over */
 """, r"""
 void app_main(void) {
     if (dm388_init() != 0) return;
@@ -389,11 +389,59 @@ IDIOMS: Dict[str, Tuple[str, List[Tuple[str, str]], List[Tuple[str, str, str, st
           "osr = (uint8_t)((osr & ~0x3F) | DM388_OSR_VALUE);", "osr = (uint8_t)((osr & ~0x3F) | DM388_OSR_VALUE | 0x80);"),
          ("rmw_wrong_value", "the read-modify-write sets OSR to 0x09 (temperature x2, pressure x2)",
           "osr = (uint8_t)((osr & ~0x3F) | DM388_OSR_VALUE);", "osr = (uint8_t)((osr & ~0x3F) | (DM388_OSR_VALUE & 0x0F) - 2);")]),
+    "paired_write": ("pico_i2c", [(
+        "    write_reg(DM388_OSR_REG, DM388_OSR_VALUE);\n    write_reg(DM388_ODR_REG, DM388_ODR_VALUE);\n",
+        "    uint8_t cfg[4] = {DM388_OSR_REG, DM388_OSR_VALUE, DM388_ODR_REG, DM388_ODR_VALUE};   /* reg, data pairs */\n"
+        "    i2c_write_blocking(i2c0, DM388_ADDR, cfg, 4, false);\n")],
+        [("paired_wrong_value", "the paired write sets ODR to 0x03",
+          "DM388_ODR_REG, DM388_ODR_VALUE};", "DM388_ODR_REG, DM388_ODR_VALUE + 1};")]),
+    "freertos_100hz": ("esp_idf", [(   # sdkconfig.defaults sets 100 Hz: a tick is 10 ms
+        "static void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms) + 1); }   /* + 1: the current tick is already partly over */",
+        "static void delay_ms(uint32_t ms) {   /* whole ticks, rounded up, + 1 for the tick already under way */\n"
+        "    vTaskDelay((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1);\n}")],
+        [("tick_rounds_to_zero", "vTaskDelay(pdMS_TO_TICKS(2)) waits 0 ticks at 100 Hz",
+          "vTaskDelay((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1);", "vTaskDelay(pdMS_TO_TICKS(ms));"),
+         ("one_partial_tick", "vTaskDelay(pdMS_TO_TICKS(2) + 1) is 1 tick at 100 Hz, which can end at once",
+          "vTaskDelay((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1);", "vTaskDelay(pdMS_TO_TICKS(ms) + 1);")]),
+    "two_files_same_names": ("pico_i2c", [
+        ("#define DM388_ADDR 0x76   /* @F(addr)@ */", "#define DEV 0x76   /* @F(addr)@ */\n#define DM388_ADDR DEV")], []),
     "goto_cleanup": ("pico_i2c", [
         ("    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) return -1;\n    if (id != DM388_CHIP_ID) return -2;\n",
          "    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) goto fail;\n    if (id != DM388_CHIP_ID) goto fail;\n"),
         (_PWR_WRITE + "    return 0;\n}\n", _PWR_WRITE + "    return 0;\nfail:\n    return -1;\n}\n")], []),
 }
+
+
+# other project files a variant needs (path relative to the project -> content)
+EXTRA_FILES: Dict[str, Dict[str, str]] = {
+    "esp_idf_legacy": {"sdkconfig.defaults": "CONFIG_FREERTOS_HZ=1000\n"},   # the plain esp_idf driver leaves the rate unstated
+    "freertos_100hz": {"sdkconfig.defaults": "CONFIG_FREERTOS_HZ=100\n"},
+    # another module of the project whose own DEV, write_reg and read_regs mean something else (a settings page in RAM)
+    "two_files_same_names": {"src/zz_settings.c": r"""
+#include <stdint.h>
+#include <stddef.h>
+#define DEV 0x01                                /* settings page in use */
+static uint8_t page[16];
+static int write_reg(uint8_t reg, uint8_t val) {
+    uint8_t slot = (uint8_t)(reg & 0x0F);
+    page[slot] = val;
+    page[0] = (uint8_t)(page[0] + DEV);         /* change counter */
+    return 0;
+}
+static int read_regs(uint8_t reg, uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = page[(reg + i) & 0x0F];
+    }
+    return 0;
+}
+int settings_set(uint8_t key, uint8_t value) { return write_reg(key, value); }
+int settings_get(uint8_t key, uint8_t *value) { return read_regs(key, value, 1); }
+"""},
+}
+
+
+def extra_files(framework: str) -> Dict[str, str]:
+    return EXTRA_FILES.get(framework, {})
 
 
 # Code verify cannot check must not pass: drivers verified against facts only (no sequence, no register map), or that
@@ -426,6 +474,10 @@ def driver(framework: str) -> Tuple[str, str]:
     return name, bus + CORE + entry
 
 
+# core mutations that are not bugs in a variant: there the changed code still does what the datasheet requires
+HARMLESS = {"freertos_100hz": {"short_delay"}}   # 1 ms rounds up to 2 ticks at 100 Hz: at least 10 ms
+
+
 def mutants(framework: str) -> List[Tuple[str, str, str]]:
     """(key, what is wrong, source) for every bug planted in the driver (core bugs an idiom variant rewrote are skipped)."""
     _name, src = driver(framework)
@@ -433,6 +485,8 @@ def mutants(framework: str) -> List[Tuple[str, str, str]]:
     own = IDIOMS[framework][2] if framework in IDIOMS else []
     out = []
     for key, what, old, new in CORE_MUTATIONS + BUS_MUTATIONS.get(base, []) + own:
+        if key in HARMLESS.get(framework, ()):
+            continue
         if old not in src:
             assert framework in IDIOMS and (key, what, old, new) not in own, f"{framework}/{key}: {old!r} not in the driver"
             continue

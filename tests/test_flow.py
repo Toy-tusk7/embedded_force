@@ -125,10 +125,51 @@ typedef struct { int8_t (*write)(uint8_t, const uint8_t *, uint32_t, void *); vo
 int8_t bmp3_soft_reset(bmp3_dev *dev) { uint8_t cmd = 0xB6; dev->write(BMP3_REG_CMD, &cmd, 1, dev->intf_ptr); dev->delay_us(2000, dev->intf_ptr); return 0; }""",
      "bmp3_soft_reset", ["write 0x7E <- 0xB6", "delay 2000 us"]),
     ("""void init(void) { uint8_t b[2]; b[0] = 0x7E; b[1] = 0xB6; i2c_master_write_to_device(I2C_NUM_0, 0x76, b, 2, 100);
-  vTaskDelay(pdMS_TO_TICKS(3)); }""", "init", ["write 0x7E <- 0xB6", "delay 3000 us"]),
+  vTaskDelay(pdMS_TO_TICKS(3)); }""", "init", ["write 0x7E <- 0xB6", "delay 2000 us (vTaskDelay(3) at 1000 Hz: at least 2 whole tick(s))"]),
 ])
 def test_traces_in_each_hal_style(code, entry, expected):
     assert [e.describe() for e in FlowModel({"src/x.cpp": code}).trace(entry).events] == expected
+
+
+@pytest.mark.parametrize("hz, call, waits", [
+    (100, "vTaskDelay(pdMS_TO_TICKS(2))", 0),                     # 2 ms is 0 ticks at 100 Hz
+    (100, "vTaskDelay(pdMS_TO_TICKS(2) + 1)", 0),                 # 1 tick: it can end at the very next tick
+    (100, "vTaskDelay((2 + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1)", 10000),
+    (1000, "vTaskDelay(pdMS_TO_TICKS(2) + 1)", 2000),
+    (1000, "vTaskDelay(2 / portTICK_PERIOD_MS)", 1000),
+])
+def test_freertos_delays_count_whole_ticks_at_the_project_tick_rate(tmp_path, hz, call, waits):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.c").write_text("void init(void) { " + call + "; }", encoding="utf-8")
+    (tmp_path / "sdkconfig.defaults").write_text(f"CONFIG_FREERTOS_HZ={hz}\n", encoding="utf-8")
+    model = FlowModel.from_dir(tmp_path)
+    [e] = model.trace("init").events
+    assert e.delay_us == waits and not e.assumed
+    # FreeRTOSConfig.h in the sources states it too; with nothing stated the rate is an assumption
+    assert FlowModel({"include/FreeRTOSConfig.h": "#define configTICK_RATE_HZ ((TickType_t)250)"}).tick_hz == 250
+    assert FlowModel({"src/main.c": "void init(void) { " + call + "; }"}).trace("init").events[0].assumed
+
+
+def test_two_files_keep_their_own_macros_and_static_helpers():
+    files = {
+        "src/a.c": "#define DEV 0x76\nstatic void wr(uint8_t r, uint8_t v) { uint8_t b[2] = {r, v}; i2c_write_blocking(i2c0, DEV, b, 2, false); }\n"
+                   "void a_init(void) { wr(0x7E, 0xB6); }",
+        "src/b.c": "#define DEV 0x01\nstatic uint8_t page[4];\nstatic void wr(uint8_t r, uint8_t v) { page[r & 3] = v; page[0] = (uint8_t)(page[0] + DEV); }\n"
+                   "void b_set(uint8_t k, uint8_t v) { wr(k, v); }",
+    }
+    [e] = FlowModel(files).trace("a_init").events
+    assert (e.addr, e.describe()) == (0x76, "write 0x7E <- 0xB6")
+    assert FlowModel(files).trace("b_set").events == []
+
+
+def test_a_multi_register_write_is_read_the_way_the_register_map_allows():
+    from embedforge.truth.flow import Event, writes_of
+    e = Event("write", addr=0x76, reg=0x1C, data=[0x0B, 0x1D, 0x02])   # OSR=0x0B, then the pair ODR=0x02
+    mapped = {0x1B, 0x1C, 0x1D}.__contains__
+    assert writes_of(e, mapped) == [(0x1C, 0x0B), (0x1D, 0x02)]
+    burst = Event("write", addr=0x76, reg=0x1B, data=[0x33, 0x0B, 0x02])   # PWR, OSR, ODR in a row
+    assert writes_of(burst, mapped) == [(0x1B, 0x33), (0x1C, 0x0B), (0x1D, 0x02)]
+    assert len(writes_of(e)) == 5   # without a map: both readings
 
 
 def test_read_data_is_runtime_and_branches_are_conditional():

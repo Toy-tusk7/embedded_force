@@ -15,7 +15,7 @@ from embedforge.agent.workspace import Project
 from embedforge.truth import FactLedger, SourceStore, verify_project
 from embedforge.truth.registers import RegisterBook
 from embedforge.truth.sequences import SequenceBook
-from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, MUST_FAIL, driver, mutants
+from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, MUST_FAIL, driver, extra_files, mutants
 
 DATASHEET = (Path(__file__).parent / "datasheet.md").read_text(encoding="utf-8")
 DEVICE = "DM388"
@@ -142,12 +142,15 @@ def _fill(src: str, ids: Dict[str, str]) -> str:
     return re.sub(r"@F\((\w+)\)@", lambda m: ids[m.group(1)], src)
 
 
-def _verify(template: Path, work: Path, file_name: str, code: str) -> List[str]:
+def _verify(template: Path, work: Path, file_name: str, code: str, extra: Optional[Dict[str, str]] = None) -> List[str]:
     if work.exists():
         shutil.rmtree(work)
     shutil.copytree(template, work)
     (work / "src").mkdir(exist_ok=True)
     (work / "src" / file_name).write_text(code, encoding="utf-8")
+    for rel, text in (extra or {}).items():
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_text(text, encoding="utf-8")
     store = SourceStore(work)
     rep = verify_project(work, FactLedger(work, store))
     return [f"{f.code} {f.file}:{f.line} {f.message[:160]}" for f in rep.findings if f.severity == "ERROR"]
@@ -169,13 +172,14 @@ def run(frameworks: Optional[List[str]] = None, with_mutants: bool = True, workd
         cases.append(Case(fw, "must_fail", "verify cannot check this code, so it must not pass", not errors, errors, caught=bool(errors)))
     for fw in [n for n in names if n not in MUST_FAIL]:
         name, src = driver(fw)
-        errors = _verify(template, base / "run", name, _fill(src, ids))
+        extra = extra_files(fw)
+        errors = _verify(template, base / "run", name, _fill(src, ids), extra)
         cases.append(Case(fw, "", "correct driver", not errors, errors))
         if not with_mutants:
             continue
         base_codes = {e.split(" ", 1)[0] for e in errors}
         for key, what, msrc in mutants(fw):
-            merr = _verify(template, base / "run", name, _fill(msrc, ids))
+            merr = _verify(template, base / "run", name, _fill(msrc, ids), extra)
             new = [e for e in merr if e.split(" ", 1)[0] not in base_codes]
             cases.append(Case(fw, key, what, not merr, merr, caught=bool(new)))
     return cases

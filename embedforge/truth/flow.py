@@ -19,7 +19,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 SOURCE_EXTS = {".c", ".h", ".cpp", ".hpp", ".cc", ".ino"}
 MAX_DEPTH = 10
@@ -196,6 +196,7 @@ class Event:
     bus: str = "i2c"
     note: str = ""
     sites: Tuple[int, ...] = ()    # call-site lines from the entry function down to the primitive
+    assumed: str = ""              # a delay whose length rests on an assumption the project does not state (tick rate)
 
     @property
     def entry_line(self) -> int:
@@ -221,7 +222,7 @@ class Event:
     def describe(self) -> str:
         p = self.public()
         if self.kind == "delay":
-            return f"delay {p['delay_us']} us"
+            return f"delay {p['delay_us']} us" + (f" ({self.note})" if self.note.startswith("vTaskDelay") else "")
         if self.kind == "write":
             return f"write {p['reg']} <- {', '.join(str(x) for x in p['data'])}"
         return f"read {p['reg']} x{p['length']}"
@@ -340,12 +341,22 @@ class Function:
     refs: Tuple[int, ...] = ()                                         # indexes of C++ reference parameters (T &x)
     ptypes: Tuple[str, ...] = ()                                       # value type per parameter ('' = not converted)
     rtype: str = ""                                                    # value type of the return value
+    static: bool = False                                               # file-local (C 'static'): other files cannot call it
 
 
 @dataclass
 class Macro:
     params: Optional[List[str]]  # None = object-like
     body: List[Tok]
+
+
+def _unit(file: str) -> str:
+    """The translation unit whose own macros, constants and static functions a file sees: each C/C++ source is one, all
+    .ino files of a sketch are one (Arduino joins them); a header is '' (what it defines is visible everywhere)."""
+    low = file.lower()
+    if low.endswith(".ino"):
+        return "<sketch>"
+    return file if low.endswith((".c", ".cc", ".cpp", ".cxx")) else ""
 
 
 _KEYWORDS = {"if", "else", "for", "while", "do", "switch", "case", "default", "return", "break", "continue", "goto",
@@ -355,7 +366,7 @@ _KEYWORDS = {"if", "else", "for", "while", "do", "switch", "case", "default", "r
              "new", "delete", "this", "true", "false", "nullptr", "NULL", "auto", "register", "constexpr", "using"}
 _TYPE_WORDS = {"unsigned", "signed", "const", "volatile", "char", "short", "int", "long", "float", "double", "bool",
                "_Bool", "void", "struct", "enum", "union", "static", "register", "auto", "constexpr", "size_t", "ssize_t"}
-_TYPE_RE = re.compile(r"^(u?int(8|16|32|64)_t|u?int_(least|fast)(8|16|32|64)_t|uintptr_t|intptr_t|size_t|ssize_t|byte|uint|u8|u16|u32|s8|s16|s32|BYTE|WORD|DWORD|uint8|uint16|uint32|int8|int16|int32)$")
+_TYPE_RE = re.compile(r"^(u?int(8|16|32|64)_t|u?int_(least|fast)(8|16|32|64)_t|uintptr_t|intptr_t|size_t|ssize_t|byte|uint|u8|u16|u32|s8|s16|s32|BYTE|WORD|DWORD|uint8|uint16|uint32|int8|int16|int32|TickType_t|BaseType_t|UBaseType_t)$")
 
 
 def _looks_type(tokens: Sequence[Tok], known_types: set) -> bool:
@@ -420,10 +431,32 @@ SDK_CONSTANTS = {   # values fixed by the SDKs, so `== HAL_OK` and `(addr << 1) 
 }
 
 
+_FREERTOS_HZ_RE = re.compile(r"^\s*CONFIG_FREERTOS_HZ\s*=\s*(\d+)", re.M)
+ASSUMED_TICK_HZ = 1000   # when a project does not state its tick rate: the fastest common rate, where pdMS_TO_TICKS waits longest
+
+
+def stated_tick_hz(root: Path) -> Optional[int]:
+    """The FreeRTOS tick rate an ESP-IDF project's configuration states (CONFIG_FREERTOS_HZ in its sdkconfig, else in
+    sdkconfig.defaults), or None."""
+    root = Path(root)
+    try:
+        found = [p for p in root.glob("sdkconfig*") if p.is_file() and not p.name.endswith(".old")]
+    except OSError:
+        return None
+    for p in sorted(found, key=lambda p: (p.name.startswith("sdkconfig.defaults"), p.name)):
+        try:
+            m = _FREERTOS_HZ_RE.search(p.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+        if m and int(m.group(1)) > 0:
+            return int(m.group(1))
+    return None
+
+
 class FlowModel:
     """All functions, macros, enums and constant globals of a set of C/C++ sources."""
 
-    def __init__(self, files: Dict[str, str]):
+    def __init__(self, files: Dict[str, str], tick_hz: Optional[int] = None):
         self.functions: Dict[str, List[Function]] = {}
         self.macros: Dict[str, Macro] = {}
         self.consts: Dict[str, List[Tok]] = {}       # enum members and const globals: name -> expression tokens
@@ -439,10 +472,31 @@ class FlowModel:
         self.global_types: Dict[str, str] = {}
         self.global_type_text: Dict[str, str] = {}   # name -> full declared type ('unsigned int', 'float')
         self.field_types: Dict[str, Optional[str]] = {}   # struct/class member -> declared type (None when ambiguous)
+        # what a source file defines for itself (macros, enum members, const globals and tables): two drivers in one
+        # project may both say `#define I2C_ADDR` or `static const uint8_t init_tbl[]`; each file sees its own
+        self.unit_macros: Dict[str, Dict[str, Macro]] = {}
+        self.unit_consts: Dict[str, Dict[str, List[Tok]]] = {}
+        self.unit_arrays: Dict[str, Dict[str, List[Tok]]] = {}
+        self._file = ""
         for name, text in sorted(files.items()):
+            self._file = name
             self._load(name, text)
+        self._file = ""
         for name, value in SDK_CONSTANTS.items():   # SDK headers are not in the project: their status/flag values are
             if name not in self.macros and name not in self.consts:
+                self.macros[name] = Macro(None, tokenize(value))
+        # FreeRTOS tick rate: the project's configuration (sdkconfig), else its own FreeRTOSConfig.h, else assumed
+        if tick_hz is None:
+            for name in ("configTICK_RATE_HZ", "CONFIG_FREERTOS_HZ"):
+                v = Evaluator(self, {}, ()).eval([Tok("id", name, 0)]) if name in self.macros else None
+                if is_int(v) and v > 0:
+                    tick_hz = v
+                    break
+        self.tick_assumed = tick_hz is None
+        self.tick_hz: int = tick_hz or ASSUMED_TICK_HZ
+        for name, value in (("configTICK_RATE_HZ", str(self.tick_hz)), ("CONFIG_FREERTOS_HZ", str(self.tick_hz)),
+                            ("portTICK_PERIOD_MS", f"( 1000 / {self.tick_hz} )"), ("portTICK_RATE_MS", f"( 1000 / {self.tick_hz} )")):
+            if name not in self.macros:
                 self.macros[name] = Macro(None, tokenize(value))
 
     @classmethod
@@ -458,7 +512,7 @@ class FlowModel:
                             files[str(p.relative_to(root)).replace("\\", "/")] = p.read_text(encoding="utf-8", errors="ignore")
                         except OSError:
                             continue
-        return cls(files)
+        return cls(files, stated_tick_hz(root))
 
     # ---------------------------------------------------------- loading
     def _load(self, name: str, text: str) -> None:
@@ -531,7 +585,7 @@ class FlowModel:
                       lambda m: "1" if (m.group(1) or m.group(2)) in self._defined else "__UNKNOWN__", rest)
         if "__UNKNOWN__" in expr:
             return "unknown"
-        v = Evaluator(self, {}, ()).eval(tokenize(expr))
+        v = Evaluator(self, {}, (), file=self._file).eval(tokenize(expr))
         if is_int(v):
             return "true" if v else "false"
         return "unknown"
@@ -543,10 +597,37 @@ class FlowModel:
         name, params = m.group(1), m.group(3)
         if m.group(2) is not None and rest[len(name)] == "(":  # function-like: '(' immediately after the name
             plist = [p.strip() for p in params.split(",") if p.strip()]
-            self.macros[name] = Macro(plist, tokenize(m.group(4)))
+            self._own(self.unit_macros, self.macros, name, Macro(plist, tokenize(m.group(4))))
         else:
             body = rest[len(name):].strip()
-            self.macros[name] = Macro(None, tokenize(body))
+            self._own(self.unit_macros, self.macros, name, Macro(None, tokenize(body)))
+
+    def _own(self, per_unit: Dict[str, Dict[str, Any]], shared: Dict[str, Any], name: str, value: Any) -> None:
+        """Record a definition of the file being loaded: a source file's own table, plus the shared one (a header's
+        definitions only go there; a source file's go there only if no other file defined the name first)."""
+        unit = _unit(self._file)
+        if unit:
+            per_unit.setdefault(unit, {})[name] = value
+            shared.setdefault(name, value)
+        else:
+            shared[name] = value
+
+    def symbol(self, name: str, file: str = "") -> Tuple[str, Any]:
+        """('macro', Macro) / ('const', tokens) / ('array', tokens) / ('', None): what `name` means in `file`, its own
+        definitions before the rest of the project's."""
+        unit = _unit(file)
+        for kind, table in (("macro", self.unit_macros), ("const", self.unit_consts), ("array", self.unit_arrays)):
+            v = table.get(unit, {}).get(name) if unit else None
+            if v is not None:
+                return kind, v
+        for kind, shared in (("macro", self.macros), ("const", self.consts), ("array", self.global_arrays)):
+            if name in shared:
+                return kind, shared[name]
+        return "", None
+
+    def macro(self, name: str, file: str = "") -> Optional[Macro]:
+        kind, v = self.symbol(name, file)
+        return v if kind == "macro" else None
 
     def _scan(self, fname: str, toks: List[Tok], cls: str = "") -> None:
         i, n = 0, len(toks)
@@ -598,7 +679,8 @@ class FlowModel:
                         params = self._params(toks[k + 1:j])
                         refs = tuple(n2 for n2, p in enumerate(_split_args(toks[k + 1:j])) if any(x.text == "&" for x in p) and not any(x.text == "(" for x in p))
                         fn = Function(name, params, toks[i + 1:end], fname, toks[name_i].line, init, owner, refs,
-                                      self._param_types(toks[k + 1:j]), self._return_type(toks, name_i))
+                                      self._param_types(toks[k + 1:j]), self._return_type(toks, name_i),
+                                      not owner and self._is_static(toks, name_i))
                         self.functions.setdefault(name.split("::")[-1], []).append(fn)
                         if "::" in name:
                             self.functions.setdefault(name, []).append(fn)
@@ -718,9 +800,9 @@ class FlowModel:
                     if lhs and lhs[-1].text == "]":
                         lb = max(k for k, x in enumerate(lhs) if x.text == "[")
                         if lb > 0 and lhs[lb - 1].kind == "id":
-                            self.global_arrays[lhs[lb - 1].text] = seg[eq + 1:]
+                            self._own(self.unit_arrays, self.global_arrays, lhs[lb - 1].text, seg[eq + 1:])
                     elif lhs and lhs[-1].kind == "id" and any(x.text in ("const", "constexpr") for x in lhs):
-                        self.consts[lhs[-1].text] = seg[eq + 1:]
+                        self._own(self.unit_consts, self.consts, lhs[-1].text, seg[eq + 1:])
                     self._scan_fnptr_assignments(seg)   # const vtables: { .read = bmp388_read_i2c, ... }
                     i = semi + 1
                     continue
@@ -812,11 +894,11 @@ class FlowModel:
             if not item or item[0].kind != "id":
                 continue
             if len(item) >= 3 and item[1].text == "=":
-                self.consts[item[0].text] = item[2:]
-                v = Evaluator(self, {}, ()).eval(item[2:])
+                self._own(self.unit_consts, self.consts, item[0].text, item[2:])
+                v = Evaluator(self, {}, (), file=self._file).eval(item[2:])
                 nxt = v + 1 if is_int(v) else nxt + 1
             else:
-                self.consts[item[0].text] = [Tok("num", str(nxt), item[0].line)]
+                self._own(self.unit_consts, self.consts, item[0].text, [Tok("num", str(nxt), item[0].line)])
                 nxt += 1
 
     def _params(self, toks: List[Tok]) -> List[str]:
@@ -854,6 +936,16 @@ class FlowModel:
         return tuple(out)
 
     @staticmethod
+    def _is_static(toks: List[Tok], name_i: int) -> bool:
+        """`static [inline] <type> [*] name(`: the function is local to its file."""
+        k = name_i - 1
+        while k >= 0 and (toks[k].kind == "id" or toks[k].text in ("*", "&")):
+            if toks[k].text == "static":
+                return True
+            k -= 1
+        return False
+
+    @staticmethod
     def _return_type(toks: List[Tok], name_i: int) -> str:
         """The declared return value type of the function whose name is at name_i ('' for pointers / unknown)."""
         k = name_i - 1
@@ -888,10 +980,16 @@ class FlowModel:
         return sorted(cands, key=lambda c: (0 if "i2c" in c.lower() else 1 if "spi" not in c.lower() else 2))
 
     # ---------------------------------------------------------- api
-    def function(self, name: str) -> Optional[Function]:
+    def function(self, name: str, file: str = "") -> Optional[Function]:
+        """The function `name` as code in `file` calls it: the file's own definition, else one other files can see (not
+        static, or static in a header), else any."""
         cands = self.functions.get(name) or self.functions.get(name.split("::")[-1])
         if not cands:
             return None
+        if len(cands) > 1:
+            unit = _unit(file)
+            cands = ([f for f in cands if unit and _unit(f.file) == unit]
+                     or [f for f in cands if not f.static or not _unit(f.file)] or cands)
         return max(cands, key=lambda f: len(f.body))  # prefer the definition over a stub
 
     def trace(self, entry: str, args: Optional[List[Any]] = None, assume: Optional[Dict[str, Any]] = None) -> "Trace":
@@ -1008,7 +1106,7 @@ class Evaluator:
         changed = False
         while i < len(toks):
             t = toks[i]
-            mac = self.m.macros.get(t.text) if t.kind == "id" else None
+            mac = self.m.macro(t.text, self.file) if t.kind == "id" else None
             if mac and mac.params is not None and i + 1 < len(toks) and toks[i + 1].text == "(":
                 end = _match(toks, i + 1)
                 args = _split_args(toks[i + 2:end])
@@ -1306,19 +1404,19 @@ class Evaluator:
     def m_const(self, name: str, depth: int) -> Any:
         if depth > 12:
             return Sym(name)
-        mac = self.m.macros.get(name)
-        if mac and mac.params is None:
-            if not mac.body:
+        kind, found = self.m.symbol(name, self.file)
+        if kind == "macro" and found.params is None:
+            if not found.body:
                 return Sym(name)
             ev = Evaluator(self.m, {}, self.chain, None, True, self.file)
             ev._macro_depth = depth + 1
-            v = ev.eval(mac.body)
+            v = ev.eval(found.body)
             return v if v is not None else Sym(name)
-        if name in self.m.consts:
-            v = Evaluator(self.m, {}, self.chain, None, True, self.file).eval(self.m.consts[name])
+        if kind == "const":
+            v = Evaluator(self.m, {}, self.chain, None, True, self.file).eval(found)
             return v if v is not None else Sym(name)
-        if name in self.m.global_arrays:
-            v = Evaluator(self.m, {}, self.chain, None, True, self.file).eval(self.m.global_arrays[name])
+        if kind == "array":
+            v = Evaluator(self.m, {}, self.chain, None, True, self.file).eval(found)
             return v if isinstance(v, Arr) else Sym(name)
         if name in self.m.functions or name in _PRIMITIVES:
             return Sym(f"fn:{name}")   # a function used as a value (callback, function pointer)
@@ -1976,7 +2074,7 @@ class Walker:
             key = obj_key(obj)
             fv = self.fields.get((key, name)) if key is not None else None
             if isinstance(fv, Sym) and fv.text.startswith("fn:"):
-                fn = self.m.function(fv.text[3:])
+                fn = self.m.function(fv.text[3:], ev.file)
                 if fn is not None and fn.name not in self._stack:
                     return self._inline(fn, args, ev, line)
         if obj is not None and name in _SPI_METHODS and "spi" in repr(obj).lower():
@@ -2007,21 +2105,23 @@ class Walker:
                 return _BUSIO_STYLE(self, name, args, ev, line)   # Adafruit BusIO: write(buf, len, stop, prefix, prefix_len)
             if name in _FNPTR_STYLE and len(args) >= 2:
                 return _FNPTR_STYLE[name](self, args, ev, line)   # Bosch callbacks: write(reg, data, len, intf_ptr)
-            fn = self.m.function(name)
+            fn = self.m.function(name, ev.file)
             if fn is not None and fn.params and len(fn.params) == len(args):
                 return self._inline(fn, args, ev, line)
             self.opaque.add(f"{name}()")
             self._opaque_n += 1
             _opaque_fill(name, args)
             return Sym(f"{name}()")
-        if prim is not None:
-            return prim(self, args, ev, line)
-        fn = self.m.function(name)
+        fn = self.m.function(name, ev.file)
         here = self.this()
         if here is not None:   # unqualified call inside a method: prefer the method of the same class
             fn = self.m.function(f"{here[1]}::{name}") or fn
-        if fn is not None:
+        # the project's own definition is what runs, also under a name an SDK uses (its delay_ms(), its
+        # i2c_write(reg, buf, len)); inside that definition the same name is the SDK's (Sensor::delay calling delay)
+        if fn is not None and (prim is None or fn.name not in self._stack):
             return self._inline(fn, args, ev, line, arg_toks=arg_toks)
+        if prim is not None:
+            return prim(self, args, ev, line)
         self.opaque.add(f"{name}()")
         self._opaque_n += 1
         _opaque_fill(name, args)
@@ -2321,13 +2421,27 @@ def _spi_read(dst_i: int, len_i: int, ok: Optional[int] = None):
 
 
 def _vtask_delay(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
-    # vTaskDelay(pdMS_TO_TICKS(ms)) — pdMS_TO_TICKS is resolved by the caller as an opaque call returning its arg
-    w.emit(ev, line, kind="delay", delay_us=_us(a[0] if a else None, 1000), note="ticks assumed 1 ms")
+    """vTaskDelay(n) / osDelay(n): the task wakes at the n-th tick from now, and the call comes part-way through a tick, so
+    only n - 1 whole tick periods are certain (vTaskDelay(1) can return almost at once)."""
+    n = a[0] if a else None
+    hz = w.m.tick_hz
+    if isinstance(n, float) and math.isfinite(n):
+        n = int(n)
+    if is_int(n):
+        assumed = f"the project does not state its FreeRTOS tick rate; {hz} Hz assumed" if w.m.tick_assumed else ""
+        w.emit(ev, line, kind="delay", delay_us=max(0, n - 1) * 1_000_000 // hz,
+               note=f"vTaskDelay({n}) at {hz} Hz: at least {max(0, n - 1)} whole tick(s)", assumed=assumed)
+    else:
+        w.emit(ev, line, kind="delay", delay_us=Sym(f"ticks({n!r})") if n is not None else None)
     return None
 
 
-def _passthrough(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
-    return a[0] if a else None
+def _ms_to_ticks(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
+    """pdMS_TO_TICKS(ms) = ms * configTICK_RATE_HZ / 1000 in integer arithmetic: at 100 Hz, 2 ms is 0 ticks."""
+    ms = a[0] if a else None
+    if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms):
+        return int(ms) * w.m.tick_hz // 1000
+    return Sym(f"pdMS_TO_TICKS({ms!r})")
 
 
 def _k_sleep(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
@@ -2377,13 +2491,13 @@ _PRIMITIVES = {
     "HAL_I2C_Master_Transmit": _write_buf(1, 2, 3, addr_shift=1, ok=0), "HAL_I2C_Master_Receive": _read_buf(1, 3, addr_shift=1, dst_i=2, ok=0),
     "HAL_SPI_Transmit": _spi_transfer(1, None, 2, ok=0), "HAL_SPI_TransmitReceive": _spi_transfer(1, 2, 3, ok=0),
     "HAL_SPI_Receive": _spi_read(1, 2, ok=0),
-    "HAL_Delay": _delay(1000), "osDelay": _delay(1000),
+    "HAL_Delay": _delay(1000), "osDelay": _vtask_delay,
     # ESP-IDF
     "i2c_master_write_to_device": _write_buf(1, 2, 3, ok=0), "i2c_master_read_from_device": _read_buf(1, 3, ok=0),
     "i2c_master_write_read_device": _write_read(1, 2, 3, 5),
     "i2c_master_transmit": _write_buf(-1, 1, 2, ok=0), "i2c_master_receive": _read_buf(-1, 2, dst_i=1, ok=0),
     "i2c_master_transmit_receive": _write_read(-1, 1, 2, 4),
-    "esp_rom_delay_us": _delay(1), "ets_delay_us": _delay(1), "vTaskDelay": _vtask_delay, "pdMS_TO_TICKS": _passthrough,
+    "esp_rom_delay_us": _delay(1), "ets_delay_us": _delay(1), "vTaskDelay": _vtask_delay, "pdMS_TO_TICKS": _ms_to_ticks,
     # Zephyr
     "i2c_reg_write_byte": _reg_write_byte(1, 2, 3), "i2c_reg_write_byte_dt": _reg_write_byte(-1, 1, 2),
     "i2c_reg_read_byte": _reg_read_byte(1, 2, 3), "i2c_reg_read_byte_dt": _reg_read_byte(-1, 1, 2),
@@ -2630,15 +2744,30 @@ def normalize(events: List[Event]) -> List[Event]:
     return out
 
 
-def writes_of(e: Event) -> List[Tuple[Any, Any]]:
-    """(register, value) pairs a write event can stand for: consecutive (auto-increment) and interleaved reg/value pairs."""
-    pairs: List[Tuple[Any, Any]] = []
+def _write_readings(e: Event) -> List[List[Tuple[Any, Any]]]:
+    """The ways a write event can be read as (register, value) pairs: consecutive registers (auto-increment), and with an
+    odd number of data bytes >= 3 also register/value pairs (reg0 v0 reg1 v1 ..., Bosch multi-register writes)."""
     if e.kind != "write":
-        return pairs
-    for k, v in enumerate(e.data):
-        pairs.append(((e.reg + k) if is_int(e.reg) else e.reg, v))
-    if len(e.data) >= 3 and len(e.data) % 2 == 1:  # interleaved: reg0 v0 reg1 v1 ... (Bosch burst write)
-        pairs.append((e.reg, e.data[0]))
-        for k in range(1, len(e.data) - 1, 2):
-            pairs.append((e.data[k], e.data[k + 1]))
-    return pairs
+        return []
+    consecutive = [((e.reg + k) if is_int(e.reg) else e.reg, v) for k, v in enumerate(e.data)]
+    if len(e.data) >= 3 and len(e.data) % 2 == 1:
+        return [consecutive, [(e.reg, e.data[0])] + [(e.data[k], e.data[k + 1]) for k in range(1, len(e.data) - 1, 2)]]
+    return [consecutive]
+
+
+def write_reading(e: Event, mapped: Optional[Callable[[int], bool]] = None) -> Optional[List[Tuple[Any, Any]]]:
+    """The one reading of a write event, or None while it is ambiguous. With a register map (`mapped(r)`: r is a register
+    of that device) the reading whose registers are all in the map wins when the other's are not."""
+    readings = _write_readings(e)
+    if len(readings) <= 1:
+        return readings[0] if readings else []
+    if mapped is None:
+        return None
+    fits = [all(is_int(r) and mapped(r) for r, _ in rd) for rd in readings]
+    return readings[fits.index(True)] if fits.count(True) == 1 else None
+
+
+def writes_of(e: Event, mapped: Optional[Callable[[int], bool]] = None) -> List[Tuple[Any, Any]]:
+    """(register, value) pairs a write event stands for: its one reading, or every pair of every reading while ambiguous."""
+    one = write_reading(e, mapped)
+    return one if one is not None else [p for rd in _write_readings(e) for p in rd]

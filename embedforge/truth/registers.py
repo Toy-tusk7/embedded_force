@@ -1483,7 +1483,7 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         for e in w.events:
             if e.kind != "write" or not mine(e.addr):
                 continue
-            for r, v in writes_of(e):
+            for r, v in writes_of(e, lambda r, a=e.addr: reg_at(r, a) is not None or bool(parts_at(r, a))):
                 if is_int(r) and isinstance(v, Part):   # read-modify-write: reserved bits it sets for certain
                     reg = reg_at(r, e.addr)
                     extra = v.value & v.mask & 0xFF & ~(reg.defined_mask if reg is not None else 0xFF)
@@ -1695,9 +1695,9 @@ def coverage_findings(project_dir: Path, ledger: Optional[FactLedger], model: Fl
         for e in w.events:
             if e.kind not in ("read", "write") or (addrs and is_int(e.addr) and e.addr not in addrs):
                 continue
-            regs = [r for r, _ in writes_of(e)] if e.kind == "write" else ([e.reg] if is_int(e.reg) else [])
             devs = dev_of.get(e.addr) if is_int(e.addr) else None
             mapped = set().union(*(per_dev.get(d, set()) for d in devs)) if devs else known
+            regs = [r for r, _ in writes_of(e, mapped.__contains__)] if e.kind == "write" else ([e.reg] if is_int(e.reg) else [])
             for r in regs:
                 if is_int(r) and r not in mapped and (r, e.kind, e.addr) not in seen:
                     seen.add((r, e.kind, e.addr))

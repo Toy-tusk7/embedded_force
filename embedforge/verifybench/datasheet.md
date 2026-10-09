@@ -7,6 +7,8 @@ is modelled on BMP388-class barometers so that real driver styles apply to it.
 
 The 7-bit I2C address of the DM388 is 0x76 when SDO is connected to GND.
 
+In a multi-byte I2C write, register addresses and data are sent in pairs: reg0, data0, reg1, data1.
+
 In SPI mode a register read is started by setting bit 7 of the register address. The DM388 sends 1 dummy byte
 before the register data of every SPI read.
 

@@ -19,11 +19,11 @@ from __future__ import annotations
 import json
 import re
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from embedforge.truth.flow import Event, FlowModel, Part, Trace, is_int, writes_of
+from embedforge.truth.flow import Event, FlowModel, Part, Trace, is_int, write_reading, writes_of
 from embedforge.truth.ledger import FactLedger, parse_int
 
 OPS = ("write", "read", "delay_min", "poll")
@@ -390,6 +390,27 @@ def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None, subject
     return ""
 
 
+def _mapped(book: Any, subject: str) -> Optional[Callable[[int], bool]]:
+    """r -> r is a register or data byte of the sequence's part in the register map; None without a map."""
+    if book is None or not book.registers:
+        return None
+    return lambda r: _register(book, r, subject) is not None or any(
+        not subject or lay.device.lower() == subject.lower() for lay, _ in book.layout_part(r))
+
+
+def _one_register_each(events: List[Event], mapped: Optional[Callable[[int], bool]]) -> List[Event]:
+    """A write that sets several registers (a burst, or reg/value pairs) becomes one write per register, in the order the
+    part receives them, so consecutive steps can each match their own register of the same transaction."""
+    out: List[Event] = []
+    for e in events:
+        pairs = write_reading(e, mapped) if e.kind == "write" and is_int(e.reg) else None
+        if pairs and len(pairs) > 1 and all(is_int(r) for r, _ in pairs):
+            out.extend(replace(e, reg=r, data=[v], length=1) for r, v in pairs)
+        else:
+            out.append(e)
+    return out
+
+
 def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: Any = None) -> FlowResult:
     res = FlowResult(seq.id, seq.subject, seq.name, seq.entry, trace.found, notes=list(trace.notes))
     if not trace.found:
@@ -397,28 +418,35 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
     dev = _fact_int(ledger, seq.device) if seq.device else None
     events = [e for e in trace.events if e.kind == "delay" or dev is None or not is_int(e.addr) or e.addr == dev]
     res.trace = [f"{e.file}:{e.entry_line} {e.describe()}" + ("" if e.guaranteed else " (conditional)") for e in events]
+    events = _one_register_each(events, _mapped(book, seq.subject))
     pos, last_idx = 0, -1
     pending: Optional[Tuple[int, float, int]] = None   # (from event index, required us, step number)
 
-    def delay_between(a: int, b: int) -> Tuple[float, bool, float]:
-        """(guaranteed known delay, any unknown delay present, conditional known delay) between events a and b."""
-        known, unknown, cond = 0.0, False, 0.0
+    def delay_between(a: int, b: int) -> Tuple[float, bool, float, str]:
+        """(guaranteed known delay, any unknown delay present, conditional known delay, an assumption the known delay
+        rests on) between events a and b."""
+        known, unknown, cond, assumed = 0.0, False, 0.0, ""
         for e in events[a + 1:b]:
             if e.kind != "delay":
                 continue
             if isinstance(e.delay_us, (int, float)):
                 if e.guaranteed:
                     known += e.delay_us
+                    assumed = assumed or e.assumed
                 else:
                     cond += e.delay_us
             else:
                 unknown = True
-        return known, unknown, cond
+        return known, unknown, cond, assumed
 
     def settle(pend: Tuple[int, float, int], until: int) -> None:
         a, need, num = pend
-        known, unknown, cond = delay_between(a, until)
-        if known + 1e-9 >= need:
+        known, unknown, cond, assumed = delay_between(a, until)
+        if known + 1e-9 >= need and assumed:   # long enough only under the assumption: a slower tick can make it short
+            res.steps.append(StepResult(num, "delay_min", "unverifiable",
+                                        f"needs >= {need:g} us; the code waits {known:g} us only if the assumption holds ({assumed}). "
+                                        "State the tick rate (CONFIG_FREERTOS_HZ in sdkconfig.defaults) or wait with a fixed-time call"))
+        elif known + 1e-9 >= need:
             res.steps.append(StepResult(num, "delay_min", "matched", f"{known:g} us >= {need:g} us"))
         elif unknown:
             res.steps.append(StepResult(num, "delay_min", "unverifiable",
@@ -427,7 +455,8 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
             res.steps.append(StepResult(num, "delay_min", "conditional",
                                         f"needs >= {need:g} us; only {known:g} us always runs (+{cond:g} us inside an if/loop)"))
         else:
-            res.steps.append(StepResult(num, "delay_min", "delay_short", f"needs >= {need:g} us, the code waits {known:g} us"))
+            res.steps.append(StepResult(num, "delay_min", "delay_short", f"needs >= {need:g} us, the code waits {known:g} us"
+                                        + (f" even at the fastest common tick rate ({assumed})" if assumed else "")))
 
     for num, step in enumerate(seq.steps, start=1):
         if step.op == "delay_min":
