@@ -450,6 +450,80 @@ def test_two_parts_with_a_register_at_the_same_address_are_kept_apart(tmp_path):
     assert not any("PWR_CTRL (0x1B) <- 0x18" in w for w in summary["writes"]), summary["writes"]
 
 
+SPI_DRIVER = r"""
+#include "hardware/spi.h"
+static double up;
+void setup() {
+  uint8_t tx[5] = {0x84, 0, 0, 0, 0};   /* read from 0x04: command byte, dummy byte, then 3 data bytes */
+  uint8_t rx[5];
+  spi_write_read_blocking(spi0, tx, rx, 5);
+  ASSEMBLE
+}
+"""
+
+
+@pytest.mark.parametrize("assemble, wrong", [
+    ("up = (double)((uint32_t)rx[2] | ((uint32_t)rx[3] << 8) | ((uint32_t)rx[4] << 16));", False),   # BMP388 SPI: dummy byte
+    ("up = (double)((uint32_t)rx[1] | ((uint32_t)rx[2] << 8) | ((uint32_t)rx[3] << 16));", False),   # a part without one
+    ("up = (double)(((uint32_t)rx[2] << 8) | (uint32_t)rx[3]);", True),                                # wrong either way
+])
+def test_spi_dummy_byte_is_judged_both_ways(tmp_path, assemble, wrong):
+    p, store, ledger, src, f = _setup(tmp_path, SPI_DRIVER.replace("ASSEMBLE", assemble), formulas=False)
+    summary, codes, found = _codes(p, ledger)
+    assert ("LAYOUT_SHIFT" in codes) == wrong, [(x.code, x.message) for x in found]
+
+
+def test_final_sigma_does_not_switch_anchoring_off(tmp_path):
+    p = Project("r7", tmp_path / "r7")
+    store = SourceStore(p.root)
+    src = store.add("https://www.ti.com/lit/ds/ads1115.pdf", "datasheet",
+                    "The ADS1115 is a precision delta-sigma (ΔΣ) ADC. Data rate 860 SPS. Gain 128 V/V.", kind="pdf")
+    ledger = FactLedger(p.root, store)
+    assert not ledger.record("ADS", "rate", "128", src.id, "Data rate 860 SPS.")["ok"]   # 128 is elsewhere in the text
+    assert ledger.record("ADS", "rate", "860", src.id, "Data rate 860 SPS.")["ok"]
+
+
+def test_units_and_ranges_read_every_occurrence(tmp_path):
+    from types import SimpleNamespace
+    from embedforge.truth.ledger import value_in_text
+    from embedforge.truth.sequences import delay_us
+    p = Project("r8", tmp_path / "r8")
+    store = SourceStore(p.root)
+    src = store.add("https://www.bosch-sensortec.com/y.pdf", "datasheet", "| tPOR | power-on time | VDD = 3 V | 3 | ms |", kind="pdf")
+    ledger = FactLedger(p.root, store)
+    assert ledger.record("BMPX", "t_por", "3", src.id, "power-on time | VDD = 3 V | 3 | ms", unit="ms")["ok"]
+    assert delay_us(SimpleNamespace(value="3", unit="", quote="VDD = 3 V | 3 | ms"), "ms") == 3000
+    assert delay_us(SimpleNamespace(value="3", unit="", quote="VDD = 3 V"), "ms") == 3000   # a voltage is no time unit
+    assert value_in_text("3.6", "Operating range 1.71 V -3.6 V") and not value_in_text("40", "range: -40 to 85")
+
+
+def test_own_section_keeps_rows_the_pdf_put_after_the_next_header():
+    from embedforge.truth.registers import own_section
+    q = ("Table 41: Register 0x1C OSR\n4.3.18 Register 0x1D ODR\nTable 42: Register 0x1D ODR\n"
+         "Bit 2..0 osr_p 000 x1\nBit 5..3 osr4_t 000 x1")
+    assert "osr_p" in own_section(q, 0x1C)
+
+
+def test_value_lists_with_and_and_name_first_rows():
+    from embedforge.truth.registers import _value_near
+    row = "00 Sleep mode 01 and 10 Forced mode 11 Normal mode"
+    assert _value_near(row, "forced", 1, 2) and _value_near(row, "forced", 2, 2) and not _value_near(row, "sleep", 1, 2)
+    assert _value_near("Normal mode 11", "normal", 3, 2)
+
+
+def test_formula_structure_checks_the_result_and_accepts_integer_division_and_inputs():
+    from embedforge.truth.registers import formula_structure_problem
+    q = "var1 = a + b; var2 = a - b; T = (var1 + var2) / 5120.0"
+    wrong = ["var1 = a + b", "var2 = a - b", "temp_c = (var1 - var2) / 5120.0"]
+    assert "not what the quote computes for T" in formula_structure_problem(wrong, q, "T")
+    assert "none of the values" in formula_structure_problem(wrong, q, "TEMP")
+    assert formula_structure_problem(wrong[:2] + ["temp_c = (var1 + var2) / 5120.0"], q, "TEMP") is None
+    assert formula_structure_problem(["partial_data6 = (x * y) // 1000"], "partial_data6 = (x * y) / 1000;", "P") is None
+    assert formula_structure_problem(["partial_data1 = uncomp_temp - PAR_T1"],
+                                     "PAR_T1 = NVM_PAR_T1 / 2^-8; partial_data1 = uncomp_temp - PAR_T1;", "P") is None
+    assert formula_structure_problem(["y = x**-8"], "y = x**-8", "Y") is None
+
+
 def test_formula_binds_the_quotes_own_names(tmp_path):
     p, store, ledger, src, book = _book(tmp_path)
     assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]

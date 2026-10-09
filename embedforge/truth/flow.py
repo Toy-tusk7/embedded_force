@@ -832,13 +832,15 @@ class FlowModel:
         w.call(fn, call_args, (), guaranteed=True)
         return Trace(entry, normalize(w.events), w.notes, found=True, opaque=sorted(w.opaque))
 
-    def run(self, entries: List[str], probe: Optional[Dict[int, int]] = None) -> "Walker":
+    def run(self, entries: List[str], probe: Optional[Dict[int, int]] = None, spi_dummy: int = 0) -> "Walker":
         """Walk several entry functions in order on one shared state (setup() then loop(), as the Arduino core does).
         In probe mode a device read returns the `probe` byte of each register, so the code's arithmetic runs on concrete
         data and the walker's `values` hold every number it computes. Without a probe, read bytes stay symbolic but
-        remember their register (shifts and masks applied to them are in obs_shifts / obs_masks)."""
+        remember their register (shifts and masks applied to them are in obs_shifts / obs_masks). `spi_dummy`: bytes an
+        SPI read returns before the register data (Bosch BMP388/BMI160 send one dummy byte, most parts none)."""
         w = Walker(self)
         w.probe = probe
+        w.spi_dummy = spi_dummy
         for obj_name, (cls, ctor_args) in self.global_objects.items():
             w.construct(obj_name, cls, ctor_args)
         for entry in entries:
@@ -1272,6 +1274,7 @@ class Walker:
         self._this: List[Tuple[Any, str]] = []              # (object, class) of the method being walked
         self._iterating = 0                                 # > 0 inside an iterated loop: break/continue are live
         self.probe: Optional[Dict[int, int]] = None         # register -> byte the device returns (probe mode)
+        self.spi_dummy = 0                                  # bytes an SPI read returns before the data (FlowModel.run)
         self.ptr: Dict[Any, int] = {}                       # bus address -> register pointer last written
         self._rxq: Dict[str, List[Any]] = {}                # Arduino Wire: bytes waiting for Wire.read()
         self.obs_shifts: List[Tuple[RxByte, int, str, int]] = []  # (read byte, left shift, file, line): how bytes are assembled
@@ -2033,19 +2036,31 @@ def _reg_read_byte(addr_i: int, reg_i: int, dst_i: int):
     return h
 
 
+def _spi_fill(w: Walker, v: Any, n: Any, skip: int, reg: Any) -> None:
+    """Fill an SPI receive buffer: `skip` junk bytes (the command byte's slot, then the part's dummy bytes), then the
+    register data from `reg` on."""
+    dst, off = _buf_slot(v)
+    if dst is None:
+        return
+    if is_int(n) and n <= skip:
+        taint(Ptr(dst, off), n)
+        return
+    taint(Ptr(dst, off + skip), n - skip if is_int(n) else None, w, reg)
+    if skip:
+        taint(Ptr(dst, off), skip)
+
+
 def _spi_transfer(tx_i: int, rx_i: Optional[int], len_i: int, ok: Optional[int] = None):
     """An SPI write, or a full-duplex transfer that also fills rx. The byte clocked in while the command byte goes out is
-    junk; after a read command (bit 7 set) the rest is the register data from that register on."""
+    junk (and any dummy byte the part sends); after a read command (bit 7 set) the rest is the register data."""
     def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
         n = a[len_i] if len_i < len(a) else None
         tx = as_bytes(a[tx_i] if tx_i < len(a) else None, n)
         w.emit(ev, line, kind="write", data=tx, length=n, bus="spi")
         if rx_i is not None and rx_i < len(a):
-            dst, off = _buf_slot(a[rx_i])
             first = tx[0] if tx else None
-            if dst is not None and is_int(first) and first & 0x80:
-                taint(Ptr(dst, off + 1), n - 1 if is_int(n) else None, w, first & 0x7F)
-                taint(Ptr(dst, off), 1)
+            if is_int(first) and first & 0x80:
+                _spi_fill(w, a[rx_i], n, 1 + w.spi_dummy, first & 0x7F)
             else:
                 taint(a[rx_i], n)
         return _ret(n, ok)
@@ -2053,11 +2068,11 @@ def _spi_transfer(tx_i: int, rx_i: Optional[int], len_i: int, ok: Optional[int] 
 
 
 def _spi_read(dst_i: int, len_i: int, ok: Optional[int] = None):
-    """spi_read_blocking / HAL_SPI_Receive: the data of the register the previous write pointed at."""
+    """spi_read_blocking / HAL_SPI_Receive: the data of the register the previous write pointed at (after any dummy byte)."""
     def h(w: Walker, a: List[Any], ev: Evaluator, line: int) -> Any:
         n = a[len_i] if len_i < len(a) else None
         if dst_i < len(a):
-            taint(a[dst_i], n, w, w.ptr.get(repr(None)))
+            _spi_fill(w, a[dst_i], n, w.spi_dummy, w.ptr.get(repr(None)))
         w.emit(ev, line, kind="read", length=n, bus="spi")
         return _ret(n, ok)
     return h

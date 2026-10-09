@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from embedforge.truth.flow import FlowModel, RxByte, Walker, is_int, writes_of
-from embedforge.truth.ledger import FactLedger, _mapped, _squash, _word, parse_int, value_in_text
+from embedforge.truth.ledger import FactLedger, _index, _squash, bounded, parse_int, value_in_text
 from embedforge.truth.source_store import SourceStore
 
 MAX_QUOTE = 2000
@@ -73,10 +73,8 @@ def verbatim(quote: str, text: str) -> bool:
         parts = [_squash(p) for p in _GAP.split(qq) if _squash(p)]
         if not parts or (len(parts) > 1 and min(len(p) for p in parts) < 8):
             continue
-        if strip:
-            tt, idx = _squashed(text, strip), None
-        else:   # word boundaries at both ends: 'Bit 5..4' is not a quote of 'Bit 15..4'
-            tt, idx = _mapped(text)
+        ix = None if strip else _index(text)   # word boundaries at both ends: '1B PWR_CTRL' is not a quote of '0x1B PWR_CTRL'
+        tt = _squashed(text, strip) if strip else ix.s
         start = tt.find(parts[0])
         while start >= 0:
             pos, ok = start + len(parts[0]), True
@@ -86,10 +84,9 @@ def verbatim(quote: str, text: str) -> bool:
                     ok = False
                     break
                 pos = i + len(p)
-            if ok and idx is not None:
-                a, b = idx[start], idx[pos - 1] + 1
-                ok = not (_word(parts[0][0]) and a > 0 and _word(text[a - 1])) and \
-                    not (_word(parts[-1][-1]) and b < len(text) and _word(text[b]))
+            if ok and ix is not None:
+                sp = ix.span(start, pos)
+                ok = sp is not None and bounded(text, sp[0], sp[1], parts[0][0], parts[-1][-1])
             if ok:
                 return True
             start = tt.find(parts[0], start + 1)
@@ -247,7 +244,10 @@ def own_section(quote: str, addr: int) -> str:
     first = own[0]
     start = first if any(a != addr for s, a in heads if s < first) else 0
     end = next((s for s, a in heads if s > first and a != addr), len(quote))
-    return quote[start:end]
+    section = quote[start:end]
+    # PDF text can put a table's rows after the next header ('Table 41: Register 0x1C OSR', '4.3.18 Register 0x1D ODR',
+    # then OSR's 'Bit 2..0 osr_p' rows): a section with no bit rows of its own was cut wrong — keep the whole quote
+    return section if re.search(r"\bBit\s*\d", section, re.I) else quote
 
 
 def _value_forms(v: int, width: int) -> List[str]:
@@ -256,22 +256,29 @@ def _value_forms(v: int, width: int) -> List[str]:
     return [f for f in forms if f]
 
 
-_VAL_LIST = r"(?:0x[0-9a-f]+|0b[01]+|[0-9a-f]+h|[0-9]+)(?:\s*/\s*(?:0x[0-9a-f]+|0b[01]+|[0-9a-f]+h|[0-9]+))*"
+_VAL = r"(?:0x[0-9a-f]+|0b[01]+|[0-9a-f]+h|[0-9]+)"
+_VAL_SEP = r"\s*(?:/|,|\band\b|\bor\b)\s*"
+_VAL_LIST = rf"{_VAL}(?:{_VAL_SEP}{_VAL})*"
 _VALUE_BEFORE = re.compile(rf"(?:^|[^0-9a-z.])({_VAL_LIST})[\s|:=>\-,(]*$")
 _VALUE_AFTER = re.compile(rf"^\s*(?:(?:mode|state|setting|value)\s*)?(?:=|:|\(|->|→)\s*({_VAL_LIST})(?![0-9a-z])")
+_VALUE_AFTER_BARE = re.compile(rf"^\s*(?:(?:mode|state|setting|value)\s*)?[\s|]*({_VAL_LIST})(?![0-9a-z])")
 
 
 def _value_near(quote: str, name: str, v: int, width: int, reach: int = 16) -> bool:
-    """A named value is stated right next to its name: the value token directly before it ('11 normal mode',
-    '| 0xB6 | softreset') or after it with an assignment mark ('normal = 0b11', 'sleep: 00'). A value further away is a
+    """A named value is stated right next to its name: the value token(s) directly before it ('11 normal mode', '01 and 10
+    Forced mode', '| 0xB6 | softreset') or after it with an assignment mark ('normal = 0b11', 'sleep: 00'), or bare after
+    it when no value stands before the name ('Normal mode 11' at the start of a row). A value further away is a
     neighbouring row's: in '00 sleep mode 01/10 forced', 01 is forced's, not sleep's."""
     low = quote.lower()
     forms = {f.lower() for f in _value_forms(v, width)}
+
+    def hit(m: Any) -> bool:
+        return bool(m) and any(tok.strip() in forms for tok in re.split(_VAL_SEP, m.group(1)))
     for a, b in _name_spans(quote, name):
-        for rx, win in ((_VALUE_BEFORE, low[max(0, a - reach):a]), (_VALUE_AFTER, low[b:b + reach])):
-            m = rx.search(win)
-            if m and any(tok.strip() in forms for tok in m.group(1).split("/")):
-                return True
+        before = _VALUE_BEFORE.search(low[max(0, a - reach):a])
+        after = low[b:b + reach]
+        if hit(before) or hit(_VALUE_AFTER.search(after)) or (not before and hit(_VALUE_AFTER_BARE.search(after))):
+            return True
     return False
 
 
@@ -503,7 +510,9 @@ def _quote_statements(quote: str) -> List[Tuple[str, str]]:
     q = re.sub(r"<sub>(.*?)</sub>", r"_\1", q)
     q = re.sub(r"</?\w+>", " ", q)
     q = re.sub(r"/\*.*?\*/|//[^\n]*", " ", q, flags=re.S)
-    q = re.sub(r"\*\*(?=[A-Za-z_(])|(?<=[A-Za-z_)])\*\*|[`|]", " ", q)   # Markdown bold, code spans, table bars
+    # Markdown bold around words ('**PAR_T1**'), never a power ('2**14', 'x**-8'); code spans; table bars
+    q = re.sub(r"(?<![\w)])\*\*(?=[A-Za-z_])([^*\n]{1,80}?)(?<=[\w)])\*\*(?![\w(])", r"\1", q)
+    q = re.sub(r"[`|]", " ", q)
     q = q.translate({ord("∙"): "*", ord("⋅"): "*", ord("·"): "*", ord("×"): "*", ord("÷"): "/"})
     marks = list(_STMT_LHS.finditer(q))
     out: List[Tuple[str, str]] = []
@@ -516,7 +525,7 @@ def _quote_statements(quote: str) -> List[Tuple[str, str]]:
                 continue
             try:
                 _parse(text)
-            except (SyntaxError, ValueError):
+            except (SyntaxError, ValueError, RecursionError, MemoryError):
                 continue
             out.append((re.sub(r"^.*(?:->|\.)\s*", "", m.group(1)).strip().lower(), text))
             break
@@ -524,9 +533,10 @@ def _quote_statements(quote: str) -> List[Tuple[str, str]]:
 
 
 def _variants(text: str) -> List[ast.AST]:
-    """The expression, plus readings where '2k' / '2-k' is the power 2^k / 2^-k whose superscript the PDF lost."""
+    """The expression, plus readings where '2k' / '2-k' is the power 2^k / 2^-k whose superscript the PDF lost, and where
+    C code's '/' between integers is integer division (the steps write that as '//')."""
     spots = list(_AMBIGUOUS_POW.finditer(text))[:5]
-    out = []
+    texts = []
     for mask in range(1 << len(spots)):
         t, shift = text, 0
         for j, sp in enumerate(spots):
@@ -534,41 +544,44 @@ def _variants(text: str) -> List[ast.AST]:
                 new = f"2^({sp.group(1)})"
                 t = t[:sp.start() + shift] + new + t[sp.end() + shift:]
                 shift += len(new) - (sp.end() - sp.start())
+        texts.append(t)
+    if "/" in text and "//" not in text:
+        texts += [t.replace("/", "//") for t in texts]
+    out = []
+    for t in texts:
         try:
             out.append(_parse(t))
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
             pass
     return out
 
 
-def _close(a: float, b: float) -> bool:
-    return abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b))
-
-
 def formula_structure_problem(steps: List[Any], quote: str, name: str) -> Optional[str]:
-    """A recorded formula must compute what the quote states, not merely reuse its numbers: each step whose variable the
-    quote assigns is evaluated on sample inputs next to the quote's own expression for that variable (earlier steps and
-    earlier quote statements feed later ones). '/ 2^8' recorded for a quote that says '/ 2^-8' is rejected; an
-    algebraically equal rewrite ('* 2^8') is not. Steps the quote states in no parseable form are left to the constant check."""
+    """A recorded formula must compute what the quote states, not merely reuse its numbers. On sample inputs, each step
+    whose variable the quote assigns is compared with the quote's own expression for it (earlier quote statements feed
+    later ones; the step's own inputs are the same on both sides), and the result must be what the quote computes: under
+    the formula's name if the quote assigns that name, else one of the quote's values. '/ 2^8' recorded for a quote that
+    says '/ 2^-8' is rejected, an algebraically equal rewrite ('* 2^8') is not. A quote with no parseable statement is left
+    to the constant check."""
     import random
     stmts = _quote_statements(quote)
     if not stmts:
         return None
-    parsed_steps = []
-    for s in steps:
-        s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", str(s).strip().rstrip(";"))
-        m = _STEP_RE.match(s) or (_STEP_RE.match(f"{name} = {s}") if len(steps) == 1 else None)
-        if not m:
-            return None
-        try:
-            parsed_steps.append((m.group(1).lower(), m.group(2).strip(), _parse(m.group(2))))
-        except (SyntaxError, ValueError):
-            return None
-    quote_trees = []
-    for lhs, text in stmts:
-        quote_trees.append((lhs, text, _parse(text), _variants(text)))
-    names = {n for _, _, t in parsed_steps for n in _names(t)} | {n for _, _, t, _ in quote_trees for n in _names(t)}
-    names |= {v for v, _, _ in parsed_steps} | {lhs for lhs, _, _, _ in quote_trees}
+    parsed: List[Tuple[str, str, ast.AST]] = []
+    try:
+        for s in steps:
+            s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", str(s).strip().rstrip(";"))
+            m = _STEP_RE.match(s) or (_STEP_RE.match(f"{name} = {s}") if len(steps) == 1 else None)
+            if not m:
+                return None
+            parsed.append((m.group(1).lower(), m.group(2).strip(), _parse(m.group(2))))
+        qs = [(lhs, text, _parse(text), _variants(text)) for lhs, text in stmts]
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    assigned = [v for v, _, _ in parsed]
+    inputs = {n for _, _, t in parsed for n in _names(t)} - set(assigned)
+    quote_names = {n for _, _, t, _ in qs for n in _names(t)} | {lhs for lhs, _, _, _ in qs}
+    names = inputs | set(assigned) | quote_names
     bases = []
     for seed in (11, 23, 37):
         r = random.Random(seed)
@@ -580,47 +593,72 @@ def formula_structure_problem(steps: List[Any], quote: str, name: str) -> Option
             try:
                 v = float(eval_expr(tree, env))
                 env[var] = v
-            except (ArithmeticError, ValueError, KeyError, TypeError):
+            except (ArithmeticError, ValueError, KeyError, TypeError, RecursionError):
                 v = None
             vals.append((dict(env), v))
         return vals
-    step_runs = [run([(v, t) for v, _, t in parsed_steps], b) for b in bases]
-    quote_envs = [[env for env, _ in run([(lhs, t) for lhs, _, t, _ in quote_trees], b)] for b in bases]
+    step_runs = [run([(v, t) for v, _, t in parsed], b) for b in bases]
+    quote_runs = [run([(lhs, t) for lhs, _, t, _ in qs], b) for b in bases]
+
+    def agrees(i: int, value_of, overrides_of) -> Optional[bool]:
+        """Does some reading of quote statement i give the step's value on every sample? None: nothing comparable."""
+        decided = False
+        for variant in qs[i][3]:
+            pairs = []
+            for b, base in enumerate(bases):
+                sv = value_of(b)
+                env = dict(quote_runs[b][i - 1][0]) if i > 0 else dict(base)
+                env.update(overrides_of(b))
+                try:
+                    qv = float(eval_expr(variant, env))
+                except (ArithmeticError, ValueError, KeyError, TypeError, RecursionError):
+                    continue
+                if sv is not None and math.isfinite(sv) and math.isfinite(qv):
+                    pairs.append((sv, qv))
+            if pairs:
+                decided = True
+                if all(_close(a, b) for a, b in pairs):
+                    return True
+        return False if decided else None
+
+    def env_before(b: int, k: int) -> Dict[str, float]:
+        return step_runs[b][k - 1][0] if k > 0 else bases[b]
     seen: Dict[str, int] = {}
-    for k, (var, text, _tree) in enumerate(parsed_steps):
-        idxs = [i for i, (lhs, _, _, _) in enumerate(quote_trees) if lhs == var]
+    compared_last = False
+    for k, (var, text, tree) in enumerate(parsed):
+        idxs = [i for i, (lhs, _, _, _) in enumerate(qs) if lhs == var]
         if not idxs:
             continue
         j = seen.get(var, 0)
         seen[var] = j + 1
         if j < len(idxs):
             idxs = [idxs[j]] + [i for i in idxs if i != idxs[j]]
-        decided = False
-        for i in idxs:
-            for variant in quote_trees[i][3]:
-                pairs = []
-                for b, base in enumerate(bases):
-                    sv = step_runs[b][k][1]
-                    env = dict(quote_envs[b][i - 1]) if i > 0 else dict(base)
-                    try:
-                        qv = float(eval_expr(variant, env))
-                    except (ArithmeticError, ValueError, KeyError, TypeError):
-                        continue
-                    if sv is not None:
-                        pairs.append((sv, qv))
-                if pairs:
-                    decided = True
-                    if all(_close(a, b) for a, b in pairs):
-                        break
-            else:
-                continue
-            break
-        else:
-            if decided:
-                lhs, qtext = quote_trees[idxs[0]][0], quote_trees[idxs[0]][1]
-                return (f"step {k + 1} ({var} = {text}) does not compute what the quote states: {lhs} = {qtext}. Copy the "
-                        "quote's expression — its operators, grouping and the signs of its exponents — not just its numbers.")
-    return None
+        used = set(_names(tree)) | set(assigned[:k])   # what the step reads and what earlier steps made: same values in the quote
+        res = [agrees(i, lambda b, k=k: step_runs[b][k][1],
+                      lambda b, k=k, used=used: {n: v for n, v in env_before(b, k).items() if n in used}) for i in idxs]
+        if any(r is True for r in res):
+            compared_last = compared_last or k == len(parsed) - 1
+            continue
+        if any(r is False for r in res):
+            lhs, qtext = qs[idxs[0]][0], qs[idxs[0]][1]
+            return (f"step {k + 1} ({var} = {text}) does not compute what the quote states: {lhs} = {qtext}. Copy the "
+                    "quote's expression — its operators, grouping and the signs of its exponents — not just its numbers.")
+    if compared_last or not parsed:
+        return None
+    # the result itself, whatever the last step's variable is called
+    named = [i for i, (lhs, _, _, _) in enumerate(qs) if lhs == name.lower()]
+    pool = named or (list(range(len(qs))) if inputs & quote_names else [])
+    if not pool:
+        return None
+    last = len(parsed) - 1
+    res = [agrees(i, lambda b: step_runs[b][last][1], lambda b: {n: bases[b][n] for n in inputs}) for i in pool]
+    if any(r is True for r in res) or not any(r is False for r in res):
+        return None
+    if named:
+        return (f"the result ({parsed[-1][0]} = {parsed[-1][1]}) is not what the quote computes for {name}: "
+                f"{qs[named[0]][0]} = {qs[named[0]][1]}. Copy the quote's expression.")
+    return (f"the result ({parsed[-1][0]} = {parsed[-1][1]}) is none of the values the quote's formulas compute "
+            f"({'; '.join(f'{l} = {t}' for l, t, _, _ in qs[:3])}). Copy the quote's expression, or quote the text that states this one.")
 
 
 def eval_expr(tree: ast.AST, env: Dict[str, float]) -> float:
@@ -1135,6 +1173,8 @@ class RegisterBook:
                 tree = _parse(expr)
             except (SyntaxError, ValueError) as e:
                 return {"ok": False, "error": f"step {k} ({var}): {e}"}
+            except (RecursionError, MemoryError):
+                return {"ok": False, "error": f"step {k} ({var}): the expression is nested too deeply; split it into steps"}
             unknown = [n for n in _names(tree) if n not in defined and n not in known]
             if unknown:
                 return {"ok": False, "error": f"step {k}: unknown name(s) {', '.join(sorted(set(unknown)))}. Every input must be a layout "
@@ -1381,6 +1421,17 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             findings.append(RegFinding("ERROR", "REGISTER_CHECK_ERROR", "", 0,
                                        f"Tracing {' + '.join(entries)} exceeded the recursion limit, so its register use is unchecked.",
                                        "Report it to the user; flattening deeply nested code may help."))
+    # SPI parts differ in whether a read returns a dummy byte before the data (Bosch BMP388/BMI160 do): judge the code
+    # under both readings, and report a byte-level error only if it is wrong under both
+    spi = any(e.bus == "spi" and e.kind == "read" for _, w in walkers for e in w.events)
+    dummies = (0, 1) if spi else (0,)
+    alt: List[Tuple[List[str], Walker]] = []
+    if spi:
+        for entries, _ in walkers:
+            try:
+                alt.append((entries, model.run(entries, spi_dummy=1)))
+            except RecursionError:
+                pass
     summary: Dict[str, Any] = {"entries": [" + ".join(e) for e, _ in walkers], "writes": [], "layouts": [], "formulas": []}
     used = {e.addr for _, w in walkers for e in w.events if is_int(e.addr)}
     if all_addrs and not used & all_addrs:
@@ -1423,41 +1474,48 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                                    f"({', '.join(f'{n}={chr(124).join(str(x) for x in vs)}' for n, vs in f.values.items())}).",
                                                    "Use one of the datasheet's values for this field."))
 
-    # 2. bit masks on bytes read from registers
-    seen_m = set()
-    for _, w in walkers:
-        for rx, mask, file, line in w.obs_masks:
-            reg = reg_at(rx.reg, rx.dev)
-            if reg is None or not reg.fields or not mine(rx.dev) or parts_at(rx.reg, rx.dev):
-                continue
-            bad = mask & ~reg.defined_mask & 0xFF
-            key = (rx.reg, mask, file, line)
-            if bad and key not in seen_m:
-                seen_m.add(key)
-                findings.append(RegFinding("ERROR", "REG_MASK_UNDEFINED", file, line,
-                                           f"{reg.name} ({_hex(reg.addr)}) is tested with mask {_hex(mask)}, but bit(s) {_hex(bad)} are not "
-                                           f"defined there; its fields are {', '.join(f.label() for f in reg.fields)} ({reg.id}).",
-                                           f"Mask with the field's bits from the register map (e.g. {', '.join(f'{f.name} = {_hex(f.mask)}' for f in reg.fields)})."))
-
-    # 3. shifts on bytes of multi-byte values
-    seen_s = set()
-    for _, w in walkers:
-        for rx, shift, file, line in w.obs_shifts:
-            if not mine(rx.dev):
-                continue
-            parts = parts_at(rx.reg, rx.dev)
-            for lay, k in parts:
-                p = lay.parts[k]
-                if (p.hi, p.lo) != (7, 0) or lay.width <= 8 and shift == 0:
+    def bit_findings(ws: List[Tuple[List[str], Walker]]) -> List[RegFinding]:
+        out: List[RegFinding] = []
+        # 2. bit masks on bytes read from registers
+        seen_m = set()
+        for _, w in ws:
+            for rx, mask, file, line in w.obs_masks:
+                reg = reg_at(rx.reg, rx.dev)
+                if reg is None or not reg.fields or not mine(rx.dev) or parts_at(rx.reg, rx.dev):
                     continue
-                want = lay.offset_of(k)
-                key = (rx.reg, shift, file, line)
-                if shift != want and key not in seen_s and not any(sh == shift for l2, k2 in parts for sh in [l2.offset_of(k2)]):
-                    seen_s.add(key)
-                    findings.append(RegFinding("ERROR", "LAYOUT_SHIFT", file, line,
-                                               f"the byte read from {_hex(rx.reg)} is shifted left by {shift}, but in {lay.name} ({lay.id}) it is "
-                                               f"bits {want + 7}..{want}: {lay.describe()}.",
-                                               f"Assemble {lay.name} exactly as the layout says (that byte << {want})."))
+                bad = mask & ~reg.defined_mask & 0xFF
+                key = (rx.reg, mask, file, line)
+                if bad and key not in seen_m:
+                    seen_m.add(key)
+                    out.append(RegFinding("ERROR", "REG_MASK_UNDEFINED", file, line,
+                                          f"{reg.name} ({_hex(reg.addr)}) is tested with mask {_hex(mask)}, but bit(s) {_hex(bad)} are not "
+                                          f"defined there; its fields are {', '.join(f.label() for f in reg.fields)} ({reg.id}).",
+                                          f"Mask with the field's bits from the register map (e.g. {', '.join(f'{f.name} = {_hex(f.mask)}' for f in reg.fields)})."))
+        # 3. shifts on bytes of multi-byte values
+        seen_s = set()
+        for _, w in ws:
+            for rx, shift, file, line in w.obs_shifts:
+                if not mine(rx.dev):
+                    continue
+                parts = parts_at(rx.reg, rx.dev)
+                for lay, k in parts:
+                    p = lay.parts[k]
+                    if (p.hi, p.lo) != (7, 0) or lay.width <= 8 and shift == 0:
+                        continue
+                    want = lay.offset_of(k)
+                    key = (rx.reg, shift, file, line)
+                    if shift != want and key not in seen_s and not any(sh == shift for l2, k2 in parts for sh in [l2.offset_of(k2)]):
+                        seen_s.add(key)
+                        out.append(RegFinding("ERROR", "LAYOUT_SHIFT", file, line,
+                                              f"the byte read from {_hex(rx.reg)} is shifted left by {shift}, but in {lay.name} ({lay.id}) it is "
+                                              f"bits {want + 7}..{want}: {lay.describe()}.",
+                                              f"Assemble {lay.name} exactly as the layout says (that byte << {want})."))
+        return out
+    bits = bit_findings(walkers)
+    if alt:
+        other = {(f.code, f.file, f.line) for f in bit_findings(alt)}
+        bits = [f for f in bits if (f.code, f.file, f.line) in other]
+    findings += bits
     for lay in book.layouts.values():
         summary["layouts"].append(f"{lay.id} {lay.describe()}")
 
@@ -1493,12 +1551,13 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             expected = evaluate_formulas(book, vec)
             observed: List[Tuple[Any, str, str]] = []
             for entries, _ in walkers:
-                try:
-                    pw = model.run(entries, probe=vec)
-                except RecursionError:
-                    continue
-                observed += [v for v in pw.values if isinstance(v[0], (int, float))]
-                read_regs |= {e.reg + k for e in pw.events if e.kind == "read" and is_int(e.reg) for k in range(e.length if is_int(e.length) else 1)}
+                for dummy in dummies:   # a formula matches if the code computes it under either SPI reading
+                    try:
+                        pw = model.run(entries, probe=vec, spi_dummy=dummy)
+                    except RecursionError:
+                        continue
+                    observed += [v for v in pw.values if isinstance(v[0], (int, float))]
+                    read_regs |= {e.reg + k for e in pw.events if e.kind == "read" and is_int(e.reg) for k in range(e.length if is_int(e.length) else 1)}
             for f in book.formulas.values():
                 want = expected.get(f.id)
                 if want is None:

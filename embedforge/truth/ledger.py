@@ -33,21 +33,20 @@ def _squash(s: str) -> str:
     # not text: a quote matches with or without it
     s = re.sub(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]", " ", s)   # 2<sup>osr_p</sup> = 2^osr_p
     # quote marks carry no meaning and PDFs use curly ones the model often drops: Register 0x1B “PWR_CTRL”
-    return re.sub(r"[\s\"'`´]+", "", s).lower()
+    # (final sigma: 'ΔΣ'.lower() is 'δς' but 'Σ'.lower() is 'σ' — one form, so a text squashes the same in pieces)
+    return re.sub(r"[\s\"'`´]+", "", s).lower().replace("ς", "σ")
 
 
 _MARKUP = re.compile(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]")
 _DROP = re.compile(r"[\s\"'`´]")
+_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES}
 
 
 def _squash_map(s: str) -> Tuple[str, List[int]]:
-    """_squash(s), and for each of its characters the index in s it came from."""
+    """_squash(s), and for each of its characters the index in s it came from (used on small pieces of a source)."""
     chars: List[Tuple[str, int]] = []
     for i, c in enumerate(s):
-        if c == "­":
-            continue
-        rep = {"ﬁ": "fi", "ﬂ": "fl", "µ": "μ"}.get(c, c.translate(_DASHES).translate(_QUOTES))
-        chars.extend((r, i) for r in rep)
+        chars.extend((r, i) for r in c.translate(_PRE))
     t = "".join(c for c, _ in chars)
     kept: List[Tuple[str, int]] = []
     pos = 0
@@ -58,27 +57,70 @@ def _squash_map(s: str) -> Tuple[str, List[int]]:
     out: List[Tuple[str, int]] = []
     for c, i in kept:
         if not _DROP.match(c):
-            out.extend((x, i) for x in c.lower())
+            out.extend((x, i) for x in c.lower().replace("ς", "σ"))
     return "".join(c for c, _ in out), [i for _, i in out]
 
 
-_ANCHOR_CACHE: Dict[int, Tuple[str, Optional[List[int]]]] = {}
+class _Index:
+    """A source text in squashed form, and the way back from a squashed span to the original text. The text is
+    squashed in line-aligned pieces, so the per-character map is only built for the piece a match falls in: a 5 MB
+    reference manual costs one fast _squash, not a 5-million-step Python loop and a 190 MB index."""
+
+    PIECE = 4000
+
+    def __init__(self, text: str):
+        starts, i = [0], self.PIECE
+        while i < len(text):
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            starts.append(j + 1)
+            i = j + 1 + self.PIECE
+        # pieces end at line breaks, which no squashed markup spans, so the pieces squash like the whole text
+        pieces = [_squash(text[a:b]) for a, b in zip(starts, starts[1:] + [len(text)])]
+        self.text, self.s = text, "".join(pieces)
+        self.orig = starts + [len(text)]
+        self.sq = [0]
+        for p in pieces:
+            self.sq.append(self.sq[-1] + len(p))
+        self._maps: Dict[Tuple[int, int], List[int]] = {}
+
+    def span(self, i: int, j: int) -> Optional[Tuple[int, int]]:
+        """Original (start, end) of squashed characters i..j-1."""
+        import bisect
+        k = bisect.bisect_right(self.sq, i) - 1
+        m = bisect.bisect_right(self.sq, j - 1) - 1
+        key = (k, m)
+        if key not in self._maps:
+            s, idx = _squash_map(self.text[self.orig[k]:self.orig[m + 1]])
+            self._maps[key] = idx if s == self.s[self.sq[k]:self.sq[m + 1]] else []
+        idx = self._maps[key]
+        if not idx:
+            return None
+        return self.orig[k] + idx[i - self.sq[k]], self.orig[k] + idx[j - 1 - self.sq[k]] + 1
 
 
-def _mapped(text: str) -> Tuple[str, Optional[List[int]]]:
-    key = hash(text)
-    hit = _ANCHOR_CACHE.get(key)
+_INDEXES: "Dict[str, _Index]" = {}
+
+
+def _index(text: str) -> _Index:
+    hit = _INDEXES.pop(text, None)   # keyed by the text itself (equality, not just hash); most recent last
     if hit is None:
-        squashed, idx = _squash_map(text)
-        hit = (squashed, idx) if squashed == _squash(text) else (_squash(text), None)
-        if len(_ANCHOR_CACHE) > 16:
-            _ANCHOR_CACHE.clear()
-        _ANCHOR_CACHE[key] = hit
+        hit = _Index(text)
+        while len(_INDEXES) >= 8:
+            _INDEXES.pop(next(iter(_INDEXES)))
+    _INDEXES[text] = hit
     return hit
 
 
 def _word(ch: str) -> bool:
     return ch.isalnum() or ch == "_"
+
+
+def bounded(text: str, a: int, b: int, first: str, last: str) -> bool:
+    """A match a..b of a quote whose squashed form starts with `first` and ends with `last` does not begin or end inside
+    a word or number of the text."""
+    return not (_word(first) and a > 0 and _word(text[a - 1])) and not (_word(last) and b < len(text) and _word(text[b]))
 
 
 def anchor(quote: str, text: str) -> Optional[Tuple[int, int]]:
@@ -87,15 +129,13 @@ def anchor(quote: str, text: str) -> Optional[Tuple[int, int]]:
     q = _squash(quote)
     if not q:
         return None
-    squashed, idx = _mapped(text)
-    pos = squashed.find(q)
-    if idx is None:   # the character map disagrees with _squash (exotic case folding): containment only
-        return (0, len(text)) if pos >= 0 else None
+    ix = _index(text)
+    pos = ix.s.find(q)
     while pos >= 0:
-        a, b = idx[pos], idx[pos + len(q) - 1] + 1
-        if not (_word(q[0]) and a > 0 and _word(text[a - 1])) and not (_word(q[-1]) and b < len(text) and _word(text[b])):
-            return a, b
-        pos = squashed.find(q, pos + 1)
+        sp = ix.span(pos, pos + len(q))
+        if sp is not None and bounded(text, sp[0], sp[1], q[0], q[-1]):
+            return sp
+        pos = ix.s.find(q, pos + 1)
     return None
 
 
@@ -113,16 +153,26 @@ def norm_unit(unit: str) -> str:
     return _UNIT_NAMES.get(u.lower(), u)
 
 
-def unit_after(text: str, value: str) -> Optional[str]:
-    """The unit written right after the value in text ('2 ms', '| 2 | ms |'), normalised; None if there is none."""
+TIME_UNITS = ("s", "ms", "us", "ns")
+
+
+def units_after(text: str, value: str) -> List[str]:
+    """The units written right after each occurrence of the value in text ('2 ms', '| 2 | ms |'), normalised, in order:
+    a row can state the same number twice ('VDD = 3 V | 3 | ms')."""
+    out: List[str] = []
     for form, rx, _conf in value_variants(value):
         if form not in ("number", "decimal"):
             continue
         for m in re.finditer(rx, text.lower().translate(_DASHES)):
             u = _UNIT_AFTER.match(text[m.end():m.end() + 12])
-            if u:
-                return norm_unit(u.group(1))
-    return None
+            if u and norm_unit(u.group(1)) not in out:
+                out.append(norm_unit(u.group(1)))
+    return out
+
+
+def unit_after(text: str, value: str, kinds: Optional[Tuple[str, ...]] = None) -> Optional[str]:
+    """The first unit written right after the value (of the given kinds, e.g. TIME_UNITS), or None."""
+    return next((u for u in units_after(text, value) if kinds is None or u in kinds), None)
 
 
 def parse_int(value: str) -> Optional[int]:
@@ -174,11 +224,14 @@ def value_in_text(value: str, text: str) -> Optional[Tuple[str, str]]:
     for form, rx, conf in value_variants(value):
         for m in re.finditer(rx, low):
             k = m.start()
-            # '-40 °C' states minus forty, not 40 (a range '1-40' still states 40)
-            if not negative and k > 0 and low[k - 1] == "-" and (k < 2 or not low[k - 2].isalnum()):
+            # '-40 °C' states minus forty, not 40; a range ('1-40', '0x00-0x7F', '1.71 V -3.6 V') still states 40 / 3.6
+            if not negative and k > 0 and low[k - 1] == "-" and not _RANGE_BEFORE.search(low[max(0, k - 14):k - 1]):
                 continue
             return form, conf
     return None
+
+
+_RANGE_BEFORE = re.compile(r"(?:\d|0x[0-9a-f]+)\s*(?:[a-zµμ°%]{1,3})?\s*$")
 
 
 @dataclass
@@ -291,9 +344,9 @@ class FactLedger:
                 "error": f"REJECTED: value '{value}' does not appear inside the quoted text, so the quote does not support it.",
             }
         form, conf = match
-        stated_unit = unit_after(stated_text, value) if unit else None
-        if stated_unit and norm_unit(unit) != stated_unit and norm_unit(unit) in set(_UNIT_NAMES.values()) | {"mHz"}:
-            return {"ok": False, "error": f"REJECTED: the quote gives {value} {stated_unit}, not {value} {unit}."}
+        stated_units = units_after(stated_text, value) if unit else []
+        if stated_units and norm_unit(unit) not in stated_units and norm_unit(unit) in set(_UNIT_NAMES.values()) | {"mHz"}:
+            return {"ok": False, "error": f"REJECTED: the quote gives {value} {stated_units[0]}, not {value} {unit}."}
         tier = TrustTier(src.tier)
         warnings: List[str] = []
         if not is_authoritative(tier):

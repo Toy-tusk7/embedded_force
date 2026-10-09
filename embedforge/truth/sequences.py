@@ -68,8 +68,8 @@ def delay_us(fact: Any, unit_hint: str = "") -> Optional[float]:
     if not m:
         return None
     # the fact's own unit, else the unit its quote writes after the value ('wait 2 ms'); the step's hint only as a last resort
-    from embedforge.truth.ledger import unit_after
-    quoted = unit_after(getattr(fact, "quote", "") or "", m.group(1)) if getattr(fact, "quote", "") else None
+    from embedforge.truth.ledger import TIME_UNITS, unit_after
+    quoted = unit_after(getattr(fact, "quote", "") or "", m.group(1), TIME_UNITS) if getattr(fact, "quote", "") else None
     unit = (m.group(2) or getattr(fact, "unit", "") or quoted or unit_hint or "").strip().lower()
     scale = _UNIT_US.get(unit)
     if scale is None:
@@ -112,7 +112,7 @@ class SequenceBook:
         if addr is None:
             return f"reg {st.reg!r} must be the FACT id of the register address"
         book = RegisterBook(self.path.parent)
-        reg = book.register_at(addr, subject) or book.register_at(addr)
+        reg = _register(book, addr, subject)   # the same lookup the check uses later
         if reg is None or not reg.fields:
             return f"register 0x{addr:02X} has no fields in the register map: record_registers for it first"
         out: Dict[str, int] = {}
@@ -158,7 +158,7 @@ class SequenceBook:
         addr = _fact_int(ledger, st.reg)
         if st.op == "write" and st.value and not st.value.upper().startswith("FACT-") and not st.fields:
             v = raw_int(st.value)
-            reg = book.register_at(addr, subject) or book.register_at(addr) if addr is not None else None
+            reg = _register(book, addr, subject)
             if v is None or reg is None:
                 return f"value {st.value!r} must be a FACT id (or the register must be in the register map)"
             if reg.fields and v & ~reg.defined_mask & 0xFF:
