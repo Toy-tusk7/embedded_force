@@ -1014,15 +1014,47 @@ class FlowModel:
                      or [f for f in cands if not f.static or not _unit(f.file)] or cands)
         return max(cands, key=lambda f: len(f.body))  # prefer the definition over a stub
 
-    def trace(self, entry: str, args: Optional[List[Any]] = None, assume: Optional[Dict[str, Any]] = None) -> "Trace":
+    def caller_context(self, entry: str, entry_lists: Iterable[List[str]]) -> Optional[Tuple[List[Any], Dict[str, Any], Dict[Tuple[str, str], Any], Any]]:
+        """What the program hands `entry` the first time it calls it: walk each list of entry points (main, setup + loop,
+        tasks) until that call and keep its arguments, globals and struct fields (`dm388_init(&dev)` after main filled
+        dev.addr). None when no entry point calls it."""
+        target = self.function(entry)
+        if target is None:
+            return None
+        for entries in entry_lists:
+            if target.name in entries:
+                continue
+            w = Walker(self)
+            w.capture = target.name
+            try:
+                for obj_name, (cls, ctor_args) in self.global_objects.items():
+                    w.construct(obj_name, cls, ctor_args)
+                for e in entries:
+                    fn = self.function(e)
+                    if fn is not None:
+                        w.call(fn, [Sym(p) for p in fn.params], (), guaranteed=True)
+            except _Captured:
+                return w.captured
+            except RecursionError:
+                continue
+        return None
+
+    def trace(self, entry: str, args: Optional[List[Any]] = None, assume: Optional[Dict[str, Any]] = None,
+              context: Optional[Tuple[List[Any], Dict[str, Any], Dict[Tuple[str, str], Any], Any]] = None) -> "Trace":
         """Walk `entry`. `assume` fixes what the caller would provide: {'dev.intf': 1} sets a field of a parameter,
-        {'addr': 0x76} a parameter's value."""
+        {'addr': 0x76} a parameter's value. `context` (from caller_context) is what the program's own call passes."""
         fn = self.function(entry)
         if fn is None:
             return Trace(entry, [], [f"function '{entry}' not found in the project sources"], found=False)
         w = Walker(self)
         for obj_name, (cls, ctor_args) in self.global_objects.items():   # global constructors run before main/setup
             w.construct(obj_name, cls, ctor_args)
+        this = None
+        if context is not None:
+            args = list(context[0]) if args is None else args
+            w.globals.update(context[1])
+            w.fields.update(context[2])
+            this = context[3]
         call_args = list(args or [])
         for k, p in enumerate(fn.params):
             if k >= len(call_args):
@@ -1033,7 +1065,7 @@ class FlowModel:
                 w.fields[(f"<{base}>", fld)] = value
             elif key in fn.params:
                 call_args[fn.params.index(key)] = value
-        w.call(fn, call_args, (), guaranteed=True)
+        w.call(fn, call_args, (), guaranteed=True, this=this)
         w.spi_flush()
         return Trace(entry, normalize(w.events), w.notes, found=True, opaque=sorted(w.opaque))
 
@@ -1093,6 +1125,10 @@ class _Break(Exception):
 
 class _Continue(Exception):
     pass
+
+
+class _Captured(Exception):
+    """The walk reached the function it was asked to find the inputs of (FlowModel.caller_context)."""
 
 
 class _Return(Exception):
@@ -1557,6 +1593,8 @@ class Walker:
         self._last_env: Dict[str, Any] = {}
         self._addr_cells: List[Tuple[Dict[str, Any], str, Arr, Any]] = []   # (&x passed to a call): where x lives, its cell
         self._opaque_n = 0                                                  # calls into code the walk cannot see
+        self.capture = ""                                                   # stop at the first call of this function and
+        self.captured: Optional[Tuple[List[Any], Dict[str, Any], Dict[Tuple[str, str], Any], Any]] = None   # keep its inputs
 
     def note_value(self, v: Any, file: str, line: int, where: str) -> None:
         if self.probe is not None and isinstance(v, (int, float)) and not isinstance(v, bool) and len(self.values) < 20000:
@@ -1676,6 +1714,9 @@ class Walker:
         if len(self._stack) >= MAX_DEPTH or fn.name in self._stack:
             self.notes.append(f"stopped at {' > '.join(chain + (fn.name,))} (recursion/depth limit)")
             return Sym(f"{fn.name}()")
+        if self.capture and fn.name == self.capture and self._stack:
+            self.captured = (list(args), dict(self.globals), dict(self.fields), this)
+            raise _Captured()
         defaults = self.m.defaults.get(fn.name) or self.m.defaults.get(fn.name.split("::")[-1]) or {}
         env = {p: (args[k] if k < len(args) else
                    (Evaluator(self.m, {}, chain, None, True, fn.file).eval(defaults[k]) if k in defaults else Sym(p)))

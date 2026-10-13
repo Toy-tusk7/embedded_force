@@ -525,13 +525,17 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
     book = SequenceBook(project_dir)
     if not book.items:
         return [], []
-    from embedforge.truth.registers import RegisterBook
+    from embedforge.truth.registers import RegisterBook, entry_points
     model = model or FlowModel.from_dir(Path(project_dir))
     regs = RegisterBook(project_dir)
     results, findings = [], []
+    entries = None
     for seq in book.items.values():
         fn = model.function(seq.entry)
-        trace = model.trace(seq.entry)
+        if entries is None:
+            entries = entry_points(model)
+        # the entry as the program calls it: main() may hand it the device handle (&dev with .addr) or set globals first
+        trace = model.trace(seq.entry, context=model.caller_context(seq.entry, entries))
         r = check_sequence(seq, trace, ledger, regs)
         results.append(r.public())
         where = fn.file if fn else ""

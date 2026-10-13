@@ -175,6 +175,32 @@ void loop() {
 }
 """),
 
+    # the device handle is created in main() and passed by pointer through every call (CORE_EDITS adapt the core)
+    "pico_i2c_handle": ("main.c", r"""
+#include <stdio.h>
+#include <math.h>
+#include "pico/stdlib.h"
+#include "hardware/i2c.h"
+#define DM388_ADDR 0x76   /* @F(addr)@ */
+typedef struct { i2c_inst_t *i2c; uint8_t addr; } dm388_t;
+static int write_reg(dm388_t *dev, uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    return i2c_write_blocking(dev->i2c, dev->addr, buf, 2, false) == 2 ? 0 : -1;
+}
+static int read_regs(dm388_t *dev, uint8_t reg, uint8_t *buf, size_t len) {
+    if (i2c_write_blocking(dev->i2c, dev->addr, &reg, 1, true) != 1) return -1;
+    return i2c_read_blocking(dev->i2c, dev->addr, buf, len, false) == (int)len ? 0 : -1;
+}
+static void delay_ms(uint32_t ms) { sleep_ms(ms); }
+""", r"""
+int main(void) {
+    dm388_t dev = { .i2c = i2c0, .addr = DM388_ADDR };
+    if (dm388_init(&dev) != 0) return 1;
+    printf("T = %f\n", dm388_read_temperature(&dev));
+    return 0;
+}
+"""),
+
     "stm32_hal": ("main.c", r"""
 #include <stdio.h>
 #include <math.h>
@@ -310,10 +336,26 @@ CORE_MUTATIONS: List[Tuple[str, str, str, str]] = [
      "    if (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) return -1;\n", ""),
 ]
 
+# every-occurrence rewrites of the core (and of the core bugs) for frameworks whose calls take more arguments
+CORE_EDITS: Dict[str, List[Tuple[str, str]]] = {
+    "pico_i2c_handle": [("write_reg(", "write_reg(dev, "), ("read_regs(", "read_regs(dev, "),
+                        ("int dm388_init(void)", "int dm388_init(dm388_t *dev)"),
+                        ("float dm388_read_temperature(void)", "float dm388_read_temperature(dm388_t *dev)")],
+}
+
+
+def _core_for(framework: str, text: str) -> str:
+    for old, new in CORE_EDITS.get(framework, []):
+        text = text.replace(old, new)
+    return text
+
+
 # bugs in a framework's bus layer
 BUS_MUTATIONS: Dict[str, List[Tuple[str, str, str, str]]] = {
     "pico_i2c": [("wrong_bus_address", "writes go to address 0x77",
                   "i2c_write_blocking(i2c0, DM388_ADDR, buf, 2, false)", "i2c_write_blocking(i2c0, DM388_ADDR + 1, buf, 2, false)")],
+    "pico_i2c_handle": [("wrong_bus_address", "main() sets the handle up with address 0x77",
+                         ".addr = DM388_ADDR };", ".addr = DM388_ADDR + 1 };")],
     "pico_spi": [("no_read_flag", "SPI read without bit 7 set", "uint8_t cmd = reg | 0x80;", "uint8_t cmd = reg;"),
                  ("dummy_byte_ignored", "the dummy byte is taken as data", "buf[i] = tmp[i + 1];", "buf[i] = tmp[i];")],
     "arduino_wire": [("wrong_bus_address", "writes go to address 0x77",
@@ -535,7 +577,7 @@ def driver(framework: str) -> Tuple[str, str]:
             src = src.replace(old, new, 1)
         return name, src
     name, bus, entry = FRAMEWORKS[framework]
-    return name, bus + CORE + entry
+    return name, bus + _core_for(framework, CORE) + entry
 
 
 # core mutations that are not bugs in a variant: there the changed code still does what the datasheet requires
@@ -548,7 +590,8 @@ def mutants(framework: str) -> List[Tuple[str, str, str]]:
     base = IDIOMS[framework][0] if framework in IDIOMS else framework
     own = IDIOMS[framework][2] if framework in IDIOMS else []
     out = []
-    for key, what, old, new in CORE_MUTATIONS + BUS_MUTATIONS.get(base, []) + own:
+    core_bugs = [(k, w, _core_for(base, o), _core_for(base, n)) for k, w, o, n in CORE_MUTATIONS]
+    for key, what, old, new in core_bugs + BUS_MUTATIONS.get(base, []) + own:
         if key in HARMLESS.get(framework, ()):
             continue
         if old not in src:
