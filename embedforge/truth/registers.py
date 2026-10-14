@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from embedforge.truth.flow import FlowModel, Part, RxByte, Walker, is_int, writes_of
-from embedforge.truth.ledger import FactLedger, _index, _squash, bounded, parse_int, value_in_text
+from embedforge.truth.ledger import GAP, FactLedger, _index, _squash, bounded, parse_int, unescape_literals, value_in_text
 from embedforge.truth.source_store import SourceStore
 
 MAX_QUOTE = 2000
@@ -46,13 +46,8 @@ def _alnum(s: str) -> str:
     return _ALNUM.sub("", (s or "").lower())
 
 
-_ESC = re.compile(r"\\u([0-9a-fA-F]{4})|\\[nrt]")
-_GAP = re.compile(r"\s*(?:…|\.{3,}|\[\.\.\.\])\s*")
-
-
-def _unescape(q: str) -> str:
-    """Literal '\\u2013' / '\\n' left in a quote by double JSON escaping are the characters they stand for."""
-    return _ESC.sub(lambda m: chr(int(m.group(1), 16)) if m.group(1) else " ", q or "")
+_GAP = GAP
+_unescape = unescape_literals
 
 
 @lru_cache(maxsize=8)
@@ -1665,6 +1660,26 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            f"{f.id} {f.text() if len(f.steps) == 1 else f.name}: {detail.get(f.id, 'matches only one of two probe inputs')}.",
                                            "Implement the recorded formula exactly (inputs from the layouts, constants and order of operations), "
                                            "or re-record the formula if the datasheet / reference code says otherwise."))
+
+    # 6. bytes of a part's recorded layouts that the code assembles into numbers (shifts them into place) feed a
+    # conversion: without a formula recorded for that part, nothing checks it (the code could scale, offset or
+    # compensate the values any way and still pass)
+    assembled: Dict[str, Tuple[set, Tuple[str, int]]] = {}   # part -> (layout names assembled, where first)
+    for _, w in walkers:
+        for rx, _shift, file, line in w.obs_shifts:
+            if not mine(rx.dev):
+                continue
+            for lay, _ in parts_at(rx.reg, rx.dev):
+                assembled.setdefault(lay.device.lower(), (set(), (file, line)))[0].add(lay.name)
+    converted = {f.device.lower() for f in book.formulas.values()}
+    for dev, (names, at_) in sorted(assembled.items()):
+        if dev not in converted:
+            findings.append(RegFinding("ERROR", "FORMULA_MISSING", *at_,
+                                       f"the code assembles {', '.join(sorted(names))} of {dev.upper()} into values, but no "
+                                       "conversion formula was recorded for that part, so what the code computes from them is unchecked.",
+                                       "record_formula for each conversion the datasheet gives (coefficient scaling, compensation, "
+                                       "units). If the PDF's formulas are garbled, find_reference_code('<part>') stores the "
+                                       "manufacturer's reference driver: quote its C code."))
     return summary, findings
 
 

@@ -37,9 +37,12 @@ NO_FAILURE_STREAK_TOOLS = {"build", "verify", "finish", "record_fact", "record_u
                            "record_sequence", "record_registers", "record_layouts", "record_formula"}
 MAX_UNBUILT_CODE_NUDGES = 2
 MAX_TRUNCATION_RETRIES = 2
-MAX_CONTINUE_NUDGES = 1
+MAX_CONTINUE_NUDGES = 2
 STALL_NUDGE_STEPS = 14   # LLM steps without progress before the agent is told to change course
 STALL_STOP_STEPS = 28    # ... before the run pauses and hands control back to the user
+STEP_EXTENSION = 30      # steps added when the budget runs out while the run is still making progress (or can finish)
+MAX_STEP_EXTENSIONS = 3
+STEPS_LEFT_WARNING = 5   # tell the model when this many steps remain and no extension will follow
 _CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.S)
 _BUILD_CMD = re.compile(r"\b(cmake|ninja|make\s+\w|pio\s+run|platformio\s+run|dfu-util|picotool|openocd|st-flash|esptool)\b", re.I)
 
@@ -179,7 +182,7 @@ class ProgressGuard:
             self.fail_name, self.fail_streak = "", 0
         elif name in RESEARCH_TOOLS:
             self.research += 1
-        elif name in SDK_TOOLS:
+        elif name in SDK_TOOLS and not failed:   # a wrong path taught nothing about the SDK; it is not a lookup spent
             self.sdk += 1
 
 
@@ -295,7 +298,28 @@ class AgentRunner:
                 s.emit("project", meta=project.meta())
 
             s.emit("status", text="Agent started", model=self.llm.model, provider=self.llm.provider.id)
-            for step in range(config.agent_max_steps):
+            budget, extensions, step = config.agent_max_steps, 0, -1
+
+            def can_extend() -> bool:   # still moving (a recent fact, edit or build), or one call from done
+                return extensions < MAX_STEP_EXTENSIONS and (guard.steps_since_progress < STALL_NUDGE_STEPS or nxt.startswith("finish"))
+
+            while True:
+                step += 1
+                if step >= budget:
+                    if not can_extend():
+                        first = ((project.meta().get("last_build") or {}).get("diagnostics") or [""])[0]
+                        s.emit("error", message=f"Step budget ({budget}) used up. Next step: {nxt}"
+                                                + (f" (last build error: {first})" if first else "") + ". Send 'continue' to resume.")
+                        status = "needs_input"
+                        break
+                    extensions += 1
+                    budget += STEP_EXTENSION
+                    s.emit("status", text=f"Step budget extended to {budget}: the run is still making progress")
+                    project.trace({"event": "budget_extended", "budget": budget})
+                if budget - step == STEPS_LEFT_WARNING and not (extensions < MAX_STEP_EXTENSIONS and guard.steps_since_progress < STALL_NUDGE_STEPS - STEPS_LEFT_WARNING):
+                    history.append(notice(f"{STEPS_LEFT_WARNING} steps left in this run. If the current sources built and "
+                                          f"verified, call finish now; otherwise make the most important fix. NEXT STEP: {nxt}"))
+                    project.trace({"event": "notice", "kind": "steps_left"})
                 steps = step + 1
                 guard.step = step
                 if s.cancel_requested:
@@ -318,7 +342,7 @@ class AgentRunner:
                 if resp["reasoning"]:
                     s.emit("thinking", text=resp["reasoning"][:3000])
                 tool_calls = resp["tool_calls"]
-                if not tool_calls and "<tool_call>" in (resp["content"] or ""):
+                if not tool_calls and ("{" in (resp["content"] or "") or "<tool_call>" in (resp["content"] or "")):
                     # calls written as text (the provider did not parse them): run them as real calls
                     from embedforge.agent.textcalls import parse_text_tool_calls
                     parsed, rest = parse_text_tool_calls(resp["content"], [t["function"]["name"] for t in tools_for(meta)])
@@ -375,7 +399,9 @@ class AgentRunner:
                     # A task in progress whose next step needs no user input: one reminder before stopping.
                     kind = meta.get("kind") or ("platformio" if (project.root / "platformio.ini").exists() else "")
                     asked_question = user_message.rstrip().endswith("?")  # the user asked something; an answer is the result
-                    in_progress = bool(kind) and not asked_question and not nxt.startswith(("finish", "set up the target"))
+                    # before setup only when the request itself named the target (next step resolve_target / init_betaflight)
+                    task_named = bool(kind) or nxt.startswith(("resolve_target", "init_betaflight"))
+                    in_progress = task_named and not asked_question and not nxt.startswith(("finish", "set up the target"))
                     if in_progress and continue_nudges < MAX_CONTINUE_NUDGES and not problem:
                         continue_nudges += 1
                         s.emit("guard", kind="continue", text=f"The task is not finished — reminding the agent of the next step: {nxt}")
@@ -456,11 +482,6 @@ class AgentRunner:
                     s.emit("error", message=text)
                     status = "needs_input"
                     break
-            else:
-                first = ((project.meta().get("last_build") or {}).get("diagnostics") or [""])[0]
-                s.emit("error", message=f"Step budget ({config.agent_max_steps}) used up. Next step: {nxt}"
-                                        + (f" (last build error: {first})" if first else "") + ". Send 'continue' to resume.")
-                status = "needs_input"
         except Exception as e:  # never let the worker thread die silently
             logger.log_event("AGENT_CRASH", f"{type(e).__name__}: {e}")
             s.emit("error", message=f"{type(e).__name__}: {e}")

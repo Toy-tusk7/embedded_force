@@ -335,10 +335,15 @@ class ToolBelt:
         }
 
     # ------------------------------------------------------------ dispatch
+    # names models call that mean a real tool with the same arguments (seen in run traces): singular/plural slips
+    _ALIASES = {"record_layout": "record_layouts", "record_register": "record_registers", "record_formulas": "record_formula",
+                "record_sequences": "record_sequence"}
+
     def call(self, name: str, args: Dict[str, Any]) -> Any:
-        h = self._handlers.get(name)
+        h = self._handlers.get(name) or self._handlers.get(self._ALIASES.get(name, ""))
         if h is None:
             return {"error": f"Unknown tool '{name}'. Available: {', '.join(self._handlers)}"}
+        name = name if name in self._handlers else self._ALIASES[name]
         if name in ("record_fact", "record_user_fact") and isinstance(args.get("facts"), (list, str)) and not args.get("quote"):
             items = args["facts"]
             if isinstance(items, str):
@@ -509,7 +514,8 @@ class ToolBelt:
         if not board:
             return {"error": "board_name is required (letters, digits, underscores)."}
         msgs = self.project.user_messages()
-        latest = msgs[-1] if msgs else ""
+        # the latest substantive request: after the task, the user's 'continue' / 'yes' does not change what was asked
+        latest = next((m for m in reversed(msgs) if len(m.strip()) >= 40), msgs[-1] if msgs else "")
         if re.search(r"platform\s*io|arduino|pico[- ]?sdk|esp[- ]?idf|stm32cube|zephyr", latest, re.I) and not re.search(r"beta\s*flight", latest, re.I):
             return {"error": "The user asked for a PlatformIO/SDK project, not Betaflight. Use resolve_target and init_project "
                              "with the board and framework the user named.", "requested": latest[:200]}
@@ -661,21 +667,23 @@ class ToolBelt:
                 res["hint"] = (f"For a pin, the value is the pin name as the quote writes it: value='GPIO{int(str(value).strip())}' — "
                                "or record several pins at once with record_board_pins.")
                 return res
-            cands = self._candidate_quotes(source_id, str(value))
+            cands = self._candidate_quotes(source_id, str(value), quote=quote)
             if cands:
                 res["candidate_quotes"] = cands
-                res["hint"] = "These passages from the source contain the value verbatim. If one states the fact, retry with it as `quote`."
+                res["hint"] = ("These passages from the source contain the value verbatim, closest to your quote first. If one "
+                               "states the fact, retry with it as `quote`.")
         return res
 
-    def _candidate_quotes(self, source_id: str, value: str, limit: int = 3) -> List[str]:
-        """Verbatim windows of the source that contain `value`, to help the model copy an exact quote."""
+    def _candidate_quotes(self, source_id: str, value: str, limit: int = 3, quote: str = "") -> List[str]:
+        """Verbatim windows of the source that contain `value`, to help the model copy an exact quote; with the quote the
+        model tried, the windows sharing most of its words come first (the passage it meant, not the first mention)."""
         from embedforge.truth.ledger import value_variants
         src = self.store.get(source_id)
         if not src or not value.strip():
             return []
         text = src.text
         low = text.lower()
-        out: List[str] = []
+        found: List[str] = []
         for _form, rx, conf in value_variants(value):
             if conf != "STRICT":
                 continue
@@ -685,11 +693,14 @@ class ToolBelt:
                 a = next((i for i in range(a, m.start()) if text[i].isspace()), a) if a > 0 else a
                 b = next((i for i in range(b, m.end(), -1) if text[i - 1].isspace()), b) if b < len(text) else b
                 w = re.sub(r"\s+", " ", text[a:b]).strip()
-                if w and w not in out:
-                    out.append(w)
-                if len(out) >= limit:
-                    return out
-        return out
+                if w and w not in found:
+                    found.append(w)
+                if len(found) >= (40 if quote else limit):
+                    break
+        words = set(re.findall(r"[a-z0-9_]{3,}", (quote or "").lower()))
+        if words:   # stable: equally close windows keep document order
+            found.sort(key=lambda w: -len(words & set(re.findall(r"[a-z0-9_]{3,}", w.lower()))))
+        return found[:limit]
 
     def record_user_fact(self, subject: str, property: str, value: Any, quote: str) -> Dict[str, Any]:
         sid = self.store._by_url.get("user://conversation")
@@ -1092,7 +1103,10 @@ class ToolBelt:
         return out
 
     def read_framework_file(self, path: str, start: int = 1, end: int = 0) -> Dict[str, Any]:
-        path = re.sub(r"^betaflight-src:", "bf:", str(path))  # the form build diagnostics use
+        path = re.sub(r"^betaflight-src:", "bf:", str(path).strip().replace("\\", "/"))  # the form build diagnostics use
+        if (self._is_betaflight() and not path.startswith("bf:") and not (self.project.root / path).is_file()
+                and re.match(r"(?:\./)?(?:betaflight/)?(?:src|lib)/", path)):
+            path = "bf:" + re.sub(r"^(?:\./)?(?:betaflight/)?", "", path)   # 'src/main/...' / 'betaflight/src/...' -> 'bf:src/...'
         if path.startswith("bf:"):
             start = max(1, int(start or 1))
             res = betaflight.read_file(path, start, int(end) if end else start + 240)
@@ -1113,8 +1127,14 @@ class ToolBelt:
             return self.read_file(path, start or 1, end or 0)
         pk = (pio.core_dir() / "packages").resolve()
         p = (pk / path).resolve()
+        if (pk not in p.parents or not p.is_file()) and "packages/" in path:   # an absolute or ~/.platformio/packages/... path
+            p = (pk / re.sub(r"^.*?(?:^|/)packages/", "", path)).resolve()
         if pk not in p.parents or not p.is_file():
-            return {"error": "Path must be inside the installed packages directory and exist."}
+            installed = sorted(d.name for d in pk.iterdir() if d.is_dir())[:12] if pk.is_dir() else []
+            return {"error": (f"No SDK file '{path}'. Paths are relative to the packages directory, exactly as search_framework "
+                              "prints them before ':<line>' (e.g. 'framework-xyz/include/foo.h')"
+                              + (f"; installed packages: {', '.join(installed)}" if installed else "")
+                              + ". Use search_framework to find the file first.")}
         lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
         start = max(1, int(start or 1))
         end = min(len(lines), int(end or start + 160), start + 240)

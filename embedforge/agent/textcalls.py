@@ -11,7 +11,8 @@ always turn them into structured calls:
     </function>
     </tool_call>
 
-or Hermes style  <tool_call>{"name": "read_source", "arguments": {...}}</tool_call>.
+or Hermes style  <tool_call>{"name": "read_source", "arguments": {...}}</tool_call>, or a bare JSON object in the text
+(often in a ```json fence): {"tool": "resolve_target", "arguments": {...}}.
 Only names of real tools are accepted; anything else stays text.
 """
 
@@ -34,12 +35,50 @@ def _value(raw: str) -> Any:
     return raw.strip("\n")
 
 
+_NAME_KEYS = ("name", "tool", "tool_name", "function")
+_ARG_KEYS = ("arguments", "parameters", "args", "input")
+
+
+def _call(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": f"call_text_{uuid.uuid4().hex[:12]}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+def _bare_json_calls(content: str, names: set) -> Tuple[List[Dict[str, Any]], str]:
+    """JSON objects in the text that are exactly a call of a real tool: {"tool"|"name": <tool>, "arguments": {...}}."""
+    calls: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int]] = []
+    dec = json.JSONDecoder()
+    i = content.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(content, i)
+        except ValueError:
+            i = content.find("{", i + 1)
+            continue
+        name = next((obj.get(k) for k in _NAME_KEYS if isinstance(obj, dict) and isinstance(obj.get(k), str)), None)
+        args = next((obj.get(k) for k in _ARG_KEYS if isinstance(obj, dict) and k in obj), {}) if name else None
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = None
+        if name in names and isinstance(args, dict) and set(obj) <= set(_NAME_KEYS) | set(_ARG_KEYS) | {"id", "type"}:
+            calls.append(_call(name, args))
+            spans.append((i, end))
+        i = content.find("{", end)
+    rest = content
+    for a, b in reversed(spans):
+        rest = rest[:a] + rest[b:]
+    rest = re.sub(r"```(?:json)?\s*```", "", rest).strip() if calls else content
+    return calls, rest
+
+
 def parse_text_tool_calls(content: str, tool_names: Iterable[str]) -> Tuple[List[Dict[str, Any]], str]:
     """(calls in the OpenAI tool_calls shape, the text with the call blocks removed)."""
     names = set(tool_names)
     calls: List[Dict[str, Any]] = []
     if "<tool_call>" not in (content or ""):
-        return calls, content or ""
+        return _bare_json_calls(content or "", names)
     for m in _BLOCK.finditer(content):
         body = m.group(1)
         name, args = None, None
@@ -57,7 +96,6 @@ def parse_text_tool_calls(content: str, tool_names: Iterable[str]) -> Tuple[List
                 name = head.group(1)
                 args = {k: _value(v) for k, v in _PARAM.findall(body)}
         if name in names and isinstance(args, dict):
-            calls.append({"id": f"call_text_{uuid.uuid4().hex[:12]}", "type": "function",
-                          "function": {"name": name, "arguments": json.dumps(args)}})
+            calls.append(_call(name, args))
     rest = _BLOCK.sub("", content).strip() if calls else content
     return calls, rest

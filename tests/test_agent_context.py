@@ -207,12 +207,28 @@ def test_truncated_reply_is_retried_not_treated_as_the_answer(project, monkeypat
     assert any("cut off" in str(m.get("content")) for m in session.llm.seen[1])
 
 
-def test_text_reply_mid_task_gets_one_reminder(project, monkeypatch):
+def test_text_reply_mid_task_gets_two_reminders(project, monkeypatch):
     _bf_project(project)
-    session = _run(project, ["Shall I go ahead and write the config?", "Waiting for you."], monkeypatch,
+    session = _run(project, ["Shall I go ahead and write the config?", "Waiting for you.", "Still waiting."], monkeypatch,
                    message="Write the Betaflight config for this board")
-    assert [g["kind"] for g in _events(session, "guard")] == ["continue"]
-    assert len(session.llm.seen) == 2 and "NEXT STEP" in session.llm.seen[1][0]["content"]
+    assert [g["kind"] for g in _events(session, "guard")] == ["continue", "continue"]
+    assert len(session.llm.seen) == 3 and "NEXT STEP" in session.llm.seen[1][0]["content"]
+
+
+def test_text_reply_before_setup_is_reminded_only_when_the_request_names_the_target(project, monkeypatch):
+    session = _run(project, ["I will start by resolving the target."], monkeypatch,
+                   message="Write a PlatformIO project with the Arduino framework for board uno")
+    assert [g["kind"] for g in _events(session, "guard")] == ["continue", "continue"]   # then the run hands back
+    chat = _run(Project("t3", project.root.parent / "t3"), ["Hello! Which board do you have?"], monkeypatch, message="hi")
+    assert _events(chat, "guard") == []
+
+
+def test_tool_calls_written_as_bare_json_text_are_run(project, monkeypatch):
+    session = _run(project, ['```json\n{"tool": "list_files", "arguments": {}}\n```', "done"], monkeypatch)
+    assert [r["name"] for r in _events(session, "tool_result")] == ["list_files"]
+    # JSON that is not exactly a call of a real tool stays text
+    plain = _run(Project("t4", project.root.parent / "t4"), ['Config: {"name": "uno", "speed": 9600}'], monkeypatch, message="hi")
+    assert _events(plain, "tool_result") == []
 
 
 def test_model_sees_state_block_and_betaflight_prompt(project, monkeypatch):

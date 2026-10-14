@@ -564,7 +564,11 @@ MUST_FAIL: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {
          "static int write_reg(uint8_t reg, uint8_t val) {\n    uint8_t tx[2] = {reg & 0x7F, val};\n"
          "    struct spi_buf b = {.buf = tx, .len = 2};\n    struct spi_buf_set s = {.buffers = &b, .count = 1};\n"
          "    return spi_write_dt(&bus, &s);\n}")]),
+    # the whole truth but the conversion formulas: the code converts calibration and raw data nothing checks
+    "conversion_without_formula": ("pico_i2c", []),
 }
+# the truth a must-fail case is verified against (default: facts only)
+MUST_FAIL_TRUTH: Dict[str, str] = {"conversion_without_formula": "no_formulas"}
 
 
 def driver(framework: str) -> Tuple[str, str]:

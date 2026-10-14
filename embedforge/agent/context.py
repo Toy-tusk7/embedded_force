@@ -360,34 +360,24 @@ _DRIVER_TASK = re.compile(r"\b(driver|sensor|datasheet|register|barometer|imu|gy
 
 
 def driver_plan(project: Any, facts: List[Any], request: str) -> str:
-    """Before writing a device driver: the meaning of the datasheet goes on record first, in this order, so verify can
-    check fields, byte order and formulas, not only that numbers were cited."""
+    """Before writing a device driver: the facts its constants need and the register map it writes, so the first code
+    is written from the datasheet. The rest (layouts, formulas, the init sequence) can follow the first build: verify
+    fails on anything the code uses that is not on record, and its findings say what to record next."""
     from embedforge.truth.registers import RegisterBook
-    from embedforge.truth.sequences import SequenceBook
     ds_facts = [f for f in facts if str(getattr(f, "source_url", "")).startswith("http")]
     if not (_DRIVER_TASK.search(request or "") or ds_facts):
         return ""
     book = RegisterBook(project.root)
-    todo = []
     if not ds_facts:
-        todo.append("record_facts from the datasheet (read_source first): bus address for the strap on the schematic, ID "
-                    "register + value, command values, start-up/conversion times with units")
+        return ("DRIVER — record_facts from the datasheet (read_source first): bus address for the strap on the schematic, ID "
+                "register + value, command values, start-up/conversion times with units; then record_registers; then "
+                "write_file the driver and build")
     if not book.registers:
-        todo.append("record_registers: every register the driver will write, poll or test, with fields (bits, named values) "
-                    "and bursts for data that must be read in one transaction")
-    if not book.layouts:
-        todo.append("record_layouts: every multi-byte value (calibration coefficients, raw readings), bytes least significant first")
-    if not book.formulas:
-        todo.append("record_formula: every conversion (coefficient scaling, compensation). If the PDF formulas are garbled, "
-                    "find_reference_code('<part>') stores the manufacturer's reference driver: quote its C code")
-    if not SequenceBook(project.root).items:
-        todo.append("record_sequence: the init order (reset, wait, calibration read, configuration) with write steps as "
-                    "{op:'write', reg:FACT, fields:{...}}")
-    if not todo:
-        return ("write_file the driver: implement exactly the recorded registers (values composed from their fields), layouts "
-                "(byte order), burst reads, formulas and sequences, then build and verify")
-    return "DRIVER — record what the datasheet MEANS before writing code. Next: " + todo[0] + (
-        f". Then: {'; '.join(t.split(':')[0] for t in todo[1:])}; then write_file and build" if len(todo) > 1 else "; then write_file and build")
+        return ("DRIVER — record_registers: the registers the driver will write, poll or test, with fields (bits, named "
+                "values) and bursts for data that must be read in one transaction; then write_file the driver and build")
+    return ("write_file the driver from the recorded facts and registers (values composed from their fields), then build "
+            "and verify: verify names what else to record (layouts for multi-byte values, formulas for conversions, the "
+            "init sequence). Layouts, formulas and sequences recorded now are checked from the first verify")
 
 
 def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], unc: List[str],
@@ -431,6 +421,16 @@ def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], u
     if not verified_now:
         return "verify"
     if not lv.get("passed"):
-        f = (lv.get("findings") or ["see the last verify result"])[0]
+        found = lv.get("findings") or []
+        codes = {str(x).split(" ", 1)[0] for x in found}
+        # what the code uses but nothing records yet: record it (no rebuild needed), every kind in one go
+        record = {"REG_MAP_MISSING": "record_registers (+ record_layouts, record_formula)", "REG_FIELDS_MISSING": "record_registers with fields",
+                  "REG_UNMAPPED": "record_registers / record_layouts for the unmapped addresses",
+                  "FORMULA_MISSING": "record_formula for the conversions", "FLOW_UNSPECIFIED": "record_sequence for the init order"}
+        todo = [t for c, t in record.items() if c in codes]
+        if todo:
+            return (f"record what verify found unrecorded: {'; '.join(todo)} (each finding's suggestion says what to quote), "
+                    "then verify again — new records need no rebuild")
+        f = (found or ["see the last verify result"])[0]
         return f"fix the verify findings (first: {f}), then build and verify again"
     return "finish(status='success', summary=...) — the current sources built and verified"

@@ -23,12 +23,14 @@ MAX_QUOTE_CHARS = 600
 
 _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
 _QUOTES = {ord("\u2018"): "'", ord("\u2019"): "'", ord("\u201c"): '"', ord("\u201d"): '"'}
+# super/subscript digits are the digits (I\u00b2C is I2C; a PDF's 2\u00b3\u2070 and a model's 2^30 both squash to 230)
+_SCRIPT_DIGITS = {**{ord(c): str(i) for i, c in enumerate("\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079")}, **{ord(c): str(i) for i, c in enumerate("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089")}}
 
 
 def _squash(s: str) -> str:
     """Whitespace-free, case-folded form used for robust verbatim-quote containment."""
     s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl").replace("\u00b5", "\u03bc")   # micro sign = Greek mu
-    s = s.translate(_DASHES).translate(_QUOTES)
+    s = s.translate(_DASHES).translate(_QUOTES).translate(_SCRIPT_DIGITS)
     # Markdown table/emphasis markup from the PDF converter ('| Bit 5..4 | mode |', '**Table 40**', '<br>') is layout,
     # not text: a quote matches with or without it
     s = re.sub(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]", " ", s)   # 2<sup>osr_p</sup> = 2^osr_p
@@ -39,7 +41,7 @@ def _squash(s: str) -> str:
 
 _MARKUP = re.compile(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]")
 _DROP = re.compile(r"[\s\"'`´]")
-_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES}
+_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES, **_SCRIPT_DIGITS}
 
 
 def _squash_map(s: str) -> Tuple[str, List[int]]:
@@ -137,6 +139,46 @@ def anchor(quote: str, text: str) -> Optional[Tuple[int, int]]:
             return sp
         pos = ix.s.find(q, pos + 1)
     return None
+
+
+_ESC_LITERAL = re.compile(r"\\u([0-9a-fA-F]{4})|\\[nrt]")
+GAP = re.compile(r"\s*(?:…|\.{3,}|\[\.\.\.\])\s*")
+GAP_MIN_PIECE = 8      # squashed characters in each piece of a quote with omissions
+GAP_MAX_SKIP = 1500    # squashed characters a '…' may stand for
+
+
+def unescape_literals(q: str) -> str:
+    """Literal '\\u2013' / '\\n' left in a quote by double JSON escaping are the characters they stand for."""
+    return _ESC_LITERAL.sub(lambda m: chr(int(m.group(1), 16)) if m.group(1) else " ", q or "")
+
+
+def anchor_pieces(quote: str, text: str) -> Optional[List[Tuple[int, int]]]:
+    """Source spans of a quote that may omit text with '…' / '...' / '[...]' between verbatim pieces: each piece at least
+    GAP_MIN_PIECE characters, on word boundaries, in order, each within GAP_MAX_SKIP of the one before. A quote
+    without omissions is one piece (anchor)."""
+    pieces = [p for p in GAP.split(quote) if _squash(p)]
+    if len(pieces) <= 1:
+        sp = anchor(quote, text)
+        return [sp] if sp else None
+    sq = [_squash(p) for p in pieces]
+    if min(len(p) for p in sq) < GAP_MIN_PIECE:
+        return None
+    ix = _index(text)
+
+    def place(k: int, lo: int, hi: int) -> Optional[List[Tuple[int, int]]]:
+        pos = ix.s.find(sq[k], lo)
+        while 0 <= pos <= hi:
+            sp = ix.span(pos, pos + len(sq[k]))
+            if sp is not None and bounded(text, sp[0], sp[1], sq[k][0], sq[k][-1]):
+                if k + 1 == len(sq):
+                    return [sp]
+                end = pos + len(sq[k])
+                rest = place(k + 1, end, end + GAP_MAX_SKIP)
+                if rest is not None:
+                    return [sp] + rest
+            pos = ix.s.find(sq[k], pos + 1)
+        return None
+    return place(0, 0, len(ix.s))
 
 
 _UNIT_NAMES = {"s": "s", "sec": "s", "second": "s", "seconds": "s", "ms": "ms", "msec": "ms", "millisecond": "ms",
@@ -312,7 +354,7 @@ class FactLedger:
     ) -> Dict[str, Any]:
         """Validate and record a fact. Returns {ok, fact|error, warnings}."""
         value = str(value).strip()
-        quote = (quote or "").strip()
+        quote = unescape_literals(quote or "").strip()
         subject = (subject or "").strip()
         prop = (prop or "").strip()
         if not (subject and prop and value):
@@ -324,8 +366,8 @@ class FactLedger:
             return {"ok": False, "error": f"Quote too short (<{MIN_QUOTE_CHARS} chars). Quote the full sentence/table row."}
         if len(quote) > MAX_QUOTE_CHARS:
             return {"ok": False, "error": f"Quote too long (>{MAX_QUOTE_CHARS} chars). Quote only the relevant row/sentence."}
-        span = anchor(quote, src.text)
-        if span is None:
+        spans = anchor_pieces(quote, src.text)
+        if spans is None:
             if _squash(quote) in _squash(src.text):
                 return {"ok": False, "error": (f"REJECTED: the quote starts or ends inside a word or number of {source_id} (e.g. "
                                                "'2 ms' inside '12 ms'). Quote whole words and numbers.")}
@@ -333,10 +375,12 @@ class FactLedger:
                 "ok": False,
                 "error": (
                     f"REJECTED: quote does not appear verbatim in {source_id}. Facts must be copied "
-                    "exactly from the source text (use read_source to get exact text)."
+                    "exactly from the source text (use read_source to get exact text). Text may be left out only with "
+                    "'…' between verbatim pieces that stand close together, in order."
                 ),
             }
-        stated_text = src.text[span[0]:span[1]]   # the value is checked in the source's own text, not the model's copy
+        # the value is checked in the source's own text of the quoted pieces, not in the model's copy or the omitted text
+        stated_text = " … ".join(src.text[a:b] for a, b in spans)
         match = value_in_text(value, stated_text)
         if match is None:
             return {

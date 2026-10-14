@@ -401,6 +401,25 @@ def test_a_check_that_crashes_fails_verify(tmp_path, monkeypatch):
     assert not rep.passed and any(x.code == "REGISTER_CHECK_ERROR" and x.severity == "ERROR" for x in rep.findings)
 
 
+def test_fact_quotes_may_skip_text_between_close_verbatim_pieces_and_match_script_digits(tmp_path):
+    p = Project("r7", tmp_path / "r7")
+    store = SourceStore(p.root)
+    src = store.add("https://www.bosch-sensortec.com/y.pdf", "datasheet",
+                    "Table 3: Register 0x00 “CHIP_ID”\n|  | Name | Description |\n|---|---|---|\n"
+                    "| Bit 7..0 | chip_id | Chip identification code, fixed to 0x50 |\nThe I²C interface runs at 400 kHz.",
+                    kind="pdf")
+    ledger = FactLedger(p.root, store)
+    # a table caption and its row, the layout between left out
+    assert ledger.record("BMPX", "chip_id", "0x50", src.id, "Register 0x00 CHIP_ID … Chip identification code, fixed to 0x50")["ok"]
+    # the value must stand in a quoted piece, not in the text the '…' leaves out
+    r = ledger.record("BMPX", "chip_id_reg", "0x00", src.id, "Table 3: Register … identification code, fixed to 0x50")
+    assert not r["ok"] and "does not appear inside the quoted text" in r["error"], r
+    assert not ledger.record("BMPX", "chip_id2", "0x50", src.id, "Table 3 … 0x50")["ok"]   # pieces too short to anchor
+    # I2C for I²C, and a quote double-escaped by the model (a literal backslash-u sequence)
+    assert ledger.record("BMPX", "i2c_speed", "400", src.id, "The I2C interface runs at 400 kHz.", "kHz")["ok"]
+    assert ledger.record("BMPX", "i2c_speed_b", "400", src.id, "The I\\u00b2C interface runs at 400 kHz.", "kHz")["ok"]
+
+
 def test_quotes_are_anchored_to_whole_words_and_the_value_and_unit_are_read_from_the_source(tmp_path):
     p = Project("r6", tmp_path / "r6")
     store = SourceStore(p.root)

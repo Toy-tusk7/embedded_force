@@ -77,6 +77,24 @@ def test_research_budget_blocks_endless_searching(project, monkeypatch):
     assert stats["tools"]["web_search"] == 9 and stats["facts"] == 0
 
 
+def test_step_budget_extends_while_the_run_makes_progress(project, monkeypatch):
+    from embedforge.core.config import config
+    monkeypatch.setattr(config, "agent_max_steps", 2)
+    turns = [[_call(i, "write_file", {"path": f"src/m{i}.c", "content": f"int v{i};\n"})] for i in range(4)] + ["done"]
+    session = _run(project, turns, monkeypatch)
+    assert any("Step budget extended to 32" in str(e.get("text")) for e in _events(session, "status"))
+    assert len(_events(session, "tool_result")) == 4 and not any("used up" in str(e.get("message")) for e in _events(session, "error"))
+
+
+def test_step_budget_ends_a_run_that_stopped_making_progress(project, monkeypatch):
+    from embedforge.core.config import config
+    monkeypatch.setattr(config, "agent_max_steps", loop_mod.STALL_NUDGE_STEPS + 2)
+    turns = [[_call(i, "read_file", {"path": f"src/missing{i}.c"})] for i in range(40)]
+    session = _run(project, turns, monkeypatch)
+    assert any(f"Step budget ({loop_mod.STALL_NUDGE_STEPS + 2}) used up" in str(e.get("message")) for e in _events(session, "error"))
+    assert not any("extended" in str(e.get("text")) for e in _events(session, "status"))
+
+
 def test_progress_resets_research_budget(project, monkeypatch):
     turns = [[_call(i, "web_search", {"query": f"q{i}"})] for i in range(6)]
     turns.append([_call(6, "record_fact", {"subject": "MPU6050", "property": "who_am_i_default", "value": "0x68",

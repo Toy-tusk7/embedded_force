@@ -15,7 +15,7 @@ from embedforge.agent.workspace import Project
 from embedforge.truth import FactLedger, SourceStore, verify_project
 from embedforge.truth.registers import RegisterBook
 from embedforge.truth.sequences import SequenceBook
-from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, MUST_FAIL, driver, extra_files, mutants
+from embedforge.verifybench.drivers import FRAMEWORKS, IDIOMS, MUST_FAIL, MUST_FAIL_TRUTH, driver, extra_files, mutants
 
 DATASHEET = (Path(__file__).parent / "datasheet.md").read_text(encoding="utf-8")
 DEVICE = "DM388"
@@ -52,9 +52,10 @@ def _row(text: str) -> str:
     return DATASHEET[DATASHEET.rfind("\n", 0, i) + 1:DATASHEET.find("\n", i)]
 
 
-def build_truth(root: Path, facts_only: bool = False) -> Dict[str, str]:
+def build_truth(root: Path, facts_only: bool = False, formulas: bool = True) -> Dict[str, str]:
     """Record the DM388 ground truth into a project at `root`; returns key -> FACT id. Every record must pass its gate.
-    facts_only: the facts but no register map and no sequence (what a careless run leaves behind)."""
+    facts_only: the facts but no register map and no sequence (what a careless run leaves behind). formulas=False: all
+    of it but the conversion formulas."""
     p = Project("verifybench", root)
     store = SourceStore(p.root)
     src = store.add("https://example.com/dm388-datasheet.pdf", "DM388 datasheet", DATASHEET, kind="pdf")
@@ -102,17 +103,19 @@ def build_truth(root: Path, facts_only: bool = False) -> Dict[str, str]:
          "quote": "Shadowing only works if all data registers are read in a single burst read."}])
     if not r.get("bursts"):
         raise RuntimeError(f"ground truth burst rejected: {r}")
-    for name, expr in [("PAR_T1", "NVM_PAR_T1 / 2^-8"), ("PAR_T2", "NVM_PAR_T2 / 2^30"), ("PAR_T3", "NVM_PAR_T3 / 2^48")]:
+    for name, expr in ([("PAR_T1", "NVM_PAR_T1 / 2^-8"), ("PAR_T2", "NVM_PAR_T2 / 2^30"), ("PAR_T3", "NVM_PAR_T3 / 2^48")]
+                       if formulas else []):
         r = book.record_formula(store, DEVICE, src.id, name, [f"{name} = {expr}"], f"{name} = {expr}")
         if not r.get("ok"):
             raise RuntimeError(f"ground truth formula {name} rejected: {r}")
-    q = _cut("partial_data1 = (float)(uncomp_temp", "* calib_data->par_t3;")
-    r = book.record_formula(store, DEVICE, src.id, "T_LIN", [
-        "partial_data1 = (float)(uncomp_temp - calib_data->par_t1)", "partial_data2 = (float)(partial_data1 * calib_data->par_t2)",
-        "calib_data->t_lin = partial_data2 + (partial_data1 * partial_data1) * calib_data->par_t3"], q, "degC",
-        inputs={"uncomp_temp": "UT"})
-    if not r.get("ok"):
-        raise RuntimeError(f"ground truth formula T_LIN rejected: {r}")
+    if formulas:
+        q = _cut("partial_data1 = (float)(uncomp_temp", "* calib_data->par_t3;")
+        r = book.record_formula(store, DEVICE, src.id, "T_LIN", [
+            "partial_data1 = (float)(uncomp_temp - calib_data->par_t1)", "partial_data2 = (float)(partial_data1 * calib_data->par_t2)",
+            "calib_data->t_lin = partial_data2 + (partial_data1 * partial_data1) * calib_data->par_t3"], q, "degC",
+            inputs={"uncomp_temp": "UT"})
+        if not r.get("ok"):
+            raise RuntimeError(f"ground truth formula T_LIN rejected: {r}")
     steps = [{"op": "write", "reg": ids["cmd_reg"], "value": ids["softreset"]},
              {"op": "delay_min", "value": ids["startup"]},
              {"op": "read", "reg": ids["chip_id_reg"]},
@@ -158,17 +161,19 @@ def _verify(template: Path, work: Path, file_name: str, code: str, extra: Option
 
 def run(frameworks: Optional[List[str]] = None, with_mutants: bool = True, workdir: Optional[Path] = None) -> List[Case]:
     base = Path(workdir or tempfile.mkdtemp(prefix="verifybench-"))
-    template, bare = base / "truth", base / "facts_only"
-    for t in (template, bare):
+    template, bare, no_formulas = base / "truth", base / "facts_only", base / "no_formulas"
+    for t in (template, bare, no_formulas):
         if t.exists():
             shutil.rmtree(t)
     ids = build_truth(template)
     build_truth(bare, facts_only=True)
+    build_truth(no_formulas, formulas=False)
+    truths = {"facts_only": bare, "no_formulas": no_formulas}
     cases: List[Case] = []
     names = frameworks or list(FRAMEWORKS) + list(IDIOMS) + list(MUST_FAIL)
     for fw in [n for n in names if n in MUST_FAIL]:   # unchecked code must not pass
         name, src = driver(fw)
-        errors = _verify(bare, base / "run", name, _fill(src, ids))
+        errors = _verify(truths[MUST_FAIL_TRUTH.get(fw, "facts_only")], base / "run", name, _fill(src, ids))
         cases.append(Case(fw, "must_fail", "verify cannot check this code, so it must not pass", not errors, errors, caught=bool(errors)))
     for fw in [n for n in names if n not in MUST_FAIL]:
         name, src = driver(fw)
