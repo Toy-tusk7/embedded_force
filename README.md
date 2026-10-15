@@ -125,7 +125,8 @@ Every call asks for its usage (`include_usage`) and is logged with its `request_
 source keeps the endpoint and request that produced it. The IDE shows them per source, and the delivery walkthrough
 lists, for every fact, the Tavily request that found its source and the credits spent per datasheet fact. Searches
 are cached per run, and a research budget stops endless searching (6 searches without a new fact or code change).
-`TAVILY_SEARCH_DEPTH=basic` halves the search cost.
+`TAVILY_SEARCH_DEPTH=basic` halves the search cost, and `EMBEDFORGE_TAVILY_MAX_CALLS` (default 12) caps the searches
+and maps one run may make; past it the agent works from the sources it has stored.
 
 ## Quickstart
 

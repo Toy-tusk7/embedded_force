@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 from embedforge import eda
 from embedforge.agent.events import RunSession
 from embedforge.agent.workspace import Project
+from embedforge.core.config import config
 from embedforge.toolchain import betaflight, pio, wsl
 from embedforge.truth import FactLedger, SourceStore, verify_project
 from embedforge.truth.verifier import build_inputs_hash, collect_sources
@@ -316,6 +317,7 @@ class ToolBelt:
         self.final: Dict[str, Any] = {}
         self._searches: Dict[str, List[Dict[str, Any]]] = {}  # normalized query -> results (per run)
         self._tavily_unavailable: Optional[Dict[str, Any]] = None   # set once Tavily refuses for good (credits, key)
+        self._tavily_calls = 0                                       # searches and maps made in this run
         self._failed_calls: Dict[str, int] = {}      # identical record_* calls that were rejected (per run)
         self._failed_errors: Dict[str, str] = {}
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
@@ -580,7 +582,7 @@ class ToolBelt:
         if key in self._searches:
             return {"results": self._searches[key], "repeated": True,
                     "note": "You already ran this exact search in this run. Use the sources above (read_source) instead of searching again."}
-        if self._tavily_unavailable:
+        if self._tavily_unavailable or self._tavily_budget_spent():
             return self._tavily_unavailable
         try:
             res = self.store.search(query, domains)
@@ -613,6 +615,19 @@ class ToolBelt:
                 "note": "Each result's `excerpt` is the passage that best matches your query. If it contains the value you need, "
                         "record_fact now with a verbatim quote copied from it; use read_source(source_id, query) for other passages."}
 
+    def _tavily_budget_spent(self) -> bool:
+        """Count one Tavily search/map for this run; past EMBEDFORGE_TAVILY_MAX_CALLS the agent works from its sources."""
+        if self._tavily_calls >= config.tavily_max_calls:
+            stored = [f"{s.id} ({s.title[:50]})" for s in self.store.sources.values() if s.kind != "user"][:12]
+            self._tavily_unavailable = {
+                "error": f"This run's Tavily budget ({config.tavily_max_calls} searches/maps) is used up. "
+                         + (f"Work from the stored sources with read_source: {', '.join(stored)}. " if stored else "")
+                         + "find_reference_code still works (GitHub); otherwise ask_user.",
+                "tavily_unavailable": True}
+            return True
+        self._tavily_calls += 1
+        return False
+
     def _tavily_out(self, e: Exception) -> bool:
         """Tavily refused for good (credits used up, key rejected): remember it for the rest of the run, so the agent is
         pointed at the sources it already has instead of retrying searches."""
@@ -632,7 +647,7 @@ class ToolBelt:
     def find_documents(self, url: str, part: str = "") -> Dict[str, Any]:
         if not str(url).lower().startswith(("http://", "https://")):
             url = "https://" + str(url).strip().lstrip("/")   # 'www.bosch-sensortec.com/products/...' -> https://...
-        if self._tavily_unavailable:
+        if self._tavily_unavailable or self._tavily_budget_spent():
             return self._tavily_unavailable
         self.session.emit("status", text=f"Mapping {url} for official documents (Tavily Map)…")
         try:

@@ -96,6 +96,27 @@ def test_used_up_credits_point_the_agent_at_its_stored_sources(tmp_path, monkeyp
     assert again == first and len(FakeTavily.calls) == 1   # not retried: no credits spent, no steps wasted
 
 
+def test_a_run_stops_searching_at_its_tavily_budget(tmp_path, monkeypatch):
+    from embedforge.agent.events import RunSession
+    from embedforge.agent.tools import ToolBelt
+    from embedforge.agent.workspace import Project
+    from embedforge.truth import FactLedger
+
+    FakeTavily.calls = []
+    monkeypatch.setattr(tavily, "TavilyClient", FakeTavily)
+    monkeypatch.setattr(config, "tavily_max_calls", 1)
+    p = Project("t", tmp_path / "t")
+    store = SourceStore(p.root)
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    assert belt.call("web_search", {"query": "BMP388 datasheet"})["results"]
+    assert belt.call("web_search", {"query": "BMP388 datasheet"})["repeated"]   # a repeat is free
+    searches = [c for c in FakeTavily.calls if c[0] == "search"]
+    over = belt.call("web_search", {"query": "BMP388 register map"})
+    assert over["tavily_unavailable"] and "budget (1 searches/maps)" in over["error"] and "SRC-001" in over["error"]
+    assert belt.call("find_documents", {"url": "www.bosch-sensortec.com"}) == over
+    assert [c for c in FakeTavily.calls if c[0] in ("search", "map")] == searches   # nothing past the budget reached Tavily
+
+
 def test_find_documents_maps_the_vendor_site_and_puts_the_datasheet_first(store):
     res = store.find_documents("https://www.bosch-sensortec.com/products/environmental-sensors/pressure-sensors/bmp388/", "BMP388")
     op, kw = FakeTavily.calls[-1]

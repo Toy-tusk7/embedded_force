@@ -25,6 +25,8 @@ class EmbedForgeConfig(BaseModel):
     )
     # advanced (2 credits): the most relevant chunks of each page, better on technical documents; basic: 1 credit
     tavily_search_depth: str = Field(default_factory=lambda: os.getenv("TAVILY_SEARCH_DEPTH", "advanced"))
+    # Tavily searches and maps one run may make: past it the agent works from the sources it has
+    tavily_max_calls: int = Field(default_factory=lambda: int(os.getenv("EMBEDFORGE_TAVILY_MAX_CALLS", "12")))
     agent_model: str = Field(
         # Ultra is the only Nemotron that produced correct firmware in our evals (Nano: 0 of 4)
         default_factory=lambda: os.getenv("NEBIUS_AGENT_MODEL") or os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
