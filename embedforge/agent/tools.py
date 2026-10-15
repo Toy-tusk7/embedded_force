@@ -315,6 +315,7 @@ class ToolBelt:
         self.ended: Optional[str] = None       # 'ask_user' | 'finish'
         self.final: Dict[str, Any] = {}
         self._searches: Dict[str, List[Dict[str, Any]]] = {}  # normalized query -> results (per run)
+        self._tavily_unavailable: Optional[Dict[str, Any]] = None   # set once Tavily refuses for good (credits, key)
         self._failed_calls: Dict[str, int] = {}      # identical record_* calls that were rejected (per run)
         self._failed_errors: Dict[str, str] = {}
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
@@ -579,7 +580,14 @@ class ToolBelt:
         if key in self._searches:
             return {"results": self._searches[key], "repeated": True,
                     "note": "You already ran this exact search in this run. Use the sources above (read_source) instead of searching again."}
-        res = self.store.search(query, domains)
+        if self._tavily_unavailable:
+            return self._tavily_unavailable
+        try:
+            res = self.store.search(query, domains)
+        except Exception as e:
+            if not self._tavily_out(e):
+                raise
+            return self._tavily_unavailable
         fetched = 0
         for r in res:
             src = self.store.get(r["source_id"])
@@ -605,11 +613,34 @@ class ToolBelt:
                 "note": "Each result's `excerpt` is the passage that best matches your query. If it contains the value you need, "
                         "record_fact now with a verbatim quote copied from it; use read_source(source_id, query) for other passages."}
 
+    def _tavily_out(self, e: Exception) -> bool:
+        """Tavily refused for good (credits used up, key rejected): remember it for the rest of the run, so the agent is
+        pointed at the sources it already has instead of retrying searches."""
+        from tavily.errors import InvalidAPIKeyError, MissingAPIKeyError, UsageLimitExceededError
+        if not isinstance(e, (UsageLimitExceededError, InvalidAPIKeyError, MissingAPIKeyError)):
+            return False
+        stored = [f"{s.id} ({s.title[:50]})" for s in self.store.sources.values() if s.kind != "user"][:12]
+        self._tavily_unavailable = {
+            "error": f"Web search is unavailable for this run (Tavily: {str(e)[:120]}). "
+                     + (f"Use the stored sources with read_source: {', '.join(stored)}. " if stored else "")
+                     + "find_reference_code still works (GitHub) and fetch_document can download a datasheet URL you know; "
+                       "otherwise ask_user to upload the datasheet.",
+            "tavily_unavailable": True}
+        self.session.emit("status", text="Tavily search unavailable (credits or key) — using stored sources")
+        return True
+
     def find_documents(self, url: str, part: str = "") -> Dict[str, Any]:
         if not str(url).lower().startswith(("http://", "https://")):
             url = "https://" + str(url).strip().lstrip("/")   # 'www.bosch-sensortec.com/products/...' -> https://...
+        if self._tavily_unavailable:
+            return self._tavily_unavailable
         self.session.emit("status", text=f"Mapping {url} for official documents (Tavily Map)…")
-        res = self.store.find_documents(url, part)
+        try:
+            res = self.store.find_documents(url, part)
+        except Exception as e:
+            if not self._tavily_out(e):
+                raise
+            return self._tavily_unavailable
         if not res["documents"]:
             res["note"] = ("No document links found on that page. Try the part's product page, the vendor's documentation "
                            "root, or web_search with the vendor domain.")

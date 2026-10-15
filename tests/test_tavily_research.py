@@ -73,6 +73,29 @@ def test_web_pages_are_read_with_extract_and_pdfs_downloaded_first(store, monkey
     assert pdf.via == "tavily:extract" and [c[0] for c in FakeTavily.calls[n:]] == ["extract"]
 
 
+def test_used_up_credits_point_the_agent_at_its_stored_sources(tmp_path, monkeypatch):
+    from tavily.errors import UsageLimitExceededError
+    from embedforge.agent.events import RunSession
+    from embedforge.agent.tools import ToolBelt
+    from embedforge.agent.workspace import Project
+    from embedforge.truth import FactLedger
+
+    class OutOfCredits(FakeTavily):
+        def search(self, **kw):
+            FakeTavily.calls.append(("search", kw))
+            raise UsageLimitExceededError("This request exceeds your plan's set usage limit.")
+    FakeTavily.calls = []
+    monkeypatch.setattr(tavily, "TavilyClient", OutOfCredits)
+    p = Project("t", tmp_path / "t")
+    store = SourceStore(p.root)
+    store.add("user://upload/bst-bmp388-ds001.md", "Document: bst-bmp388-ds001.md", PAGE, kind="pdf")
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    first = belt.call("web_search", {"query": "BMP388 datasheet"})
+    assert first["tavily_unavailable"] and "SRC-001 (Document: bst-bmp388-ds001.md)" in first["error"]
+    again = belt.call("web_search", {"query": "BMP388 register map"})
+    assert again == first and len(FakeTavily.calls) == 1   # not retried: no credits spent, no steps wasted
+
+
 def test_find_documents_maps_the_vendor_site_and_puts_the_datasheet_first(store):
     res = store.find_documents("https://www.bosch-sensortec.com/products/environmental-sensors/pressure-sensors/bmp388/", "BMP388")
     op, kw = FakeTavily.calls[-1]

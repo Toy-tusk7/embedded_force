@@ -466,12 +466,14 @@ async def upload_files(
             else:
                 dest = clean_name
             p.write_bytes(dest, content)
+            if suffix in (".md", ".txt"):   # a document (e.g. a datasheet converted to Markdown): quotable like a PDF
+                store.add(f"user://upload/{dest}", f"Document: {clean_name}", content.decode("utf-8", errors="replace"), kind="pdf")
             uploaded_records.append({
                 "name": clean_name,
                 "path": dest,
                 "kind": "text",
                 "size": len(content),
-                "summary": f"Uploaded file {clean_name} to {dest}"
+                "summary": f"Uploaded file {clean_name} to {dest}" + (" (indexed into Sources)" if suffix in (".md", ".txt") else "")
             })
         else:
             dest = f"docs/{clean_name}"

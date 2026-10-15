@@ -30,6 +30,16 @@ def test_a_hosted_ide_asks_for_its_password(monkeypatch):
     assert client.get("/api/config", headers={"Authorization": f"Basic {right}"}).status_code == 200
 
 
+def test_an_uploaded_markdown_datasheet_becomes_a_quotable_source():
+    client = TestClient(app)
+    pid = client.post("/api/projects", json={"name": "md-datasheet"}).json()["id"]
+    text = "# BMP388\n\nThe 7-bit device address is 111011x. Connecting SDO to GND results in slave address 1110110 (0x76).\n"
+    res = client.post(f"/api/projects/{pid}/upload", files=[("files", ("bst-bmp388-ds001.md", text.encode(), "text/markdown"))])
+    assert res.status_code == 200
+    sources = client.get(f"/api/projects/{pid}").json()["sources"]
+    assert [s["url"] for s in sources if s["url"].startswith("user://upload/")] == ["user://upload/bst-bmp388-ds001.md"]
+
+
 def test_reopened_project_carries_its_last_verify_report():
     import json
     from embedforge.agent.workspace import ProjectManager
