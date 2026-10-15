@@ -97,8 +97,11 @@ python -m embedforge.verifybench          # add -v to list every planted bug and
 - **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
   runs the larger Nemotron models (Super, Ultra, 3.5 Lightning) reached verified Betaflight board configs, while
   Nano (3B active) looped in research. The model picker lists every chat model the provider offers, Nemotron first.
-- **Sampling** follows the Nemotron 3 model card (temperature 1.0, top_p 0.95); replies get up to 16k output tokens
-  for reasoning. Reasoning arrives in `reasoning_content` (or inline `<think>`) and is shown live in the IDE.
+- **Sampling and chat template** follow the Nemotron 3 model card: temperature 1.0, top_p 0.95, and
+  `chat_template_kwargs = {enable_thinking: true, force_nonempty_content: true}`, NVIDIA's setting for coding agents
+  and tool calling (`EMBEDFORGE_NEMOTRON_EFFORT=medium` adds `medium_effort` for shorter reasoning; a provider that
+  rejects the options is used without them). Replies get up to 16k output tokens; reasoning arrives in
+  `reasoning_content` (or inline `<think>`) and is shown live in the IDE.
 - **Tool calling** uses the OpenAI `tools` schema. Calls the model writes as text (Qwen-coder XML, Hermes JSON or
   bare JSON) are recovered and run; replies cut off at the token limit are retried instead of shown.
 - **Provider order:** Nebius (Nemotron) → NVIDIA API catalog (Nemotron) → Claude → Gemini, whichever is configured

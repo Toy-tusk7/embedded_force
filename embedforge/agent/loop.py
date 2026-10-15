@@ -296,7 +296,8 @@ class AgentRunner:
             history = [m for m in project.load_conversation() if not ctx.is_notice(m)]  # older saves may still hold notices
             is_first = not history
             project.trace({"event": "run_start", "model": self.llm.model, "provider": getattr(self.llm.provider, "id", ""),
-                           "sampling": getattr(self.llm, "sampling", lambda: {})(), "max_steps": config.agent_max_steps,
+                           "sampling": getattr(self.llm, "sampling", lambda: {})(),
+                           "template": getattr(self.llm, "template_kwargs", lambda: {})(), "max_steps": config.agent_max_steps,
                            "kind": project.meta().get("kind"), "harness": _harness_version()})
             req_ctx = self._requirement_context(user_message) if is_first else ""
             store.add_user_text("\n".join(self._user_statements(history, user_message)))

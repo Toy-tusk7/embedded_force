@@ -67,6 +67,9 @@ def resolve_provider(requested: Optional[str]) -> str:
     return requested if p is not None and p.configured else default_provider()
 
 
+# (base URL, model) pairs whose provider rejected Nemotron's chat_template_kwargs: later runs send none
+_NO_TEMPLATE_KWARGS: set = set()
+
 # ------------------------------------------------------------------ model catalogue
 _MODEL_CACHE: Dict[str, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
@@ -162,6 +165,19 @@ class AgentLLM:
             out["top_p"] = top_p
         return out
 
+    def template_kwargs(self) -> Dict[str, Any]:
+        """Nemotron 3 chat-template options, as NVIDIA's model card recommends for coding agents and tool calling:
+        reasoning on, and a non-empty answer after the reasoning (so a reply is never only a thought);
+        EMBEDFORGE_NEMOTRON_EFFORT=medium asks for markedly shorter reasoning."""
+        if self.provider.id not in ("nebius", "nvidia") or (self.base_url, self.model) in _NO_TEMPLATE_KWARGS:
+            return {}
+        if not re.search(r"nemotron-?3", self.model.lower()):
+            return {}
+        out: Dict[str, Any] = {"enable_thinking": True, "force_nonempty_content": True}
+        if os.getenv("EMBEDFORGE_NEMOTRON_EFFORT", "").strip().lower() == "medium":
+            out["medium_effort"] = True
+        return out
+
     def default_max_tokens(self) -> int:
         """Reasoning models spend thousands of tokens thinking before a config rewrite; give them room."""
         if getattr(self, "_max_tokens_cap", None):
@@ -191,6 +207,9 @@ class AgentLLM:
         if self.provider.id == "gemini":   # Gemini takes minimal | low | medium | high
             effort = config.anthropic_effort.lower()
             payload["reasoning_effort"] = effort if effort in ("minimal", "low", "medium") else "high"
+        template = self.template_kwargs()
+        if template:
+            payload["chat_template_kwargs"] = template
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last: Optional[str] = None
         for attempt in range(retries):
@@ -203,6 +222,11 @@ class AgentLLM:
                     continue
                 if r.status_code == 400 and "max_tokens" in r.text and payload["max_tokens"] > 8192:
                     self._max_tokens_cap = payload["max_tokens"] = 8192  # provider limit: remember it for this model
+                    continue
+                if r.status_code in (400, 422) and "chat_template_kwargs" in payload and re.search(
+                        r"chat_template|template_kwargs|force_nonempty|medium_effort|extra (inputs|fields)|unrecognized|not permitted", r.text, re.I):
+                    _NO_TEMPLATE_KWARGS.add((self.base_url, self.model))   # this provider does not take them: run without
+                    payload.pop("chat_template_kwargs")
                     continue
                 if r.status_code >= 400:
                     raise LLMError(f"LLM request failed ({self.model}): HTTP {r.status_code}: {r.text[:500]}")
