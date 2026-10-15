@@ -1192,6 +1192,7 @@ class RegisterBook:
         defined: set = set()
         missing_consts: List[str] = []
         local_consts = _quote_constants(quote)
+        uses_known = False
         for k, s in enumerate(steps[:40], start=1):
             s = str(s).strip().rstrip(";")
             s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", s)   # calib_data->t_lin = ... -> t_lin = ...
@@ -1223,8 +1224,15 @@ class RegisterBook:
             for text, value, exp in _constants(tree):
                 if not _const_in_quote(quote, value, exp):
                     missing_consts.append(text)
+            uses_known = uses_known or any(n in known for n in _names(tree))
             defined.add(var.lower())
             parsed.append([var, prep_expr(expr)])
+        if not uses_known:
+            return {"ok": False, "error": f"{name} uses no register value: a formula converts recorded layouts (or formulas "
+                                          "built on them). A single number or time (a delay, a constant) is a fact: "
+                                          "record_fact with its unit. A number the quoted code sets (temp_var = 0.00390625f;) "
+                                          "needs no formula of its own: use it in the formula that needs it, with that line "
+                                          "in its quote."}
         if parsed[-1][0].lower() != name.lower():
             parsed.append([name, parsed[-1][0]])
         foreign = self._names_not_in_quote(orig_steps, quote, inputs if isinstance(inputs, dict) else {})
@@ -1430,6 +1438,26 @@ def _close(a: float, b: float) -> bool:
     if not (math.isfinite(a) and math.isfinite(b)):
         return False
     return abs(a - b) <= 1e-5 * max(abs(a), abs(b)) + 1e-300
+
+
+def register_derived(book: RegisterBook) -> set:
+    """Ids of the formulas whose value comes from register bytes: a layout, directly or through other formulas. The rest
+    are constants (a scale factor, a delay) that only the formulas using them can check."""
+    out: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for f in book.formulas.values():
+            if f.id in out:
+                continue
+            dev = f.device.lower()
+            names = {l.name.lower() for l in book.layouts.values() if l.device.lower() == dev}
+            names |= {g.name.lower() for g in book.formulas.values() if g.id in out and g.device.lower() == dev}
+            text = " ".join(e for _, e in f.steps).lower()
+            if any(re.search(rf"\b{re.escape(n)}\b", text) for n in names):
+                out.add(f.id)
+                changed = True
+    return out
 
 
 def evaluate_formulas(book: RegisterBook, vec: Dict[int, int]) -> Dict[str, float]:
@@ -1641,6 +1669,7 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     # 5. formulas: probe runs with concrete register bytes
     if book.formulas:
         results: Dict[str, List[Optional[str]]] = {f.id: [] for f in book.formulas.values()}   # by id: names repeat across parts
+        derived = register_derived(book)
 
         def same_dev(items: Any, f: FormulaDef) -> List[Any]:
             return [x for x in items if x.device.lower() == f.device.lower()]
@@ -1685,6 +1714,12 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             res = results[f.id]
             inputs = {p.addr for l in same_dev(book.layouts.values(), f) if l.name.lower() in " ".join(e for _, e in f.steps).lower() for p in l.parts}
             deps_read = not inputs or inputs & read_regs
+            if f.id not in derived:   # a constant (temp_var = 1 / 2^8): the code may fold it into a literal anywhere
+                users = [g.name for g in same_dev(book.formulas.values(), f) if g.id != f.id and
+                         re.search(rf"\b{re.escape(f.name.lower())}\b", " ".join(e for _, e in g.steps).lower())]
+                summary["formulas"].append(f"{f.id} {f.name}: a constant, not register data"
+                                           + (f" (checked through {', '.join(users[:4])})" if users else ""))
+                continue
             if all(r for r in res if r is not None) and any(res):
                 summary["formulas"].append(f"{f.id} {f.name}: matches the code at {res[0]}")
             elif not deps_read:

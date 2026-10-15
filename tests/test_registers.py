@@ -179,6 +179,21 @@ def test_correct_driver_has_no_meaning_errors(tmp_path):
     assert any("PWR_CTRL (0x1B) <- 0x33: mode=3 (normal), temp_en=1, press_en=1" in w for w in summary["writes"]), summary["writes"]
 
 
+def test_a_constant_formula_is_not_compared_with_the_code(tmp_path):
+    from embedforge.truth.registers import FormulaDef, register_derived
+    p, store, ledger, src, f = _setup(tmp_path, driver())
+    book = RegisterBook(p.root)
+    # recorded before constants were refused (a project from an older run): the code may fold it into a literal
+    book.formulas["FRM-090"] = FormulaDef("FRM-090", "BMPX", "SCALE_T1", [["SCALE_T1", "2 ** -8"]], src.id, "2^-8")
+    book._save()
+    assert "FRM-090" not in register_derived(book) and {"FRM-001", "FRM-002", "FRM-003"} <= register_derived(book)
+    summary, codes, found = _codes(p, ledger)
+    assert codes == [], [(x.code, x.message) for x in found]
+    assert "FRM-090 SCALE_T1: a constant, not register data" in summary["formulas"]
+    res = book.record_formula(store, "BMPX", src.id, "SCALE_T2", ["SCALE_T2 = 2^30"], "PAR_T2 = NVM_PAR_T2 / 2^30")
+    assert not res["ok"] and "uses no register value" in res["error"] and "record_fact" in res["error"], res
+
+
 def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):
     p, store, ledger, src, f = _setup(tmp_path, driver())
     book = RegisterBook(p.root)
