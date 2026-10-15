@@ -417,6 +417,13 @@ _FUNCS: Dict[str, Callable[..., float]] = {
     "exp": math.exp, "expf": math.exp, "log": math.log, "logf": math.log, "log10": math.log10, "abs": abs, "fabs": abs,
     "fabsf": abs, "ldexp": lambda x, e: math.ldexp(float(x), int(e)),
 }
+_POW_HELPER = re.compile(r"pow\w*|\w+_pow\w*", re.I)   # a vendor's own power helper: Bosch's pow_bmp3(t_lin, 2)
+
+
+def _func(name: str) -> Optional[Callable[..., float]]:
+    n = name.lower()
+    return _FUNCS.get(n) or (_FUNCS["pow"] if _POW_HELPER.fullmatch(n) else None)
+
 _CAST_RE = re.compile(r"\(\s*(?:const\s+)?(?:float|double|u?int(?:8|16|32|64)_t|int|long|unsigned(?:\s+int|\s+long)?|signed)\s*\)")
 
 
@@ -438,7 +445,7 @@ def _parse(expr: str) -> ast.AST:
         ok = isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Name, ast.Load, ast.Call, ast.Add, ast.Sub, ast.Mult,
                                ast.Div, ast.FloorDiv, ast.Pow, ast.USub, ast.UAdd, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.Mod))
         ok = ok or (isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool))
-        if isinstance(node, ast.Call) and not (isinstance(node.func, ast.Name) and node.func.id.lower() in _FUNCS and not node.keywords):
+        if isinstance(node, ast.Call) and not (isinstance(node.func, ast.Name) and _func(node.func.id) and not node.keywords):
             ok = False
         if not ok:
             raise ValueError(f"unsupported syntax '{ast.unparse(node) if hasattr(ast, 'unparse') else type(node).__name__}' "
@@ -670,7 +677,7 @@ def eval_expr(tree: ast.AST, env: Dict[str, float]) -> float:
             v = ev(n.operand)
             return -v if isinstance(n.op, ast.USub) else v
         if isinstance(n, ast.Call):
-            return _FUNCS[n.func.id.lower()](*[ev(a) for a in n.args])
+            return _func(n.func.id)(*[ev(a) for a in n.args])
         a, b = ev(n.left), ev(n.right)
         op = n.op
         if isinstance(op, ast.Add):

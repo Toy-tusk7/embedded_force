@@ -381,6 +381,26 @@ def test_a_constant_the_quoted_code_sets_needs_no_step_of_its_own(tmp_path):
     assert "Names in this quote: temp_var, reg_calib_data->par_t1, reg_data, quantized_calib_data->par_t1." in res["error"], res
 
 
+def test_a_vendor_power_helper_is_pow(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
+    code = store.add("https://github.com/boschsensortec/BMP3_SensorAPI/blob/master/bmp3.c", "bmp3.c",
+                     "    partial_data1 = quantized_calib_data->par_t2 * quantized_calib_data->t_lin;\n"
+                     "    partial_data2 = quantized_calib_data->par_t1 * pow_bmp3(quantized_calib_data->t_lin, 2);\n"
+                     "    partial_out1 = partial_data1 + partial_data2;\n")
+    quote = code.text.strip()
+    fq = "Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T2 = NVM_PAR_T2 / 2^30"
+    for name in ("PAR_T1", "PAR_T2"):
+        assert book.record_formula(store, "BMPX", src.id, name, [f"{name} = NVM_{name} / 2^{'-8' if name == 'PAR_T1' else '30'}"], fq)["ok"]
+    inputs = {"quantized_calib_data->par_t1": "PAR_T1", "quantized_calib_data->par_t2": "PAR_T2", "quantized_calib_data->t_lin": "UT"}
+    as_written = [s.strip() for s in quote.split(";") if s.strip()]
+    assert book.record_formula(store, "BMPX", code.id, "OUT1", as_written, quote, inputs=inputs)["ok"]
+    squared = ["partial_data1 = par_t2 * t_lin", "partial_data2 = par_t1 * t_lin ** 2", "partial_out1 = partial_data1 + partial_data2"]
+    assert book.record_formula(store, "BMPX", code.id, "OUT1B", squared, quote, inputs=inputs)["ok"]
+    cubed = ["partial_data1 = par_t2 * t_lin", "partial_data2 = par_t1 * t_lin ** 3", "partial_out1 = partial_data1 + partial_data2"]
+    assert "does not compute what the quote states" in book.record_formula(store, "BMPX", code.id, "OUT1C", cubed, quote, inputs=inputs)["error"]
+
+
 def test_formula_must_compute_what_the_quote_states(tmp_path):
     p, store, ledger, src, book = _book(tmp_path)
     assert book.record_layouts(store, "BMPX", src.id, LAYOUTS)["ok"]
