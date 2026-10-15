@@ -113,7 +113,7 @@ class Project:
                 continue
             rel = p.relative_to(self.root)
             if rel.parts[0] in HIDDEN_DIRS or rel.name in ("project.json", "conversation.json", "trace.jsonl", "ledger.json",
-                                                           "board.json", "user_messages.jsonl"):
+                                                           "board.json", "user_messages.jsonl", "verify_report.json"):
                 continue
             suffix = p.suffix.lower()
             kind = ("image" if suffix in IMAGE_EXTS else "pdf" if suffix in DOC_EXTS

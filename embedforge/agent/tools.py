@@ -10,7 +10,7 @@ from embedforge.agent.events import RunSession
 from embedforge.agent.workspace import Project
 from embedforge.toolchain import betaflight, pio, wsl
 from embedforge.truth import FactLedger, SourceStore, verify_project
-from embedforge.truth.verifier import collect_build_inputs, collect_sources
+from embedforge.truth.verifier import build_inputs_hash, collect_sources
 
 
 def _fn(name: str, desc: str, props: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
@@ -410,12 +410,7 @@ class ToolBelt:
 
     def source_hash(self) -> str:
         """Hash of every build input (sources, linker/CMake/make files, platformio.ini)."""
-        h = hashlib.sha256()
-        for p in collect_build_inputs(self.project.root):
-            if p.exists():
-                h.update(str(p.relative_to(self.project.root)).replace("\\", "/").encode())
-                h.update(p.read_bytes())
-        return h.hexdigest()
+        return build_inputs_hash(self.project.root)
 
     def verify_inputs_hash(self) -> str:
         """Build inputs plus what verify judges them against (facts, sequences, schematic): a new fact or a re-imported
@@ -1355,6 +1350,10 @@ class ToolBelt:
                 self.session.emit("build_manifest", manifest=mf)
         pub = rep.public()
         self.session.emit("verify", report=pub, summary=rep.summary())
+        import json
+        # the whole report, so the IDE shows the evidence (findings, traceability, sequences) when the project is reopened
+        (self.project.root / "verify_report.json").write_text(
+            json.dumps({"hash": h, "summary": rep.summary(), "report": pub}, default=str), encoding="utf-8")
         prev_inputs = (meta.get("last_verify") or {}).get("inputs")
         findings = self._compact_findings(pub["findings"])
         flows = [{"sequence": f["sequence"], "subject": f["subject"], "name": f["name"], "entry": f["entry"],

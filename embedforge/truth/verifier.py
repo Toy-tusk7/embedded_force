@@ -142,6 +142,18 @@ def collect_build_inputs(project_dir: Path) -> List[Path]:
     return sorted(set(files))
 
 
+def build_inputs_hash(project_dir: Path) -> str:
+    """Hash of every build input: equal hashes mean a build or verify result still describes the current sources."""
+    import hashlib
+    project_dir = Path(project_dir)
+    h = hashlib.sha256()
+    for p in collect_build_inputs(project_dir):
+        if p.exists():
+            h.update(str(p.relative_to(project_dir)).replace("\\", "/").encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
 def collect_sources(project_dir: Path) -> List[Path]:
     files: List[Path] = []
     for d in SRC_DIRS:

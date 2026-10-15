@@ -413,6 +413,12 @@ svg.ic { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none
 .problem:hover { border-color: var(--border-strong); background: var(--surface-2); }
 .problem .loc { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
 .problem .fix { margin-top: 4px; font-size: 12.5px; color: var(--text-2); }
+.flow { margin: 0 16px 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.flow-head { margin-bottom: 6px; font-size: 13px; }
+.flow-step { display: flex; align-items: baseline; gap: 8px; margin: 0 16px 4px; font-size: 12.5px; color: var(--text-2); }
+.flow .flow-step { margin: 0 0 4px; }
+.flow-step code { font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; word-break: break-word; }
+.flow-step .loc, .flow-head .loc { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text-3); }
 .trace-table { margin: 0 16px 18px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: auto; }
 .trace-table table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .trace-table th, .trace-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }

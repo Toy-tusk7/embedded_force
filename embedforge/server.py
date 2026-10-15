@@ -251,7 +251,21 @@ def get_project(project_id: str):
         "walkthrough": walk.read_text(encoding="utf-8") if walk.exists() else "",
         "chat": chat,
         "active_run": active,
+        "verify": _last_verify(p.root),
     }
+
+
+def _last_verify(root: Path) -> Optional[Dict[str, Any]]:
+    """The last verify report of a project, and whether it still describes the current sources."""
+    from embedforge.truth.verifier import build_inputs_hash
+    vr = root / "verify_report.json"
+    if not vr.exists():
+        return None
+    try:
+        v = json.loads(vr.read_text(encoding="utf-8"))
+        return {**v["report"], "summary": v.get("summary", ""), "current": v.get("hash") == build_inputs_hash(root)}
+    except (ValueError, KeyError, OSError):
+        return None
 
 
 @app.get("/api/projects/{project_id}/file")

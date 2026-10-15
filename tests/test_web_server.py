@@ -17,6 +17,25 @@ def test_web_server_config():
     assert "nebius_model" in data
     assert "langsmith_active" in data
 
+def test_reopened_project_carries_its_last_verify_report():
+    import json
+    from embedforge.agent.workspace import ProjectManager
+    from embedforge.truth.verifier import build_inputs_hash
+    client = TestClient(app)
+    pid = client.post("/api/projects", json={"name": "verified"}).json()["id"]
+    assert client.get(f"/api/projects/{pid}").json()["verify"] is None   # never verified
+    root = ProjectManager.open(pid).root
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    report = {"passed": True, "findings": [], "traceability": [{"constant": "ADDR", "fact_id": "FACT-001"}], "flows": []}
+    (root / "verify_report.json").write_text(json.dumps({"hash": build_inputs_hash(root), "summary": "PASS", "report": report}),
+                                             encoding="utf-8")
+    v = client.get(f"/api/projects/{pid}").json()["verify"]
+    assert v["passed"] and v["current"] and v["traceability"][0]["fact_id"] == "FACT-001"
+    (root / "src" / "main.c").write_text("int main(void) { return 1; }\n", encoding="utf-8")   # sources changed since
+    assert client.get(f"/api/projects/{pid}").json()["verify"]["current"] is False
+
+
 def test_upload_image_schematic_and_zip():
     import io
     import zipfile

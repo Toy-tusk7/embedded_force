@@ -100,10 +100,11 @@
     OFFICIAL_MANUFACTURER: ['good', 'Manufacturer'], OFFICIAL_REPO: ['good', 'Official repo'],
     USER: ['accent', 'From you'], UNOFFICIAL: ['warn', 'Unofficial'],
   };
-  const tierPill = (t) => { const [c, l] = TIER[t] || ['neutral', t || '?']; return `<span class="pill ${c}">${esc(l)}</span>`; };
+  const fromBoard = (url) => String(url || '').startsWith('user://board');   // pins quoted from the imported schematic
+  const tierPill = (t, url) => { const [c, l] = fromBoard(url) ? ['accent', 'From schematic'] : TIER[t] || ['neutral', t || '?']; return `<span class="pill ${c}">${esc(l)}</span>`; };
   const srcLink = (url) => (String(url).startsWith('http')
     ? `<a href="${esc(url)}" target="_blank" rel="noopener" title="${esc(url)}">${esc(url.replace(/^https?:\/\/(www\.)?/, ''))}</a>`
-    : `<span>${String(url).startsWith('user://upload') ? 'your upload' : 'stated by you'}</span>`);
+    : `<span>${fromBoard(url) ? 'imported schematic' : String(url).startsWith('user://upload') ? 'your upload' : 'stated by you'}</span>`);
   const emptyState = (icon, title, text) => `<div class="empty-state">${ico(icon)}<div><b>${esc(title)}</b></div><div>${esc(text)}</div></div>`;
 
   // ------------------------------------------------------------------ markdown (safe subset)
@@ -173,7 +174,7 @@
     { id: 'facts', label: 'Facts', icon: 'shield', hint: 'Verbatim-quoted values' },
     { id: 'code', label: 'Code', icon: 'code', hint: 'Firmware sources' },
     { id: 'build', label: 'Build', icon: 'chip', hint: 'Real cross-compile' },
-    { id: 'verify', label: 'Verify', icon: 'check', hint: 'Constants vs datasheet' },
+    { id: 'verify', label: 'Verify', icon: 'check', hint: 'Code vs datasheet' },
     { id: 'deliver', label: 'Deliver', icon: 'download', hint: 'Flashable .hex' },
   ];
   const TOOL_STAGE = {
@@ -313,7 +314,7 @@
     chat().innerHTML = `<div class="welcome">
       <div class="welcome-mark">${ico('bolt')}</div>
       <h1>What are you building?</h1>
-      <p>Name your MCU, peripherals and wiring. The agent quotes official datasheets for every hardware value, compiles with the real vendor toolchain and verifies each constant before handing you a <b>.hex</b>.</p>
+      <p>Name your MCU, peripherals and wiring. The agent quotes official datasheets for every hardware value, compiles with the real vendor toolchain, and checks the code against the datasheet (constants, register fields, byte order, formulas, init order and timing) before handing you a <b>.hex</b>. No board or simulator needed.</p>
       <div class="flow">${STAGES.slice(1, 8).map((s) => `<span>${ico(s.icon)}${s.label}</span>`).join('')}</div>
       <div class="examples">${EXAMPLES.map(([t, sub, p], i) => `<button class="example" data-ex="${i}"><b>${esc(t)}</b><span>${esc(sub)}</span></button>`).join('')}</div>
       <button class="btn ghost sm welcome-eda" data-eda-open>${ico('board')}Have a schematic? Import it from EasyEDA first</button>
@@ -463,7 +464,7 @@
     const facts = Object.values(S.ledger);
     setCount('#cnt-facts', facts.length);
     $('#facts').innerHTML = facts.length ? facts.map((f) => `<div class="fact" id="fact-${esc(f.id)}">
-        <div class="fact-head"><span class="fact-id">${esc(f.id)}</span>${tierPill(f.tier)}${f.confidence === 'LOOSE' ? '<span class="pill warn">loose match</span>' : ''}<span class="fact-val">${esc(f.value)}${f.unit ? ' ' + esc(f.unit) : ''}</span></div>
+        <div class="fact-head"><span class="fact-id">${esc(f.id)}</span>${tierPill(f.tier, f.source_url)}${f.confidence === 'LOOSE' ? '<span class="pill warn">loose match</span>' : ''}<span class="fact-val">${esc(f.value)}${f.unit ? ' ' + esc(f.unit) : ''}</span></div>
         <div class="fact-prop">${esc(f.property)} <small>· ${esc(f.subject)}</small></div>
         <div class="fact-quote">“${esc(f.quote)}”</div>
         <div class="fact-src">${srcLink(f.source_url)}</div></div>`).join('')
@@ -498,15 +499,35 @@
     $('#builds').innerHTML = S.builds.length ? [...S.builds].reverse().map(buildCard).join('')
       : emptyState('chip', 'No builds yet', 'Every successful compile is versioned here with its .hex, .bin and .elf.');
   }
+  // a verify report (live event or the last one saved with the project) -> the Checks tab's state
+  function setVerify(report, stale) {
+    S.problems.verify = (report.findings || []).map((f) => ({ ...f }));
+    S.trace = report.traceability || [];
+    S.verify = { passed: report.passed, summary: report.summary || '', stale, flows: report.flows || [], registers: report.registers || {} };
+  }
+  function verifyEvidence() {   // the datasheet sequences as traced in the code, and what the register writes mean
+    const v = S.verify;
+    if (!v) return '';
+    const stPill = (s) => `<span class="pill ${s === 'matched' ? 'good' : /missing|order|value|delay_short/.test(s) ? 'bad' : 'warn'}">${esc(s)}</span>`;
+    const flows = (v.flows || []).map((f) => `<div class="flow"><div class="flow-head"><b>${esc(f.subject)}.${esc(f.name)}</b> <span class="loc">in ${esc(f.entry)}()</span></div>
+        ${(f.steps || []).map((s) => `<div class="flow-step">${stPill(s.status)}<span>${s.step}. ${esc(s.detail || s.op)}</span>${s.line ? `<span class="loc">${esc(s.file || '')}:${s.line}</span>` : ''}</div>`).join('')}</div>`).join('');
+    const regs = v.registers || {};
+    const writes = (regs.writes || []).slice(0, 24).map((w) => `<div class="flow-step"><code>${esc(w)}</code></div>`).join('');
+    const formulas = (regs.formulas || []).slice(0, 24).map((w) => `<div class="flow-step"><code>${esc(w)}</code></div>`).join('');
+    return (flows ? `<div class="section-title">Datasheet sequences, traced in the code</div>${flows}` : '')
+      + (writes ? `<div class="section-title">Register writes, decoded from the register map</div>${writes}` : '')
+      + (formulas ? `<div class="section-title">Formulas, run on probe register bytes</div>${formulas}` : '');
+  }
   function renderChecks() {
     const all = [...S.problems.build.map((p) => ({ ...p, src: 'compiler' })), ...S.problems.verify.map((p) => ({ ...p, src: 'verifier' }))];
     const errs = all.filter((p) => /error/i.test(p.severity)).length;
     setCount('#cnt-checks', errs || (S.verify && S.verify.passed ? '✓' : ''), errs ? 'bad' : 'good');
     let summary = '<div class="checks-summary neutral">' + ico('info') + '<div><b>No checks yet</b><span>Compiler diagnostics and datasheet verification results appear here.</span></div></div>';
     if (S.verify) {
+      const note = esc(S.verify.summary) + (S.verify.stale ? ' · the sources changed since this check: verify again' : '');
       summary = S.verify.passed
-        ? `<div class="checks-summary good">${ico('shield')}<div><b>Verified against the datasheet</b><span>${esc(S.verify.summary)}</span></div></div>`
-        : `<div class="checks-summary bad">${ico('alert')}<div><b>Verification failed</b><span>${esc(S.verify.summary)}</span></div></div>`;
+        ? `<div class="checks-summary ${S.verify.stale ? 'neutral' : 'good'}">${ico('shield')}<div><b>Verified against the datasheet</b><span>${note}</span></div></div>`
+        : `<div class="checks-summary bad">${ico('alert')}<div><b>Verification failed</b><span>${note}</span></div></div>`;
     } else if (S.problems.build.some((p) => /error/i.test(p.severity))) {
       summary = `<div class="checks-summary bad">${ico('alert')}<div><b>Build failed</b><span>${errs} compiler error(s)</span></div></div>`;
     }
@@ -515,9 +536,9 @@
         <span class="pill ${sev(p.severity)}">${esc(String(p.severity).toUpperCase())}</span>
         <div><div>${esc(p.message)}</div><div class="loc">${esc(p.file || '')}${p.line ? ':' + p.line : ''} · ${p.src}${p.code ? ' · ' + esc(p.code) : ''}</div>${p.suggestion ? `<div class="fix">→ ${esc(p.suggestion)}</div>` : ''}</div></div>`).join('')}` : '';
     const trace = S.trace.length ? `<div class="section-title">Traceability (${S.trace.length})</div><div class="trace-table"><table><thead><tr><th>Constant</th><th>Where</th><th>Fact</th><th>Datasheet quote</th></tr></thead><tbody>${S.trace.map((r) => `<tr>
-        <td><code>${esc(r.constant)}</code><br><code>${esc(r.literal)}</code></td><td>${esc(r.file)}:${r.line}</td><td><b>${esc(r.fact_id)}</b><br>${tierPill(r.tier)}</td>
+        <td><code>${esc(r.constant)}</code><br><code>${esc(r.literal)}</code></td><td>${esc(r.file)}:${r.line}</td><td><b>${esc(r.fact_id)}</b><br>${tierPill(r.tier, r.source_url)}</td>
         <td class="q">“${esc(r.quote)}”<br>${srcLink(r.source_url)}</td></tr>`).join('')}</tbody></table></div>` : '';
-    $('#checks').innerHTML = summary + problems + trace;
+    $('#checks').innerHTML = summary + problems + verifyEvidence() + trace;
     $$('#checks .problem').forEach((el) => el.onclick = () => { const f = el.dataset.file; if (f && f in S.files) openFile(f); });
     if (S.active) renderViewer();
   }
@@ -771,9 +792,7 @@
       }
       case 'build_manifest': upsertBuild(e.manifest); break;
       case 'verify':
-        S.problems.verify = (e.report.findings || []).map((f) => ({ ...f }));
-        S.trace = e.report.traceability || [];
-        S.verify = { passed: e.report.passed, summary: e.summary };
+        setVerify({ ...e.report, summary: e.summary }, false);
         renderChecks();
         setStage('verify', e.report.passed ? 'done' : 'fail', e.report.passed ? `passed · ${S.trace.length} traced` : `${S.problems.verify.filter((p) => p.severity === 'ERROR').length} finding(s)`);
         showTab('checks');
@@ -945,6 +964,7 @@
     S.ledger = Object.fromEntries(d.ledger.map((f) => [f.id, f]));
     S.sources = d.sources;
     S.builds = d.builds;
+    if (d.verify) setVerify(d.verify, !d.verify.current);
     await syncFiles(d.files);
     chat().innerHTML = '';
     if (d.chat.length) d.chat.forEach((m) => addMsg(m.role, m.text)); else renderWelcome();
@@ -1172,7 +1192,7 @@
       if (!t) return;
       const f = S.ledger[t.dataset.fact];
       const p = $('#popover');
-      p.innerHTML = f ? `<div class="fact-head"><span class="fact-id">${esc(f.id)}</span>${tierPill(f.tier)}<span class="fact-val">${esc(f.value)}</span></div><div class="fact-prop">${esc(f.property)} <small>· ${esc(f.subject)}</small></div><div class="fact-quote">“${esc(f.quote)}”</div><div class="fact-src">${srcLink(f.source_url)}</div>`
+      p.innerHTML = f ? `<div class="fact-head"><span class="fact-id">${esc(f.id)}</span>${tierPill(f.tier, f.source_url)}<span class="fact-val">${esc(f.value)}</span></div><div class="fact-prop">${esc(f.property)} <small>· ${esc(f.subject)}</small></div><div class="fact-quote">“${esc(f.quote)}”</div><div class="fact-src">${srcLink(f.source_url)}</div>`
         : `<b style="color:var(--bad)">${esc(t.dataset.fact)} is not in the ledger</b>`;
       const r = t.getBoundingClientRect();
       p.style.left = Math.max(12, Math.min(r.left, innerWidth - 440)) + 'px';
@@ -1189,7 +1209,8 @@
     loadProjects().then(async (list) => {
       let saved = null;
       try { saved = localStorage.getItem('ef_project'); } catch (_) {}
-      const found = list.find((p) => p.id === saved);
+      // the project open last time, else the most recent one: opening the IDE never creates an empty project
+      const found = list.find((p) => p.id === saved) || list[0];
       if (found) await selectProject(found.id); else await newProject();
     }).catch((e) => toast(e.message, true));
     setInterval(loadStatus, 60000);
