@@ -2,243 +2,210 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
-[![Powered by](https://img.shields.io/badge/Nebius_Token_Factory-NVIDIA_Nemotron_3_Nano-76B900.svg)](https://studio.nebius.ai/)
-[![Search Engine](https://img.shields.io/badge/Search-Tavily_AI-orange.svg)](https://tavily.com/)
+[![Model](https://img.shields.io/badge/NVIDIA_Nemotron_3_Ultra-Nebius_Token_Factory-76B900.svg)](https://tokenfactory.nebius.com/)
+[![Search](https://img.shields.io/badge/Research-Tavily-orange.svg)](https://tavily.com/)
 
-> **EmbedForge** is an autonomous, evidence-driven AI embedded engineering system. It transforms human embedded-system requirements into verified, buildable firmware through bounded technical research, human-in-the-loop truth promotion, deterministic behavior extraction, rule-based verification, and autonomous repair loops.
+**EmbedForge turns a component's datasheet into a checked specification, has an AI agent write the driver, and
+catches datasheet-level bugs in that driver before any board or simulator exists.**
+
+An NVIDIA Nemotron agent researches the datasheet (with Tavily), records what it needs as facts that must be quoted
+word for word from the source, writes the firmware and compiles it with the real vendor toolchain. Then `verify`
+reads the C code without running it, works out exactly what it would send to the chip, and compares that with the
+recorded datasheet facts. Any difference is an error with a file and line, and goes back to the agent to fix.
 
 ---
 
-## 1. System Architecture
+## Why
 
-Unlike simple prompt-to-code chatbots, EmbedForge operates as an **autonomous closed-loop engineering pipeline**:
+Driver bugs that come from misreading a datasheet — the wrong byte order of a calibration value, a reserved bit
+set in a config register, a reset delay that is too short, a measurement enabled before the chip is configured —
+compile cleanly and usually surface on the bench, with a logic analyser, days later. AI coding agents make exactly
+these mistakes, and confidently. Other agents for firmware check their output by flashing a board or running a
+circuit simulator. EmbedForge checks it against the datasheet itself, statically, so these bugs are caught at the
+desk.
+
+## How it works
 
 ```mermaid
-flowchart TD
-    subgraph Human_Boundary["Human Authority & Physical Boundary"]
-        REQ_IN["Natural Language Requirement"]
-        GATE["Human Approval Gateway (Resource Gate)"]
-        HIL["Human Hardware Flash & Physical Test"]
-    end
-
-    subgraph Nebius_Token_Factory["Nebius AI Cloud / Token Factory"]
-        NEMO["NVIDIA Nemotron-3-Nano-30B-A3B\n(Reasoning, Architecture & Patch Synthesis)"]
-    end
-
-    subgraph EmbedForge_Engine["EmbedForge Execution & Policy Plane"]
-        PARSER["Requirement Engine (Zero-Invention Contract)"]
-        GAP["Gap Detector (Missing Addresses/Timings)"]
-        PLAN_R["Research Planner & Query Generator"]
-        TAVILY["Tavily Search & Extract (Datasheet Discovery)"]
-        KB["Knowledge Engine (Provenance Store & Conflicts)"]
-        PLAN_ENG["Engineering Planner & HAL Boundary"]
-        GEN["Firmware Generator (C Headers & Drivers)"]
-        BUILD["Deterministic Build Engine (GCC Compiler)"]
-        ANALYZE["Static Behavior Analyzer (AST / Register Maps)"]
-        VERIFY["Verification Engine (Deterministic Rules)"]
-        EVIDENCE["Evidence & Lineage Engine"]
-        REPAIR["Autonomous Repair Engine"]
-    end
-
-    REQ_IN --> PARSER
-    PARSER --> GAP
-    GAP --> PLAN_R
-    PLAN_R --> TAVILY
-    TAVILY --> GATE
-    GATE --> KB
-    KB --> PLAN_ENG
-    NEMO <--> PLAN_ENG
-    PLAN_ENG --> GEN
-    GEN --> BUILD
-    BUILD --> ANALYZE
-    ANALYZE --> VERIFY
-    VERIFY -->|PROVEN_MISMATCH| EVIDENCE
-    EVIDENCE --> REPAIR
-    NEMO <--> REPAIR
-    REPAIR -->|Patch Applied| BUILD
-    VERIFY -->|PASS| HIL
+flowchart LR
+    U["Request + schematic<br/>(EasyEDA / KiCad)"] --> A["Agent loop<br/>NVIDIA Nemotron 3 Ultra<br/>on Nebius Token Factory"]
+    A -->|web_search / fetch_document| T["Tavily search & extract<br/>manufacturer domains first"]
+    T --> S["Source store<br/>(text + trust tier)"]
+    A -->|record_fact / record_registers /<br/>record_layouts / record_formula / record_sequence| G{"Quote gates:<br/>verbatim in the source?<br/>value and unit in the quote?"}
+    S --> G
+    G -->|accepted| L["The truth<br/>facts, register map, byte layouts,<br/>formulas, init sequences"]
+    A -->|write_file / build| B["PlatformIO / Betaflight build<br/>real vendor toolchain"]
+    B --> V["verify<br/>static trace of the C code<br/>vs. the truth"]
+    L --> V
+    V -->|ERRORs with file:line| A
+    V -->|PASS| D["Deliver: .hex + walkthrough<br/>(every constant traced to a quote)"]
 ```
 
----
+1. **Research.** `web_search` runs a Tavily search (manufacturer domains preferred, full page text kept);
+   `fetch_document` downloads datasheets and converts PDFs to Markdown (tables and equations kept), with Tavily
+   Extract as the fallback. Sources get a trust tier: manufacturer domains and official GitHub organisations are
+   authoritative; forums and mirrors are recorded but flagged.
+2. **The truth layer.** Every fact the firmware relies on is recorded with a quote. A fact is accepted only if the
+   quote appears verbatim in the stored source (ignoring layout, case and quote marks, on word boundaries), the value
+   appears inside the quoted text, and its unit matches the one the source states. Register maps (fields and named
+   values), byte layouts, burst-read rules, conversion formulas and datasheet init sequences are recorded the same
+   way. Pins come from the imported schematic, quoting its connectivity lines.
+3. **Build.** The agent writes the firmware and builds it with PlatformIO (or Betaflight's own build in WSL).
+4. **Verify.** A static tracer (`embedforge/truth/flow.py`) walks the code from its entry points — pico-sdk, Arduino
+   Wire/SPI, STM32 HAL, ESP-IDF (new and legacy drivers) and Zephyr bus calls; macros, structs, register tables,
+   pointers, FreeRTOS tasks and delays — and records the bus traffic: `write 0x7E <- 0xB6`, `delay 2000 us`,
+   `read 0x31 x21`. `verify` compares that trace with the truth:
 
-## 2. Core Non-Negotiable Principles
+| Compared | Bug it catches | Error code |
+|---|---|---|
+| Constants vs. facts | A made-up or untagged address, register or chip ID | `UNSOURCED_CONSTANT`, `FACT_VALUE_MISMATCH` |
+| Register writes vs. register map | A register the map does not have; a reserved bit set | `REG_UNMAPPED`, `REG_RESERVED_BITS` |
+| Event order vs. init sequence | Measurement enabled before configuration; a missing reset | `FLOW_ORDER`, `FLOW_STEP_MISSING` |
+| Written values vs. sequence | Forced mode written where normal mode is required | `FLOW_VALUE_MISMATCH` |
+| Waits vs. required time | `vTaskDelay(pdMS_TO_TICKS(2))` at 100 Hz waits 0 ticks | `FLOW_DELAY_SHORT` |
+| Byte assembly vs. layout | MSB and LSB swapped | `LAYOUT_SHIFT` |
+| Burst reads vs. datasheet | Data registers read in two transactions | `REG_BURST_SPLIT` |
+| Code math vs. formula (run on probe register bytes) | 2^30 mistyped, exponent sign flipped, wrong signedness | `FORMULA_MISMATCH`, `FORMULA_MISSING` |
+| Code it cannot follow | A bus call the tracer does not model | `FLOW_OPAQUE_BUS` |
 
-1. **Human Authority**: The human engineer decides which external resources become trusted engineering knowledge.
-2. **Zero Invention Contract**: The Requirement Engine never invents MCU models, I2C addresses, sampling frequencies, register offsets, pin mappings, or voltages. If missing, they are flagged as `InformationGap` items.
-3. **Deterministic Verification**: LLMs provide reasoning, while deterministic parsers and AST extractors extract actual code behavior and verify against approved facts.
-4. **Complete Traceability**: Every finding, claim, and patch has an end-to-end lineage trail (`REQ-xxx` $\rightarrow$ `RES-xxx` $\rightarrow$ `KNOW-xxx` $\rightarrow$ `PLAN-xxx` $\rightarrow$ `FW-xxx` $\rightarrow$ `BUILD-xxx` $\rightarrow$ `BEHAV-xxx` $\rightarrow$ `FIND-xxx` $\rightarrow$ `CASE-xxx` $\rightarrow$ `PATCH-xxx`).
-5. **Physical Hardware Boundary**: Physical flashing and testing remain under human control.
+Code that verify cannot check fails; it never passes silently. The IDE shows the evidence: every constant traced
+to its fact and quote, each datasheet sequence step by step, and each register write decoded into its fields.
 
----
+## Does verify work? The benchmark
 
-## 3. Technology Stack & Integrations
+`embedforge/verifybench` checks the checker, with no LLM involved. It uses a fictional barometer, the DM388 (a
+datasheet written for the benchmark, so the right answer is known exactly), records its truth through the same
+gates the agent uses, and verifies a correct driver written for 9 frameworks and in 21 C styles, plus the same
+drivers with one planted bug each:
 
-### A. Nebius Token Factory & NVIDIA Nemotron
-- **Model**: `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`
-- **Endpoint**: `https://api.studio.nebius.ai/v1`
-- **Role**: High-reasoning cognitive brain for:
-  - Engineering architecture planning and HAL interface partitioning.
-  - Root-cause reasoning over verification evidence cases.
-  - Minimal patch synthesis.
+| Measure | Result |
+|---|---|
+| Correct drivers passing | 30 of 30 |
+| Planted bugs caught (one per run) | 615 of 615 |
+| Code verify cannot check, blocked instead of passed | 6 of 6 |
 
-### B. Tavily Search & Extract Integration
-- **Role**: Automated, bounded discovery of official datasheets, register maps, and silicon errata.
-- **Features**:
-  - Domain-scoped searches prioritizing official semiconductor manufacturers (`st.com`, `ti.com`, `invensense.tdk.com`, `bosch-sensortec.com`, `nordicsemi.com`).
-  - Automated extraction of register addresses (`WHO_AM_I`, `PWR_MGMT_1`, `SMPLRT_DIV`), maximum bus clock speeds, and startup delays.
-  - Human review gateway ensuring no third-party snippet is promoted to the Knowledge Base without approval.
-
----
-
-## 4. Reference Repositories (Study, Don't Clone)
-
-| Repository | Focus Area | Architectural Pattern Studied |
-| :--- | :--- | :--- |
-| [NVIDIA NeMo Agent Toolkit](https://github.com/NVIDIA/NeMo-Agent-Toolkit) | Orchestration & Tools | Policy-governed tool execution sandboxing |
-| [NVIDIA Nemotron](https://github.com/NVIDIA-NeMo/Nemotron) | Reasoning Brain | Structured tool calling and reasoning recipes |
-| [Embedded AI Workspace](https://github.com/atillab1/embedded-ai-workspace) | Firmware QA & MCP | Datasheet tooling, static analysis, and HIL validation |
-| [LUXAR](https://github.com/neltharion11/luxar-embedded-agent) | Autonomous Agent Loop | Embedded lifecycle loop and human approval gates |
-| [Datasheet-to-Driver](https://github.com/livia0194/datasheet-to-driver) | Knowledge Extraction | Converting structured register tables into HAL drivers |
-| [Embedder CLI](https://github.com/embedder-dev/embedder-cli) | Build & Debug Agent | Deterministic log parsing and iterative compilation |
-
----
-
-## 5. Quickstart & Installation
-
-### Prerequisites
-- Python 3.10+ (tested on Python 3.14)
-- Git & Virtualenv
-
-### Installation
+With zero misses in 615 runs, the 95% upper bound on the miss rate for bugs of these kinds is about 0.5% (rule of
+three, 3/n). Run it yourself — it is offline and free:
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/embedforge.git
-cd embedforge
+python -m embedforge.verifybench          # add -v to list every planted bug and the error that caught it
+```
 
-# Create and activate virtual environment
+## NVIDIA Nemotron on Nebius Token Factory
+
+- **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
+  runs the larger Nemotron models (Super, Ultra, 3.5 Lightning) reached verified Betaflight board configs, while
+  Nano (3B active) looped in research. The model picker lists every chat model the provider offers, Nemotron first.
+- **Sampling** follows the Nemotron 3 model card (temperature 1.0, top_p 0.95); replies get up to 16k output tokens
+  for reasoning. Reasoning arrives in `reasoning_content` (or inline `<think>`) and is shown live in the IDE.
+- **Tool calling** uses the OpenAI `tools` schema. Calls the model writes as text (Qwen-coder XML, Hermes JSON or
+  bare JSON) are recovered and run; replies cut off at the token limit are retried instead of shown.
+- **Provider order:** Nebius (Nemotron) → NVIDIA API catalog (Nemotron) → Claude → Gemini, whichever is configured
+  first; `EMBEDFORGE_PROVIDER` forces one.
+
+## Tavily
+
+Every fact EmbedForge relies on is quoted from text Tavily found or extracted, so Tavily is the start of the evidence
+chain: search (`search_depth`, `include_domains` for manufacturer domains, `include_raw_content` so the full page is
+stored and quotable), and Extract when a direct download yields no text. Searches are cached per run, and a research
+budget stops endless searching (6 searches without a new fact or code change).
+
+## Quickstart
+
+Requirements: Python 3.10+. PlatformIO is installed as a dependency and downloads each project's toolchain on first
+use. Betaflight builds need Windows with WSL (Ubuntu).
+
+```bash
+git clone https://github.com/Toy-tusk7/embedded_force.git
+cd embedded_force
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .\.venv\Scripts\activate
-
-# Install EmbedForge in editable mode
+source .venv/bin/activate          # Windows: .\.venv\Scripts\activate
 pip install -e .
-
-# Optional: datasheet PDFs -> Markdown (headings, tables, reconstructed equations; PyMuPDF is AGPL-3.0)
-pip install -e ".[pdf]"
+pip install -e ".[pdf]"            # optional: better PDF -> Markdown (PyMuPDF, AGPL-3.0)
+cp .env.example .env               # then add NEBIUS_API_KEY and TAVILY_API_KEY
+embedforge                         # or: python -m embedforge.server
 ```
 
-### Environment Configuration
+Open **http://localhost:8000** and describe the firmware, e.g. *"Raspberry Pi Pico (pico-sdk), BMP388 on I2C0
+(SDA GP4, SCL GP5, SDO to GND): read temperature and pressure every second over USB serial."*
 
-Copy `.env.example` to `.env` and fill in your keys (`.env` is git-ignored — never commit it):
+### The IDE
 
-```ini
-# Claude API (Anthropic): when set, runs use Claude instead of Nemotron
-ANTHROPIC_API_KEY=
-# Google Gemini API (Google AI Studio key): used when no Claude key is set
-GEMINI_API_KEY=
-# EMBEDFORGE_PROVIDER=anthropic   # or gemini / nebius / nvidia, to force one provider
+- **Pipeline** — Understand → Target → Research → Facts → Code → Build → Verify → Deliver, live per run, with a run
+  health panel that says where a run is stuck.
+- **Conversation** — the agent's reasoning and tool calls, grouped into readable activity blocks.
+- **Workspace** — files (FACT tags link to their quote), the fact ledger with quotes and trust tiers, sources,
+  versioned builds (`.hex` / `.bin` / `.elf`), Checks (compiler errors, verify findings, sequences, register meaning,
+  traceability) and a terminal.
 
-# Nebius AI Cloud / Token Factory
-NEBIUS_API_KEY=your_nebius_api_key_here
-NEBIUS_BASE_URL=https://api.studio.nebius.ai/v1
-NEBIUS_MODEL=nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B   # default; change per project in the UI
+### Import your schematic
 
-# Optional second provider: NVIDIA API catalog / NIM (https://build.nvidia.com)
-NVIDIA_API_KEY=
-
-# Tavily AI Search (required for live datasheet research)
-TAVILY_API_KEY=your_tavily_api_key_here
-```
-
-### Choosing the model
-
-The model picker in the top bar lists every chat model your provider(s) offer, NVIDIA Nemotron models first,
-with their size parsed from the model id (e.g. `30B · 3B active`). The choice is saved per project.
-Small active-parameter models (such as Nemotron 3 Nano, 3B active) tend to loop in research on long
-firmware tasks; larger ones (Nemotron 3 Super / Ultra) follow the research → code → build → verify loop
-more reliably.
-
----
-
-## 6. Running EmbedForge
-
-### Run Nominal Autonomous Engineering Pipeline
-```bash
-python -m embedforge.cli --prompt "Create an STM32 driver for MPU6050 accelerometer over I2C at 100Hz with 30ms startup delay." --inject-defect NONE
-```
-
-### Run Autonomous Verification & Repair Loop
-Inject a known hardware mismatch (e.g. incorrect I2C address `0x77` instead of datasheet `0x68`) to observe autonomous detection, evidence building, patching, and reverification:
-```bash
-python -m embedforge.cli --inject-defect WRONG_I2C_ADDRESS
-```
-
-### Launch Interactive Web Dashboard & Control Plane
-Run the local FastAPI dashboard:
-```bash
-python -m embedforge.server
-```
-Then navigate to **`http://localhost:8000`** in your browser:
-* **Pipeline stepper** — Understand → Target → Research → Facts → Code → Build → Verify → Deliver, live per run.
-* **Run health** — tool-call breakdown and a plain-language diagnosis of where a run stalled
-  (e.g. "Stuck in research: 9 searches but no facts recorded").
-* **Conversation** with tool calls grouped into readable activity blocks, guard warnings and ask-user cards.
-* **Workspace** — files with FACT-tag links and error-line marks, the fact ledger, sources with trust tiers,
-  versioned builds (.hex/.bin/.elf), checks (compiler + datasheet verification + traceability) and a terminal.
-* Model picker, Strict / Fast / Custom prompt modes, light & dark themes, responsive down to phone width.
-
-### Import your schematic from EasyEDA
-
-Click **EasyEDA** in the composer (or *Import EasyEDA schematic* in the left rail) and drop your exports:
+Click **EasyEDA** in the composer and drop your exports:
 
 | Editor | Best file | Optional extras |
 |---|---|---|
-| EasyEDA Pro | `File › Save As (Local)` → `.epro` (V2) or `.epro2` (V3) | `File › Export › Netlist` (Protel2 / PADS), `File › Export › Bill of Materials` (CSV) |
-| EasyEDA Standard | `File › EasyEDA File Source…` → `.json`, or right-click the project › `Download` (`.zip`) | `File › Export Netlist` (Protel/Altium / PADS), BOM CSV |
+| EasyEDA Pro | `File › Save As (Local)` → `.epro` / `.epro2` | `File › Export › Netlist`, `File › Export › Bill of Materials` (CSV) |
+| EasyEDA Standard | `File › EasyEDA File Source…` → `.json`, or the project `.zip` | `File › Export Netlist`, BOM CSV |
 
-KiCad netlists (`.net`) work too. Files are recognised by content, stored under `schematics/`, and merged into one
-board model: netlists give connectivity, the schematic source gives pin names (`PA8`…), the BOM gives part numbers.
-The **Board** tab shows the MCU pin map; the agent reads it with the `query_board` tool and records each pin it relies
-on as a Fact Ledger entry quoting the exact connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`),
-so wiring in the firmware is traceable to your schematic. The agent cannot write to `schematics/`.
+KiCad netlists (`.net`) work too. Netlists give connectivity, the schematic gives pin names, the BOM gives part
+numbers. The agent reads the board with `query_board` and records each pin it uses as a fact quoting the exact
+connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`).
 
 ### Build targets
 
 | Firmware | How it builds | Notes |
 |---|---|---|
-| Custom firmware (STM32, ESP32, AT32, RP2040, …) | PlatformIO, project-local core | Boards from the PlatformIO registry; ArteryTek AT32 platform auto-installed |
-| Custom firmware for RP2350 / RP2354 | PlatformIO + community platform [`maxgerhardt/platform-raspberrypi`](https://github.com/maxgerhardt/platform-raspberrypi) (Arduino-Pico core) | Not official PlatformIO support. RP2354A/B = RP2350A/B with 2 MB stacked flash: use an RP2350B board such as `weact_rp2350b` with `board_upload.maximum_size = 2097152` |
-| Betaflight board configs | Betaflight `2026.6.2` checkout + its own toolchain, built in **WSL** (`make CONFIG=<BOARD>`) | One-time setup in `~/.embedforge` (no sudo): Betaflight, Arm GCC 13.3.1, portable CMake, Pico SDK, picotool, official reference configs. The agent writes `betaflight/configs/CUST/<BOARD>/config.h` from the imported schematic; every pin is verified against the schematic **and** against the RP2350 peripheral pin tables. RP2354 flash size (2 MB) is set by a generated `config.mk` / `pico_flash_mem.ld` |
-| INAV | not supported here | Official INAV targets are STM32F4/F7/H7 and AT32F435; INAV 10.0 pre-releases add an experimental, bench-test-only RP2350A target. An RP2350B/RP2354B port is a separate engineering project |
+| Custom firmware (STM32, ESP32, AT32, RP2040, …) | PlatformIO, project-local core | Boards from the PlatformIO registry; ArteryTek AT32 installed automatically |
+| Custom firmware for RP2350 / RP2354 | PlatformIO + [`maxgerhardt/platform-raspberrypi`](https://github.com/maxgerhardt/platform-raspberrypi) | Community platform; RP2354A/B = RP2350A/B with 2 MB stacked flash |
+| Betaflight board configs | Betaflight `2026.6.2` + its toolchain in **WSL** (`make CONFIG=<BOARD>`) | The agent writes `config.h` from the schematic; every pin is checked against the schematic and the RP2350 pin tables |
 
-### Agent guard-rails
+### Guard-rails
 
-* **No fake targets.** MCUs are resolved against the real PlatformIO registry. Official vendor platforms that are
-  not in the default registry (currently ArteryTek AT32 → `arterytekat32` / `at32firmlib`) are installed
-  automatically from an allow-list; anything else is reported as unsupported rather than built for another chip.
-* **SDK first.** `init_project` downloads the toolchain and SDK immediately so the agent can look up real SDK
-  function names before writing code.
-* **Progress guard.** More than 6 searches (or 10 SDK lookups) without recording a fact or changing code blocks
-  further searching with a concrete next step; 14 idle steps trigger a nudge and 28 pause the run for your input.
-* **Build sandbox policy.** The agent cannot write `extra_scripts`, `platform_packages`, `!command` flags,
-  URL `lib_deps`, `*.py` or `library.json` — the ways a PlatformIO build can execute code on your machine.
+- **No fake targets.** MCUs are resolved against the real PlatformIO registry; anything else is reported as
+  unsupported rather than built for another chip.
+- **Budgets that follow progress.** 6 searches or 10 SDK lookups without a new fact or code change block further
+  searching with a concrete next step; a run gets 60 steps, extended by 30 (up to 3 times) while it is still making
+  progress, and pauses after 28 steps without progress.
+- **Build sandbox.** The agent cannot write `extra_scripts`, `platform_packages`, `!command` flags, URL `lib_deps`,
+  `*.py` or `library.json` — the ways a PlatformIO build can run code on your machine.
 
----
+## Project layout
 
-### Run Benchmark Scorecard Evaluation
+| Path | What it does |
+|---|---|
+| `embedforge/agent/` | The agent loop (`loop.py`), model providers (`llm.py`), tools (`tools.py`), context and prompts |
+| `embedforge/truth/` | Sources and PDF → Markdown, the fact ledger, register/sequence books, the static tracer (`flow.py`) and `verifier.py` |
+| `embedforge/toolchain/` | PlatformIO and Betaflight (WSL) builds, `.hex` / `.uf2` output |
+| `embedforge/eda/` | EasyEDA / KiCad schematic import |
+| `embedforge/verifybench/` | The verify benchmark (fictional DM388 datasheet, drivers, planted bugs) |
+| `embedforge/server.py`, `embedforge/web/` | FastAPI server and the browser IDE |
+| `tests/` | `pytest` (offline: models and Tavily are faked) |
+
+## Limits
+
+Verify replaces neither a first power-on test nor a logic analyser. It cannot see electrical faults (wiring,
+pull-ups, power, noise, a dead chip), bus-level timing (clock stretching, signal integrity), or chip behaviour the
+datasheet does not describe (errata). It is only as good as the recorded facts — which is why every fact must be
+quoted verbatim, and why a missing fact makes verify fail instead of guess. The static tracer follows the SDK calls
+listed above; other bus calls are reported, not trusted.
+
+## Related work
+
+Agents that write firmware and test it on a board ([Embedder](https://www.ycombinator.com/companies/embedder),
+[EmbedGenius](https://arxiv.org/abs/2412.09058)) or in a circuit simulator ([EmbedBench](https://arxiv.org/abs/2506.11003)),
+and formal tools that prove general properties from hand-written specifications (CBMC, Frama-C, Microsoft SDV).
+EmbedForge's difference: the specification is built from the datasheet by the agent, every line of it checked
+against the source text, and the code is checked against it before anything runs.
+
+## Tests
+
 ```bash
-python -m embedforge.benchmark.runner
+pip install -e ".[dev]"
+pytest                                  # offline: models and Tavily are faked
+python -m embedforge.verifybench        # the verify benchmark
 ```
 
----
+## License
 
-### Run Test Suite
-```bash
-pytest -v
-```
-
----
-
-## 7. License
-
-EmbedForge is open-source software licensed under the [Apache License 2.0](LICENSE).
+Apache License 2.0 (see [LICENSE](LICENSE)). The optional `[pdf]` extra installs PyMuPDF / pymupdf4llm, which are
+AGPL-3.0 (or commercially licensed); without it, PDFs are read with pypdf.

@@ -15,7 +15,7 @@ class EmbedForgeConfig(BaseModel):
         default_factory=lambda: os.getenv("NEBIUS_API_KEY")
     )
     nebius_base_url: str = Field(
-        default_factory=lambda: os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1")
+        default_factory=lambda: os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1")
     )
     nebius_model: str = Field(
         default_factory=lambda: os.getenv("NEBIUS_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
