@@ -35,6 +35,11 @@ def test_trust_tiers():
     assert classify_url("https://github.com/randomuser/mpu6050") == TrustTier.UNOFFICIAL
     assert classify_url("https://stackoverflow.com/q/1") == TrustTier.UNOFFICIAL
     assert classify_url("https://evil-st.com.attacker.io/x") == TrustTier.UNOFFICIAL
+    # vendor-hosted forums are users' posts, not the vendor's documentation
+    for forum in ("https://community.st.com/t5/x", "https://community.bosch-sensortec.com/t5/x", "https://e2e.ti.com/x",
+                  "https://forum.arduino.cc/t/x", "https://devzone.nordicsemi.com/f/x"):
+        assert classify_url(forum) == TrustTier.UNOFFICIAL, forum
+    assert classify_url("https://docs.arduino.cc/x") == TrustTier.OFFICIAL_MANUFACTURER
 
 
 def test_real_quote_is_accepted(env):

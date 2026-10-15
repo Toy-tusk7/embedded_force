@@ -56,6 +56,12 @@ def _matches(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+# Vendor-hosted forums (community.st.com, e2e.ti.com, forum.arduino.cc, devzone.nordicsemi.com, ez.analog.com): users'
+# posts on an official domain are not the vendor's documentation
+FORUM_LABELS = {"community", "communities", "forum", "forums", "e2e", "answers", "discuss", "discussions", "devzone",
+                "ez", "engineerzone", "support-community"}
+
+
 def classify_url(url: str) -> TrustTier:
     """Deterministically classify a source URL into a trust tier."""
     if not url:
@@ -63,6 +69,8 @@ def classify_url(url: str) -> TrustTier:
     if url.startswith("user://"):
         return TrustTier.USER
     host = _host(url)
+    if host.split(".")[0] in FORUM_LABELS or (host.startswith("www.") and host.split(".")[1] in FORUM_LABELS):
+        return TrustTier.UNOFFICIAL
     if any(_matches(host, d) for d in OFFICIAL_DOMAINS | OFFICIAL_HOST_SUFFIXES):
         return TrustTier.OFFICIAL_MANUFACTURER
     if host in ("github.com", "raw.githubusercontent.com", "www.github.com", "gitlab.com"):
