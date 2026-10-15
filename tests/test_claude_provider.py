@@ -18,12 +18,17 @@ def claude_configured(monkeypatch):
     return config
 
 
-def test_claude_replaces_nemotron_when_configured(claude_configured, monkeypatch):
-    a = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")      # a project saved with the Nemotron model
-    assert a.provider.id == "anthropic" and a.model == config.anthropic_model and a.sampling() == {}
-    monkeypatch.setattr(config, "llm_provider", "nebius")              # EMBEDFORGE_PROVIDER forces a provider
-    b = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")
-    assert b.provider.id == "nebius" and b.model.startswith("nvidia/")
+def test_nemotron_on_nebius_comes_first_and_a_saved_provider_is_kept(claude_configured, monkeypatch):
+    assert llm.default_provider() == "nebius"                          # Nemotron on Nebius even with Claude configured
+    a = AgentLLM("claude-opus-5-5", "anthropic")                       # a project that picked Claude keeps it
+    assert a.provider.id == "anthropic" and a.model == "claude-opus-5-5" and a.sampling() == {}
+    monkeypatch.setattr(config, "nebius_api_key", None)
+    monkeypatch.setattr(config, "nvidia_api_key", None)
+    b = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")      # no Nemotron access: Claude
+    assert b.provider.id == "anthropic" and b.model == config.anthropic_model
+    monkeypatch.setattr(config, "nebius_api_key", "k")
+    monkeypatch.setattr(config, "llm_provider", "anthropic")           # EMBEDFORGE_PROVIDER forces a provider
+    assert AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius").provider.id == "anthropic"
 
 
 def test_history_translation():

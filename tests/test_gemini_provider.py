@@ -22,15 +22,19 @@ def gemini_only(monkeypatch):
     monkeypatch.setattr(config, "agent_top_p", None)
 
 
-def test_gemini_replaces_nemotron_and_a_chosen_provider_is_kept(gemini_only, monkeypatch):
-    a = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")      # a project saved with the Nemotron model
+def test_provider_order_and_a_chosen_provider_is_kept(gemini_only, monkeypatch):
+    monkeypatch.setattr(config, "nebius_api_key", None)
+    monkeypatch.setattr(config, "nvidia_api_key", None)
+    a = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")      # saved Nemotron, no Nemotron access: Gemini
     assert a.provider.id == "gemini" and a.model == config.gemini_model and a.sampling() == {}
     monkeypatch.setattr(config, "anthropic_api_key", "test-key-2")
-    assert AgentLLM(None, "nebius").provider.id == "anthropic"       # Claude first when both are configured
+    assert AgentLLM(None, None).provider.id == "anthropic"             # Claude before Gemini
     b = AgentLLM("gemini-3.5-flash", "gemini")                         # ... unless the project picked Gemini
     assert b.provider.id == "gemini" and b.model == "gemini-3.5-flash"
-    monkeypatch.setattr(config, "llm_provider", "nebius")              # EMBEDFORGE_PROVIDER forces a provider
-    assert AgentLLM(None, "gemini").provider.id == "nebius"
+    monkeypatch.setattr(config, "nebius_api_key", "k")
+    assert AgentLLM(None, None).provider.id == "nebius"                # Nemotron on Nebius first when configured
+    monkeypatch.setattr(config, "llm_provider", "gemini")              # EMBEDFORGE_PROVIDER forces a provider
+    assert AgentLLM(None, "nebius").provider.id == "gemini"
 
 
 def test_request_shape_and_thought_signature_round_trip(gemini_only, monkeypatch):

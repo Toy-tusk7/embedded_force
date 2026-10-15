@@ -41,19 +41,17 @@ def providers() -> Dict[str, Provider]:
     }
 
 
-# Providers that replace Nemotron while the Token Factory is unavailable, in order of preference
-PREFERRED = ("anthropic", "gemini")
+# Provider order when nothing is forced: NVIDIA Nemotron on Nebius Token Factory first, then Nemotron from the NVIDIA
+# API catalog, then Claude, then Gemini (EMBEDFORGE_PROVIDER forces one)
+PREFERRED = ("nebius", "nvidia", "anthropic", "gemini")
 
 
 def default_provider() -> str:
-    """EMBEDFORGE_PROVIDER if set; otherwise Claude, then Gemini, when configured; then Nebius, then NVIDIA."""
+    """EMBEDFORGE_PROVIDER if set; otherwise the first configured provider in PREFERRED (Nebius when none is)."""
     if config.llm_provider in providers():
         return config.llm_provider
     ps = providers()
-    for pid in PREFERRED:
-        if ps[pid].configured:
-            return pid
-    return "nebius" if config.has_nebius or not config.has_nvidia else "nvidia"
+    return next((pid for pid in PREFERRED if ps[pid].configured), "nebius")
 
 
 def default_model(provider_id: str) -> str:
@@ -61,16 +59,11 @@ def default_model(provider_id: str) -> str:
 
 
 def resolve_provider(requested: Optional[str]) -> str:
-    """The provider a run uses: a forced EMBEDFORGE_PROVIDER wins; a project's saved choice of Claude or Gemini is kept
-    while configured; a saved Nemotron provider gives way to Claude or Gemini when either is configured."""
+    """The provider a run uses: a forced EMBEDFORGE_PROVIDER wins; a project keeps the provider it saved while that
+    provider is configured; otherwise the default."""
     if config.llm_provider in providers():
         return config.llm_provider
-    ps = providers()
-    if requested in PREFERRED and ps[requested].configured:
-        return requested
-    if any(ps[pid].configured for pid in PREFERRED):
-        return default_provider()
-    p = ps.get(requested or "")
+    p = providers().get(requested or "")
     return requested if p is not None and p.configured else default_provider()
 
 
