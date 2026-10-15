@@ -59,8 +59,8 @@ def default_provider() -> str:
 
 
 def default_model(provider_id: str) -> str:
-    return {"anthropic": config.anthropic_model, "gemini": config.gemini_model,
-            "selfhosted": config.selfhosted_model}.get(provider_id, config.agent_model)
+    return {"anthropic": config.anthropic_model, "gemini": config.gemini_model, "selfhosted": config.selfhosted_model,
+            "nvidia": config.nvidia_model}.get(provider_id, config.agent_model)
 
 
 def resolve_provider(requested: Optional[str]) -> str:
@@ -150,6 +150,8 @@ class AgentLLM:
             self.model = model if model and model.startswith("gemini") else config.gemini_model
         elif pid == "selfhosted":   # the name the server serves the model under; a model picked from its list is kept
             self.model = model if model and provider == "selfhosted" else config.selfhosted_model
+        elif pid == "nvidia":       # NVIDIA's own model ids ('nvidia/nemotron-3-super-120b-a12b'), not Nebius's spelling
+            self.model = model if model and provider == "nvidia" else config.nvidia_model
         else:
             self.model = model if model and not model.startswith(("claude-", "gemini")) else config.agent_model
         self.base_url = p.base_url
