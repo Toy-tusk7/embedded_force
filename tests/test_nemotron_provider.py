@@ -77,7 +77,7 @@ def test_a_self_hosted_nemotron_server_comes_first_and_gets_the_same_options(mon
 def test_the_nvidia_api_gets_its_own_model_id(monkeypatch):
     monkeypatch.setattr(config, "nebius_api_key", None)
     a = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")     # saved on Nebius; only the NVIDIA API is configured
-    assert (a.provider.id, a.model) == ("nvidia", config.nvidia_model) and a.model == "nvidia/nemotron-3-super-120b-a12b"
+    assert (a.provider.id, a.model) == ("nvidia", config.nvidia_model) and a.model == "nvidia/nemotron-3-ultra-550b-a55b"
     assert AgentLLM("nvidia/nemotron-3-nano-30b-a3b", "nvidia").model == "nvidia/nemotron-3-nano-30b-a3b"   # picked there
     assert a.template_kwargs()["enable_thinking"] is True and a.sampling() == {"temperature": 1.0, "top_p": 0.95}
 

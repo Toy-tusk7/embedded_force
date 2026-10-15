@@ -36,8 +36,9 @@ class EmbedForgeConfig(BaseModel):
     nvidia_base_url: str = Field(
         default_factory=lambda: os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     )
-    # the NVIDIA API names models its own way (Super's build.nvidia.com id; the IDE's model picker lists the rest)
-    nvidia_model: str = Field(default_factory=lambda: os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"))
+    # the NVIDIA API names models its own way (Ultra's id from its build.nvidia.com example; the IDE's model picker lists
+    # the rest, e.g. nvidia/nemotron-3-super-120b-a12b)
+    nvidia_model: str = Field(default_factory=lambda: os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"))
     # A self-hosted OpenAI-compatible server (vLLM / SGLang on a Nebius AI Cloud GPU VM, Ollama / llama.cpp locally):
     # used first when its base URL is set. The key is only needed if the server was started with one.
     selfhosted_base_url: str = Field(default_factory=lambda: os.getenv("SELFHOSTED_BASE_URL", "").strip())
