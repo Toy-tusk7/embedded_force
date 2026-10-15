@@ -28,10 +28,6 @@ from embedforge.agent.workspace import (
 from embedforge import eda
 from embedforge.truth import SourceStore
 from embedforge.toolchain import pio
-from embedforge.engines.debug import PhysicalDebugEngine
-from embedforge.models.debug import HumanObservation
-from embedforge.models.knowledge import KnowledgeBase
-from embedforge.benchmark import BenchmarkScorecard
 
 app = FastAPI(title="EmbedForge IDE API", version="1.0.0")
 
@@ -107,15 +103,6 @@ class SelectModelRequest(BaseModel):
 
 class EditPromptRequest(BaseModel):
     text: str
-
-
-class PhysicalDiagnoseRequest(BaseModel):
-    chip: str
-    symptom: str
-    measured_voltage: Optional[float] = None
-    logic_analyzer_notes: Optional[str] = None
-    serial_logs: Optional[str] = None
-    setup_notes: Optional[str] = None
 
 
 # ------------------------------------------------------------------ static
@@ -584,29 +571,6 @@ def cancel_run(run_id: str):
         raise HTTPException(status_code=404, detail="Run not found")
     session.cancel_requested = True
     return {"ok": True}
-
-
-# ------------------------------------------------------------------ legacy rule-based diagnostics / benchmarks
-@app.post("/api/physical/diagnose")
-def diagnose_hardware(req: PhysicalDiagnoseRequest):
-    engine = PhysicalDebugEngine()
-    obs = HumanObservation(
-        session_id="SESS-WEB-01",
-        target_chip=req.chip,
-        symptom=req.symptom,
-        measured_voltage=req.measured_voltage,
-        logic_analyzer_notes=req.logic_analyzer_notes,
-        serial_log_snippet=req.serial_logs,
-        hardware_setup_notes=req.setup_notes,
-    )
-    diag = engine.diagnose_observation(obs, firmware_files=[], kb=KnowledgeBase())
-    return diag.model_dump()
-
-
-@app.post("/api/benchmark/run")
-def run_benchmark():
-    scorecard = BenchmarkScorecard()
-    return scorecard.run_all()
 
 
 def main():

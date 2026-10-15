@@ -13,11 +13,14 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",
     "httpx>=0.25.0",
-    "requests>=2.30.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
-    "tavily-python>=0.3.0",
+    "tavily-python>=0.8",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
     "python-multipart>=0.0.9",
+    "pypdf>=4.0",
+    "platformio>=6.1",
     "anthropic>=1.12",
 ]
 
@@ -26,13 +29,18 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
-# Datasheet PDF -> Markdown (headings, tables, reconstructed equations). PyMuPDF is AGPL-3.0 (or commercial licence).
+# Datasheet PDF -> Markdown (headings, tables, reconstructed equations). PyMuPDF is AGPL-3.0 (or commercial licence);
+# without it PDFs are read with pypdf (plain text).
 pdf = [
     "pymupdf4llm>=1.28",
 ]
+# LangSmith run tracing (LANGCHAIN_TRACING_V2=true)
+tracing = [
+    "langsmith>=0.1",
+]
 
 [project.scripts]
-embedforge = "embedforge.cli:main"
+embedforge = "embedforge.server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

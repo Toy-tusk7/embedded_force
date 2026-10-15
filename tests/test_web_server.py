@@ -17,19 +17,6 @@ def test_web_server_config():
     assert "nebius_model" in data
     assert "langsmith_active" in data
 
-def test_web_server_physical_diagnose():
-    client = TestClient(app)
-    res = client.post("/api/physical/diagnose", json={
-        "chip": "MPU6050",
-        "symptom": "I2C bus hangs on start",
-        "logic_analyzer_notes": "SDA stuck low continuously with no pull-up"
-    })
-    assert res.status_code == 200
-    data = res.json()
-    assert data["classification"] == "HARDWARE_DEPENDENT"
-    assert "pull-up" in data["recommended_action"].lower()
-
-
 def test_upload_image_schematic_and_zip():
     import io
     import zipfile
