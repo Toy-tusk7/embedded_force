@@ -190,6 +190,11 @@ def test_a_constant_formula_is_not_compared_with_the_code(tmp_path):
     summary, codes, found = _codes(p, ledger)
     assert codes == [], [(x.code, x.message) for x in found]
     assert "FRM-090 SCALE_T1: a constant, not register data" in summary["formulas"]
+    # a coefficient built on the constant: the mismatch message gives the constant's value, not 'fix SCALE_T1 first'
+    book.formulas["FRM-091"] = FormulaDef("FRM-091", "BMPX", "PAR_T1S", [["PAR_T1S", "NVM_PAR_T1 * SCALE_T1"]], src.id, "x")
+    book._save()
+    msg = next(x.message for x in _codes(p, ledger)[2] if x.code == "FORMULA_MISMATCH" and "PAR_T1S" in x.message)
+    assert "(with SCALE_T1 = 0.00390625)" in msg and "fix those first" not in msg, msg
     res = book.record_formula(store, "BMPX", src.id, "SCALE_T2", ["SCALE_T2 = 2^30"], "PAR_T2 = NVM_PAR_T2 / 2^30")
     assert not res["ok"] and "uses no register value" in res["error"] and "record_fact" in res["error"], res
 

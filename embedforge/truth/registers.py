@@ -1706,9 +1706,12 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                             raw.append(f"{l.name} = {rv:g} at {o[1]} ({o[2]})")
                             fl, _, ln = str(o[1]).rpartition(":")
                             loc.setdefault(f.id, (fl, int(ln) if ln.isdigit() else 0))
-                    deps = [g.name for g in same_dev(book.formulas.values(), f) if g.name != f.name and re.search(rf"\b{re.escape(g.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
+                    uses = [g for g in same_dev(book.formulas.values(), f) if g.name != f.name and re.search(rf"\b{re.escape(g.name.lower())}\b", " ".join(e for _, e in f.steps).lower())]
+                    deps = [g.name for g in uses if g.id in derived]
+                    consts = [f"{g.name} = {expected[g.id]:.10g}" for g in uses if g.id not in derived and g.id in expected]
                     detail[f.id] = (f"on probe input the formula gives {want:.7g}, a value the code never computes"
                                       + (f"; the code has the raw {'; '.join(raw[:2])} — the conversion is missing or different" if raw and len(f.steps) <= 2 else "")
+                                      + (f" (with {', '.join(consts)})" if consts else "")
                                       + (f" (it uses {', '.join(deps)}: fix those first)" if deps else ""))
         for f in book.formulas.values():
             res = results[f.id]
