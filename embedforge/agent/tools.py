@@ -40,13 +40,20 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "overrides such as 'board_upload.maximum_size = 2097152' (only board_build.*, board_upload.*, upload_protocol, build_unflags).",
         {"board": S, "framework": S, "build_flags": _arr(), "lib_deps": _arr(), "options": _arr()}, ["board", "framework"]),
     _fn("web_search",
-        "Search the web (Tavily) for official datasheets, reference manuals and register maps. Prefer `domains` with the "
-        "manufacturer's site. Each result has a source_id, trust tier and an `excerpt` (the passage best matching your query); "
-        "datasheet PDFs are downloaded in full automatically. Do not repeat a search — use read_source on what you have.",
+        "Search the web (Tavily) for official datasheets, reference manuals and register maps. Give `domains` with the "
+        "manufacturer's site: its pages rank first. Each result has a source_id, trust tier, Tavily relevance `score` and "
+        "an `excerpt` (the passage best matching your query); datasheet PDFs are downloaded in full automatically. Put a "
+        "part number in double quotes to require it exactly. Do not repeat a search — use read_source on what you have.",
         {"query": S, "domains": _arr()}, ["query"]),
+    _fn("find_documents",
+        "List the official documents a manufacturer's page links to (datasheet, reference manual, register map, errata, "
+        "application notes) by mapping the site with Tavily Map: give the part's product or documentation page URL (or "
+        "the vendor's documentation root) and the part number. Use it when web_search finds only snippets, mirrors or "
+        "forum posts; then fetch_document the right document.",
+        {"url": S, "part": S}, ["url"]),
     _fn("fetch_document",
-        "Download a datasheet/register-map PDF or web page by URL and store its full text. Only needed for URLs that "
-        "web_search did not already store in full. Returns a source_id.",
+        "Store the full text of a datasheet/register-map PDF or web page by URL (web pages through Tavily Extract, "
+        "tables kept as Markdown). Only needed for URLs that web_search did not already store in full. Returns a source_id.",
         {"url": S}, ["url"]),
     _fn("find_reference_code",
         "Get the MANUFACTURER's own reference driver for a part from its official GitHub organisation (Bosch Sensortec, "
@@ -320,7 +327,7 @@ class ToolBelt:
             self.state.update(verify_hash=lv.get("hash"), verify_ok=bool(lv.get("passed")), verify_inputs=lv.get("inputs"))
         self._handlers: Dict[str, Callable[..., Any]] = {
             "resolve_target": self.resolve_target, "init_project": self.init_project, "init_betaflight": self.init_betaflight,
-            "web_search": self.web_search,
+            "web_search": self.web_search, "find_documents": self.find_documents,
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
             "read_source": self.read_source, "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
@@ -589,13 +596,26 @@ class ToolBelt:
             r["excerpt"] = re.sub(r"[ \t]+", " ", ex[0]["text"])[:900] if ex else ""
             r["is_datasheet"] = bool(src and _looks_like_datasheet(src.url))
             r.pop("snippet", None)
-            self.session.emit("source", **{k: v for k, v in r.items() if k != "excerpt"})
+            self.session.emit("source", **{k: v for k, v in r.items() if k != "excerpt"},
+                              via=src.via if src else "", tavily_request=src.tavily_request if src else "")
         self._searches[key] = res
         if not res:
             return {"results": [], "note": "No results. Try the vendor's own part number / register names, or drop the domain filter."}
         return {"results": res,
                 "note": "Each result's `excerpt` is the passage that best matches your query. If it contains the value you need, "
                         "record_fact now with a verbatim quote copied from it; use read_source(source_id, query) for other passages."}
+
+    def find_documents(self, url: str, part: str = "") -> Dict[str, Any]:
+        if not str(url).lower().startswith(("http://", "https://")):
+            url = "https://" + str(url).strip().lstrip("/")   # 'www.bosch-sensortec.com/products/...' -> https://...
+        self.session.emit("status", text=f"Mapping {url} for official documents (Tavily Map)…")
+        res = self.store.find_documents(url, part)
+        if not res["documents"]:
+            res["note"] = ("No document links found on that page. Try the part's product page, the vendor's documentation "
+                           "root, or web_search with the vendor domain.")
+        else:
+            res["next"] = "fetch_document the datasheet (or reference manual) URL, then read_source for the values you need."
+        return res
 
     def find_reference_code(self, part: str, vendor: str = "") -> Dict[str, Any]:
         from embedforge.truth.refcode import find_reference_code
@@ -611,7 +631,8 @@ class ToolBelt:
                              + (f" The imported schematic is already stored as {board_sid}: use query_board for its wiring."
                                 if board_sid else " Project files are read with read_file.")}
         src = self.store.fetch(url)
-        self.session.emit("source", source_id=src.id, title=src.title, url=src.url, tier=src.tier, chars=src.chars)
+        self.session.emit("source", source_id=src.id, title=src.title, url=src.url, tier=src.tier, chars=src.chars,
+                          via=src.via, tavily_request=src.tavily_request)
         return {"source_id": src.id, "url": src.url, "tier": src.tier, "chars": src.chars, "kind": src.kind,
                 "preview": src.text[:500],
                 "next": "Call read_source(source_id, query) with the register/pin/parameter names you need."}

@@ -78,6 +78,8 @@ hardware problem you debug it and ship a patched build.
 4. Research only what is still missing, efficiently:
    - One targeted `web_search` per missing item (e.g. "<part> datasheet pdf" with the manufacturer domain).
    - Read the `excerpt` in each result first; it is usually the passage you need. Then `read_source` for more.
+   - If the results are only snippets, mirrors or forum posts, `find_documents(<the part's product page URL>, part)`
+     lists the manufacturer's official datasheet, reference manual and errata; then `fetch_document` the right one.
    - `record_fact` as soon as you see the value (several at once: `record_facts`). If rejected, retry with one of the
      `candidate_quotes`.
    - You have a research budget: after ~6 searches without recording a fact or writing code, searching is blocked.

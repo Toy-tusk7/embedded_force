@@ -448,7 +448,8 @@
   async function syncFiles(list) {
     for (const f of list) {
       if (!(f.path in S.files)) {
-        if (isImg(f.path) || isPdf(f.path) || /\.zip$/i.test(f.path)) S.files[f.path] = '';
+        // images, PDFs and binary archives (zip, EasyEDA Pro .epro/.epro2/.esch) have no text to preload
+        if (isImg(f.path) || isPdf(f.path) || /\.(zip|epro2?|esch)$/i.test(f.path)) S.files[f.path] = '';
         else {
           try { S.files[f.path] = (await api(`/api/projects/${S.projectId}/file?path=${encodeURIComponent(f.path)}`)).content || ''; } catch (_) { S.files[f.path] = ''; }
         }
@@ -478,7 +479,7 @@
       const ds = s.is_datasheet || /\.pdf($|\?)/i.test(url) || s.kind === 'pdf';
       return `<div class="src"><span class="src-title" title="${esc(s.title)}">${esc(s.title || url)}</span>${url.startsWith('http') ? `<a class="icon-btn sm" href="${esc(url)}" target="_blank" rel="noopener" title="Open">${ico('external')}</a>` : '<span></span>'}
         <span class="src-url">${esc(url)}</span>
-        <span class="src-meta">${tierPill(s.tier)}${ds ? '<span class="pill accent">document</span>' : ''}<span>${esc(s.source_id || s.id || '')}</span><span>${Math.round((s.chars || 0) / 1000)}k chars</span></span></div>`;
+        <span class="src-meta">${tierPill(s.tier, url)}${ds ? '<span class="pill accent">document</span>' : ''}${String(s.via || '').startsWith('tavily:') ? `<span class="pill neutral" title="Tavily request ${esc(s.tavily_request || '')}">Tavily ${esc(s.via.slice(7))}</span>` : ''}${s.score ? `<span title="Tavily relevance score">score ${esc(s.score)}</span>` : ''}<span>${esc(s.source_id || s.id || '')}</span><span>${Math.round((s.chars || 0) / 1000)}k chars</span></span></div>`;
     }).join('') : emptyState('book', 'No sources yet', 'Datasheets and pages the agent reads are listed here with their trust level.');
   }
   function upsertBuild(m) { const i = S.builds.findIndex((b) => b.version === m.version); if (i >= 0) S.builds[i] = m; else S.builds.push(m); renderBuilds(); }

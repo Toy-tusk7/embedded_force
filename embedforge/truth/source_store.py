@@ -10,6 +10,7 @@ import io
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass, asdict, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -36,6 +37,8 @@ class Source:
     sha256: str
     chars: int
     kind: str = "web"  # web | pdf | user
+    via: str = ""             # how the text was obtained: tavily:search | tavily:extract | download | ...
+    tavily_request: str = ""  # Tavily request_id of the call that returned it (provenance, support)
     text: str = field(default="", repr=False)
 
     def public(self) -> Dict[str, Any]:
@@ -210,7 +213,8 @@ class SourceStore:
         )
 
     # ---------- core API ----------
-    def add(self, url: str, title: str, text: str, kind: str = "web", replace: bool = False) -> Source:
+    def add(self, url: str, title: str, text: str, kind: str = "web", replace: bool = False, via: str = "",
+            tavily_request: str = "") -> Source:
         """Store a document. Re-adding a URL keeps the longer text unless `replace` (e.g. a re-imported schematic)."""
         with self._lock:
             existing_id = self._by_url.get(url)
@@ -229,6 +233,8 @@ class SourceStore:
                 sha256=hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest(),
                 chars=len(text),
                 kind=kind,
+                via=via,
+                tavily_request=tavily_request,
                 text=text,
             )
             self.sources[sid] = src
@@ -316,33 +322,27 @@ class SourceStore:
                 # If cached documents don't answer the query, proceed to web search!
                 break
 
-        from tavily import TavilyClient
-
-        client = TavilyClient(api_key=config.tavily_api_key)
         kwargs: Dict[str, Any] = dict(
-            query=query, search_depth="basic", max_results=min(max_results or 3, 3), include_raw_content=True,
-            exclude_domains=EXCLUDED_STORE_DOMAINS
+            query=query, search_depth=config.tavily_search_depth, max_results=max(1, min(max_results or 3, 5)),
+            # the whole page as Markdown: register tables keep their rows and columns, and every quote can be checked
+            include_raw_content="markdown", exclude_domains=EXCLUDED_STORE_DOMAINS,
         )
+        if config.tavily_search_depth == "advanced":
+            kwargs["chunks_per_source"] = 3   # the most relevant passages of each page as its snippet
+        if '"' in query:
+            kwargs["exact_match"] = True      # a quoted part number must appear as written
         if domains:
             cleaned = [d.lower().strip() for d in domains if not any(bad in d.lower() for bad in EXCLUDED_STORE_DOMAINS)]
             # If searching for AT32 / Artery, do not restrict to ST domain
             if ("at32" in low_q or "artery" in low_q) and "st.com" in cleaned:
                 cleaned = [d for d in cleaned if d != "st.com"]
-            if cleaned:
+            if cleaned:   # the manufacturer's domains first, other sites still allowed (one call instead of a fallback)
                 kwargs["include_domains"] = cleaned
+                kwargs["include_domains_mode"] = "prefer"
 
-        resp = client.search(**kwargs)
-        raw_results = resp.get("results", [])
-
-        # If domain-restricted search yielded 0 results, retry without domain restriction
-        if not raw_results and "include_domains" in kwargs:
-            fallback_kwargs = dict(kwargs)
-            fallback_kwargs.pop("include_domains", None)
-            resp = client.search(**fallback_kwargs)
-            raw_results = resp.get("results", [])
-
+        resp = self._tavily("search", **kwargs)
         out = []
-        for r in raw_results:
+        for r in resp.get("results", []):
             url = r.get("url", "")
             host = urllib.parse.urlparse(url).netloc.lower()
             if any(bad in host for bad in EXCLUDED_STORE_DOMAINS):
@@ -353,7 +353,8 @@ class SourceStore:
             # If text is raw HTML, extract clean text
             if "<html" in text.lower() or "<body" in text.lower():
                 text = html_to_text(text)
-            src = self.add(url, r.get("title", ""), text, kind="pdf" if url.lower().endswith(".pdf") else "web")
+            src = self.add(url, r.get("title", ""), text, kind="pdf" if url.lower().endswith(".pdf") else "web",
+                           via="tavily:search", tavily_request=str(resp.get("request_id") or ""))
             out.append(
                 {
                     "source_id": src.id,
@@ -361,45 +362,103 @@ class SourceStore:
                     "url": src.url,
                     "tier": src.tier,
                     "chars": src.chars,
+                    "score": round(float(r.get("score") or 0), 3),
                     "snippet": (r.get("content") or "")[:350],
                 }
             )
         return out
 
+    def _tavily(self, op: str, **kwargs: Any) -> Dict[str, Any]:
+        """One Tavily call (search / extract / map), with its credit usage requested. Every call is logged to
+        sources/tavily_usage.jsonl (endpoint, request id, credits, query or URL), so each stored source and the facts
+        quoted from it trace back to the Tavily request that found them."""
+        from tavily import TavilyClient
+        resp = getattr(TavilyClient(api_key=config.tavily_api_key), op)(include_usage=True, **kwargs)
+        entry = {"t": round(time.time(), 1), "op": op, "request_id": resp.get("request_id", ""),
+                 "credits": (resp.get("usage") or {}).get("credits"),
+                 "query": kwargs.get("query") or "", "url": kwargs.get("url") or kwargs.get("urls") or ""}
+        with self._lock, open(self.dir / "tavily_usage.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        return resp
+
+    def tavily_usage(self) -> Dict[str, Any]:
+        """Tavily calls and credits spent for this project, per endpoint."""
+        p = self.dir / "tavily_usage.jsonl"
+        calls: Dict[str, int] = {}
+        credits = 0.0
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                calls[e.get("op", "?")] = calls.get(e.get("op", "?"), 0) + 1
+                credits += float(e.get("credits") or 0)
+        return {"calls": calls, "credits": round(credits, 2)}
+
+    def find_documents(self, url: str, part: str = "", limit: int = 40) -> Dict[str, Any]:
+        """Tavily Map over a manufacturer's product or documentation page: the official documents it links to
+        (datasheet, reference manual, register map, errata, application notes), PDFs and pages naming the part first."""
+        what = f" for {part}" if part else ""
+        resp = self._tavily("map", url=url, max_depth=2, limit=max(10, min(int(limit or 40), 100)), allow_external=False,
+                            instructions=f"Find the official datasheet, reference manual, register map, application notes "
+                                         f"and errata{what}.")
+        part_l = (part or "").lower().replace(" ", "")
+        doc_word = re.compile(r"datasheet|data-sheet|reference|manual|register|errata|app(lication)?[-_ ]?note|\.pdf", re.I)
+
+        def rank(u: str) -> tuple:   # PDFs, then the part's own, then datasheets, then other documents
+            low = u.lower()
+            return (not low.split("?")[0].endswith(".pdf"), not (part_l and part_l in low.replace("-", "").replace("_", "")),
+                    not re.search(r"datasheet|data-sheet|[-_]ds\d", low), not doc_word.search(low), len(u))
+        urls = sorted({u for u in resp.get("results") or [] if isinstance(u, str)}, key=rank)
+        docs = [{"url": u, "tier": classify_url(u).value, "pdf": u.lower().split("?")[0].endswith(".pdf")}
+                for u in urls if doc_word.search(u) or (part_l and part_l in u.lower())]
+        return {"base_url": resp.get("base_url", url), "documents": docs[:15], "pages_mapped": len(urls),
+                "request_id": resp.get("request_id", "")}
+
     def fetch(self, url: str) -> Source:
-        """Download a document (PDF/HTML) and store its full text."""
-        text, kind = "", "web"
+        """Store the full text of a document. Web pages are read with Tavily Extract (advanced, Markdown: rendered pages,
+        tables kept); PDFs are downloaded and converted locally (tables and equations kept), with Extract as the fallback."""
+        text, kind, via, request = "", "web", "", ""
         err: Optional[str] = None
-        try:
-            with httpx.Client(follow_redirects=True, timeout=60.0, headers={"User-Agent": _UA}) as c:
-                with c.stream("GET", url) as resp:
-                    resp.raise_for_status()
-                    buf = bytearray()
-                    for chunk in resp.iter_bytes():
-                        buf.extend(chunk)
-                        if len(buf) > MAX_DOWNLOAD_BYTES:
-                            break
-                    ctype = resp.headers.get("content-type", "").lower()
-            data = bytes(buf)
-            if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf") or data[:5] == b"%PDF-":
-                text, kind = pdf_to_text(data), "pdf"
-            else:
-                text = html_to_text(data.decode("utf-8", "ignore"))
-        except Exception as e:
-            err = str(e)
+        is_pdf_url = url.lower().split("?")[0].endswith(".pdf")
 
-        if len(text.strip()) < 200 and config.has_tavily:
+        def extract() -> None:
+            nonlocal text, via, request, err
             try:
-                from tavily import TavilyClient
-
-                r = TavilyClient(api_key=config.tavily_api_key).extract(urls=[url])
+                r = self._tavily("extract", urls=[url], extract_depth="advanced", format="markdown")
                 items = r.get("results", [])
-                if items:
-                    text = items[0].get("raw_content", "") or text
-                    err = None
+                if items and len((items[0].get("raw_content") or "").strip()) >= 200:
+                    text, via, request, err = items[0]["raw_content"], "tavily:extract", str(r.get("request_id") or ""), None
+                elif r.get("failed_results"):
+                    err = f"tavily extract: {r['failed_results'][0].get('error', 'failed')}"
             except Exception as e:
-                err = f"{err}; tavily extract: {e}" if err else str(e)
+                err = f"{err}; tavily extract: {e}" if err else f"tavily extract: {e}"
+
+        if not is_pdf_url and config.has_tavily:
+            extract()
+        if len(text.strip()) < 200:
+            try:
+                with httpx.Client(follow_redirects=True, timeout=60.0, headers={"User-Agent": _UA}) as c:
+                    with c.stream("GET", url) as resp:
+                        resp.raise_for_status()
+                        buf = bytearray()
+                        for chunk in resp.iter_bytes():
+                            buf.extend(chunk)
+                            if len(buf) > MAX_DOWNLOAD_BYTES:
+                                break
+                        ctype = resp.headers.get("content-type", "").lower()
+                data = bytes(buf)
+                if "pdf" in ctype or is_pdf_url or data[:5] == b"%PDF-":
+                    text, kind = pdf_to_text(data), "pdf"
+                else:
+                    text = html_to_text(data.decode("utf-8", "ignore"))
+                via = "download"
+            except Exception as e:
+                err = f"{err}; {e}" if err else str(e)
+        if len(text.strip()) < 200 and is_pdf_url and config.has_tavily:
+            extract()
 
         if len(text.strip()) < 200:
             raise RuntimeError(f"Could not retrieve readable content from {url}: {err or 'empty document'}")
-        return self.add(url, url.rsplit("/", 1)[-1] or url, text, kind=kind)
+        return self.add(url, url.rsplit("/", 1)[-1] or url, text, kind=kind, via=via, tavily_request=request)

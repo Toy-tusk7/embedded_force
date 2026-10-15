@@ -23,7 +23,7 @@ from embedforge.truth import FactLedger, SourceStore
 PROGRESS_TOOLS = {"record_fact", "record_user_fact", "record_board_pins", "init_project", "init_betaflight", "query_board",
                   "write_file", "replace_in_file", "rename_file", "build", "verify", "record_facts", "record_sequence", "record_registers",
                   "record_layouts", "record_formula"}
-RESEARCH_TOOLS = {"web_search", "fetch_document", "find_reference_code"}
+RESEARCH_TOOLS = {"web_search", "fetch_document", "find_reference_code", "find_documents"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
 MAX_SDK_WITHOUT_PROGRESS = 10
@@ -242,9 +242,18 @@ class AgentRunner:
         lines = [f"# Walkthrough — {meta.get('name')}", "",
                  f"- **Target:** {meta.get('board')} ({meta.get('mcu')}), framework `{meta.get('framework')}`",
                  f"- **Model:** `{self.llm.model}` via {self.llm.provider.name}", ""]
-        lines += ["## Facts used (each with verbatim quote & source)", "", "| ID | Subject | Property | Value | Tier | Source |", "|---|---|---|---|---|---|"]
+        lines += ["## Facts used (each with verbatim quote & source)", "",
+                  "| ID | Subject | Property | Value | Tier | Source | Found by |", "|---|---|---|---|---|---|---|"]
         for f in ledger.facts.values():
-            lines.append(f"| {f.id} | {f.subject} | {f.property} | `{f.value}` | {f.tier} | {f.source_url} |")
+            src = store.get(f.source_id)
+            found = (f"{src.via}" + (f" `{src.tavily_request[:12]}`" if src.tavily_request else "")) if src and src.via else "—"
+            lines.append(f"| {f.id} | {f.subject} | {f.property} | `{f.value}` | {f.tier} | {f.source_url} | {found} |")
+        usage = store.tavily_usage()
+        if usage["calls"]:
+            web_facts = sum(1 for f in ledger.facts.values() if str(f.source_url).startswith("http"))
+            lines += ["", "## Research (Tavily)", "",
+                      "- Calls: " + ", ".join(f"{op} ×{n}" for op, n in sorted(usage["calls"].items())),
+                      f"- Credits: {usage['credits']:g}" + (f" ({usage['credits'] / web_facts:.2f} per datasheet fact)" if web_facts else "")]
         lines += ["", "## Builds", ""]
         for b in builds:
             hx = b.get("files", {}).get("hex", "—")
@@ -495,7 +504,8 @@ class AgentRunner:
             stats = dict(steps=steps, tools=dict(guard.calls), failures=dict(guard.failures), blocked=dict(guard.blocked),
                          facts=len(ledger.facts), sources=len(store.sources), builds=len(project.builds()),
                          build_ok=belt.state["build_ok"], verify_ok=belt.state["verify_ok"], model=self.llm.model,
-                         status=status, next_step=nxt, truncations=truncations, continue_nudges=continue_nudges)
+                         status=status, next_step=nxt, truncations=truncations, continue_nudges=continue_nudges,
+                         tavily=store.tavily_usage())
             try:
                 project.trace({"event": "run_end", **stats})
             except Exception:

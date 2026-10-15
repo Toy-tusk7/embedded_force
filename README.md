@@ -29,7 +29,7 @@ desk.
 ```mermaid
 flowchart LR
     U["Request + schematic<br/>(EasyEDA / KiCad)"] --> A["Agent loop<br/>NVIDIA Nemotron 3 Ultra<br/>on Nebius Token Factory"]
-    A -->|web_search / fetch_document| T["Tavily search & extract<br/>manufacturer domains first"]
+    A -->|web_search / find_documents /<br/>fetch_document| T["Tavily search, map & extract<br/>manufacturer domains first"]
     T --> S["Source store<br/>(text + trust tier)"]
     A -->|record_fact / record_registers /<br/>record_layouts / record_formula / record_sequence| G{"Quote gates:<br/>verbatim in the source?<br/>value and unit in the quote?"}
     S --> G
@@ -41,10 +41,11 @@ flowchart LR
     V -->|PASS| D["Deliver: .hex + walkthrough<br/>(every constant traced to a quote)"]
 ```
 
-1. **Research.** `web_search` runs a Tavily search (manufacturer domains preferred, full page text kept);
-   `fetch_document` downloads datasheets and converts PDFs to Markdown (tables and equations kept), with Tavily
-   Extract as the fallback. Sources get a trust tier: manufacturer domains and official GitHub organisations are
-   authoritative; forums and mirrors are recorded but flagged.
+1. **Research.** `web_search` runs a Tavily search (manufacturer domains preferred, full page kept as Markdown);
+   `find_documents` maps a vendor's product page with Tavily Map to find its official datasheet and errata;
+   `fetch_document` reads web pages with Tavily Extract and converts PDFs to Markdown locally (tables and equations
+   kept). Sources get a trust tier: manufacturer domains and official GitHub organisations are authoritative; forums
+   and mirrors are recorded but flagged.
 2. **The truth layer.** Every fact the firmware relies on is recorded with a quote. A fact is accepted only if the
    quote appears verbatim in the stored source (ignoring layout, case and quote marks, on word boundaries), the value
    appears inside the quoted text, and its unit matches the one the source states. Register maps (fields and named
@@ -103,12 +104,23 @@ python -m embedforge.verifybench          # add -v to list every planted bug and
 - **Provider order:** Nebius (Nemotron) → NVIDIA API catalog (Nemotron) → Claude → Gemini, whichever is configured
   first; `EMBEDFORGE_PROVIDER` forces one.
 
-## Tavily
+## Tavily: it finds, the ledger verifies
 
-Every fact EmbedForge relies on is quoted from text Tavily found or extracted, so Tavily is the start of the evidence
-chain: search (`search_depth`, `include_domains` for manufacturer domains, `include_raw_content` so the full page is
-stored and quotable), and Extract when a direct download yields no text. Searches are cached per run, and a research
-budget stops endless searching (6 searches without a new fact or code change).
+Every fact EmbedForge relies on is quoted from text Tavily found, mapped or extracted, so Tavily is the start of the
+evidence chain:
+
+| Step | Tavily endpoint | How it is used |
+|---|---|---|
+| Find | **Search** (`search_depth="advanced"`, `chunks_per_source=3`) | Manufacturer domains preferred (`include_domains_mode="prefer"`), quoted part numbers matched exactly (`exact_match`), the whole page kept as Markdown (`include_raw_content="markdown"`) so register tables stay tables and every quote can be checked against it; relevance `score` passed to the agent |
+| Discover | **Map** (`instructions`, `max_depth=2`, no external links) | `find_documents` maps the part's product page for the vendor's own datasheet, reference manual, register map and errata, PDFs and the part's own documents first |
+| Read | **Extract** (`extract_depth="advanced"`, `format="markdown"`) | Web pages are read through Extract (rendered, tables kept); PDFs are converted locally first, Extract as the fallback |
+| Verify | — | The fact ledger accepts a fact only if its quote is verbatim in that stored text |
+
+Every call asks for its usage (`include_usage`) and is logged with its `request_id` and credits, and each stored
+source keeps the endpoint and request that produced it. The IDE shows them per source, and the delivery walkthrough
+lists, for every fact, the Tavily request that found its source and the credits spent per datasheet fact. Searches
+are cached per run, and a research budget stops endless searching (6 searches without a new fact or code change).
+`TAVILY_SEARCH_DEPTH=basic` halves the search cost.
 
 ## Quickstart
 
