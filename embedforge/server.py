@@ -39,6 +39,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _require_password(request, call_next):
+    """With EMBEDFORGE_PASSWORD set (a hosted demo), every request needs it: HTTP Basic auth, any user name. The
+    browser asks once and sends it with every later request of the page, the event stream included."""
+    import base64
+    import hmac
+    password = config.server_password
+    if password:
+        auth = request.headers.get("authorization", "")
+        given = ""
+        if auth[:6].lower() == "basic ":
+            try:
+                given = base64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")[2]
+            except ValueError:
+                given = ""
+        if not hmac.compare_digest(given.encode(), password.encode()):
+            return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="EmbedForge"'})
+    return await call_next(request)
+
 WEB_DIR = Path(__file__).parent / "web"
 
 _RUNS: Dict[str, RunSession] = {}
@@ -589,7 +609,11 @@ def cancel_run(run_id: str):
 
 def main():
     import uvicorn
-    uvicorn.run("embedforge.server:app", host="127.0.0.1", port=8000, reload=False)
+    host = os.getenv("EMBEDFORGE_HOST", "127.0.0.1")
+    if host not in ("127.0.0.1", "localhost", "::1") and not config.server_password:
+        # reachable from other machines: without a password anyone could run the agent on your API credits
+        raise SystemExit(f"EMBEDFORGE_HOST={host} makes the IDE reachable from other machines; set EMBEDFORGE_PASSWORD first.")
+    uvicorn.run("embedforge.server:app", host=host, port=int(os.getenv("EMBEDFORGE_PORT", "8000")), reload=False)
 
 
 if __name__ == "__main__":

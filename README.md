@@ -126,6 +126,9 @@ cp .env.example .env               # then add NEBIUS_API_KEY and TAVILY_API_KEY
 embedforge                         # or: python -m embedforge.server
 ```
 
+To host the IDE for others (a demo on a cloud VM), set `EMBEDFORGE_PASSWORD` and `EMBEDFORGE_HOST=0.0.0.0`: the
+browser asks for the password (any user name), and the server refuses to listen beyond the local machine without one.
+
 Open **http://localhost:8000** and describe the firmware, e.g. *"Raspberry Pi Pico (pico-sdk), BMP388 on I2C0
 (SDA GP4, SCL GP5, SDO to GND): read temperature and pressure every second over USB serial."*
 

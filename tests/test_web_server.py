@@ -17,6 +17,19 @@ def test_web_server_config():
     assert "nebius_model" in data
     assert "langsmith_active" in data
 
+def test_a_hosted_ide_asks_for_its_password(monkeypatch):
+    import base64
+    from embedforge.core.config import config
+    monkeypatch.setattr(config, "server_password", "s3cret")
+    client = TestClient(app)
+    res = client.get("/")
+    assert res.status_code == 401 and res.headers["www-authenticate"].startswith("Basic")
+    wrong = base64.b64encode(b"judge:nope").decode()
+    assert client.get("/api/config", headers={"Authorization": f"Basic {wrong}"}).status_code == 401
+    right = base64.b64encode(b"judge:s3cret").decode()
+    assert client.get("/api/config", headers={"Authorization": f"Basic {right}"}).status_code == 200
+
+
 def test_reopened_project_carries_its_last_verify_report():
     import json
     from embedforge.agent.workspace import ProjectManager

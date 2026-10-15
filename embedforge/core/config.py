@@ -72,6 +72,8 @@ class EmbedForgeConfig(BaseModel):
     workspace_root: Path = Field(
         default_factory=lambda: Path(os.getenv("EMBEDFORGE_WORKSPACE", Path.cwd()))
     )
+    # a hosted IDE asks for this password (HTTP Basic auth); required when EMBEDFORGE_HOST is not this machine
+    server_password: str = Field(default_factory=lambda: os.getenv("EMBEDFORGE_PASSWORD", ""))
     temperature: float = 0.2
     max_tokens: int = 4096
     bounded_search_limit: int = 5

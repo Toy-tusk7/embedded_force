@@ -23,3 +23,4 @@ def _temporary_workspace(tmp_path, monkeypatch):
     # ... nor ever reach a paid API: a call a test forgot to fake fails authentication instead of spending credits
     for key in ("nebius_api_key", "nvidia_api_key", "tavily_api_key"):
         monkeypatch.setattr(config, key, "test-key-not-real")
+    monkeypatch.setattr(config, "server_password", "")   # a hosted setup's password must not lock the tests out
