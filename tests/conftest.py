@@ -24,3 +24,4 @@ def _temporary_workspace(tmp_path, monkeypatch):
     for key in ("nebius_api_key", "nvidia_api_key", "tavily_api_key"):
         monkeypatch.setattr(config, key, "test-key-not-real")
     monkeypatch.setattr(config, "server_password", "")   # a hosted setup's password must not lock the tests out
+    monkeypatch.setattr(config, "selfhosted_base_url", "")   # nor a self-hosted model server be picked or called

@@ -38,12 +38,16 @@ def providers() -> Dict[str, Provider]:
         "gemini": Provider("gemini", "Google Gemini API", config.gemini_base_url.rstrip("/"), config.gemini_api_key),
         "nebius": Provider("nebius", "Nebius Token Factory", config.nebius_base_url.rstrip("/"), config.nebius_api_key),
         "nvidia": Provider("nvidia", "NVIDIA API (NIM)", config.nvidia_base_url.rstrip("/"), config.nvidia_api_key),
+        # a server without an API key ignores the Authorization header: any non-empty token marks it configured
+        "selfhosted": Provider("selfhosted", "Self-hosted (vLLM / Ollama)", config.selfhosted_base_url.rstrip("/"),
+                               (config.selfhosted_api_key or "none") if config.selfhosted_base_url else None),
     }
 
 
-# Provider order when nothing is forced: NVIDIA Nemotron on Nebius Token Factory first, then Nemotron from the NVIDIA
-# API catalog, then Claude, then Gemini (EMBEDFORGE_PROVIDER forces one)
-PREFERRED = ("nebius", "nvidia", "anthropic", "gemini")
+# Provider order when nothing is forced: a self-hosted server you set up (e.g. Nemotron on a Nebius AI Cloud VM), then
+# NVIDIA Nemotron on Nebius Token Factory, then Nemotron from the NVIDIA API catalog, then Claude, then Gemini
+# (EMBEDFORGE_PROVIDER forces one)
+PREFERRED = ("selfhosted", "nebius", "nvidia", "anthropic", "gemini")
 
 
 def default_provider() -> str:
@@ -55,7 +59,8 @@ def default_provider() -> str:
 
 
 def default_model(provider_id: str) -> str:
-    return {"anthropic": config.anthropic_model, "gemini": config.gemini_model}.get(provider_id, config.agent_model)
+    return {"anthropic": config.anthropic_model, "gemini": config.gemini_model,
+            "selfhosted": config.selfhosted_model}.get(provider_id, config.agent_model)
 
 
 def resolve_provider(requested: Optional[str]) -> str:
@@ -143,6 +148,8 @@ class AgentLLM:
             self.model = model if model and model.startswith("claude-") else config.anthropic_model
         elif pid == "gemini":
             self.model = model if model and model.startswith("gemini") else config.gemini_model
+        elif pid == "selfhosted":   # the name the server serves the model under; a model picked from its list is kept
+            self.model = model if model and provider == "selfhosted" else config.selfhosted_model
         else:
             self.model = model if model and not model.startswith(("claude-", "gemini")) else config.agent_model
         self.base_url = p.base_url
@@ -169,7 +176,7 @@ class AgentLLM:
         """Nemotron 3 chat-template options, as NVIDIA's model card recommends for coding agents and tool calling:
         reasoning on, and a non-empty answer after the reasoning (so a reply is never only a thought);
         EMBEDFORGE_NEMOTRON_EFFORT=medium asks for markedly shorter reasoning."""
-        if self.provider.id not in ("nebius", "nvidia") or (self.base_url, self.model) in _NO_TEMPLATE_KWARGS:
+        if self.provider.id not in ("nebius", "nvidia", "selfhosted") or (self.base_url, self.model) in _NO_TEMPLATE_KWARGS:
             return {}
         if not re.search(r"nemotron-?3", self.model.lower()):
             return {}

@@ -104,8 +104,10 @@ python -m embedforge.verifybench          # add -v to list every planted bug and
   `reasoning_content` (or inline `<think>`) and is shown live in the IDE.
 - **Tool calling** uses the OpenAI `tools` schema. Calls the model writes as text (Qwen-coder XML, Hermes JSON or
   bare JSON) are recovered and run; replies cut off at the token limit are retried instead of shown.
-- **Provider order:** Nebius (Nemotron) → NVIDIA API catalog (Nemotron) → Claude → Gemini, whichever is configured
-  first; `EMBEDFORGE_PROVIDER` forces one.
+- **Your own GPUs:** [`deploy/nebius-vm/`](deploy/nebius-vm/README.md) serves Nemotron 3 Super with vLLM on a Nebius
+  AI Cloud GPU VM (`SELFHOSTED_BASE_URL`) and runs the IDE next to it, reachable from any browser with a password.
+- **Provider order:** self-hosted → Nebius Token Factory (Nemotron) → NVIDIA API catalog (Nemotron) → Claude →
+  Gemini, whichever is configured first; `EMBEDFORGE_PROVIDER` forces one.
 
 ## Tavily: it finds, the ledger verifies
 

@@ -550,7 +550,7 @@ def chat(project_id: str, req: ChatRequest):
     if not msg:
         raise HTTPException(status_code=400, detail="Empty message")
     if not config.has_llm:
-        raise HTTPException(status_code=503, detail="No LLM provider configured (set ANTHROPIC_API_KEY, GEMINI_API_KEY, NEBIUS_API_KEY or NVIDIA_API_KEY)")
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set SELFHOSTED_BASE_URL, NEBIUS_API_KEY, NVIDIA_API_KEY, ANTHROPIC_API_KEY or GEMINI_API_KEY)")
     if req.attachments:
         msg += f"\n\n[User uploaded attachments: {', '.join(req.attachments)}]"
     return _start_run(project_id, msg)
@@ -570,7 +570,7 @@ def debug(project_id: str, req: DebugRequest):
     parts.append("Diagnose using the existing project and ledger, research the datasheet/errata as needed, "
                  "fix the firmware if it is a software cause, rebuild and verify; otherwise tell me exactly what to check.")
     if not config.has_llm:
-        raise HTTPException(status_code=503, detail="No LLM provider configured (set ANTHROPIC_API_KEY, GEMINI_API_KEY, NEBIUS_API_KEY or NVIDIA_API_KEY)")
+        raise HTTPException(status_code=503, detail="No LLM provider configured (set SELFHOSTED_BASE_URL, NEBIUS_API_KEY, NVIDIA_API_KEY, ANTHROPIC_API_KEY or GEMINI_API_KEY)")
     return _start_run(project_id, "\n".join(parts))
 
 

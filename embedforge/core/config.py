@@ -36,6 +36,11 @@ class EmbedForgeConfig(BaseModel):
     nvidia_base_url: str = Field(
         default_factory=lambda: os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     )
+    # A self-hosted OpenAI-compatible server (vLLM / SGLang on a Nebius AI Cloud GPU VM, Ollama / llama.cpp locally):
+    # used first when its base URL is set. The key is only needed if the server was started with one.
+    selfhosted_base_url: str = Field(default_factory=lambda: os.getenv("SELFHOSTED_BASE_URL", "").strip())
+    selfhosted_model: str = Field(default_factory=lambda: os.getenv("SELFHOSTED_MODEL", "nemotron-3-super"))
+    selfhosted_api_key: str = Field(default_factory=lambda: os.getenv("SELFHOSTED_API_KEY", ""))
     # Anthropic Claude API (the SDK also reads ANTHROPIC_API_KEY itself; ANTHROPIC_AUTH_TOKEN works too)
     anthropic_api_key: Optional[str] = Field(
         default_factory=lambda: os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")
@@ -56,8 +61,8 @@ class EmbedForgeConfig(BaseModel):
     gemini_model: str = Field(   # on the free tier; gemini-3.1-pro-preview is paid-only
         default_factory=lambda: os.getenv("EMBEDFORGE_GEMINI_MODEL", "gemini-3.8-flash")
     )
-    # Force one provider for every run: anthropic | gemini | nebius | nvidia (empty: Claude, then Gemini, when
-    # configured, else Nebius/NVIDIA)
+    # Force one provider for every run: selfhosted | nebius | nvidia | anthropic | gemini (empty: the first configured,
+    # in that order)
     llm_provider: str = Field(
         default_factory=lambda: os.getenv("EMBEDFORGE_PROVIDER", "").strip().lower()
     )
@@ -97,8 +102,12 @@ class EmbedForgeConfig(BaseModel):
         return bool(self.gemini_api_key and self.gemini_api_key.strip())
 
     @property
+    def has_selfhosted(self) -> bool:
+        return bool(self.selfhosted_base_url)
+
+    @property
     def has_llm(self) -> bool:
-        return self.has_anthropic or self.has_gemini or self.has_nebius or self.has_nvidia
+        return self.has_selfhosted or self.has_anthropic or self.has_gemini or self.has_nebius or self.has_nvidia
 
     @property
     def has_tavily(self) -> bool:

@@ -59,6 +59,21 @@ def test_a_provider_that_rejects_the_template_options_is_used_without_them(monke
     assert "chat_template_kwargs" not in sent[2]   # remembered for that provider and model
 
 
+def test_a_self_hosted_nemotron_server_comes_first_and_gets_the_same_options(monkeypatch):
+    monkeypatch.setattr(config, "selfhosted_base_url", "http://127.0.0.1:8001/v1")
+    monkeypatch.setattr(config, "selfhosted_model", "nemotron-3-super")
+    assert llm.default_provider() == "selfhosted"
+    a = AgentLLM("nvidia/Nemotron-3-Ultra-550b-a55b", "nebius")      # a project saved on Token Factory
+    assert a.provider.id == "nebius"                                 # keeps its provider while that is configured
+    b = AgentLLM(None, None)
+    assert (b.provider.id, b.model, b.base_url) == ("selfhosted", "nemotron-3-super", "http://127.0.0.1:8001/v1")
+    sent = []
+    monkeypatch.setattr(llm.httpx, "Client", _client([(200, OK)], sent))
+    b.chat([{"role": "user", "content": "go"}])
+    assert sent[0]["model"] == "nemotron-3-super" and sent[0]["chat_template_kwargs"]["enable_thinking"] is True
+    assert sent[0]["temperature"] == 1.0 and sent[0]["top_p"] == 0.95
+
+
 def test_other_models_get_no_template_options(monkeypatch):
     sent = []
     monkeypatch.setattr(llm.httpx, "Client", _client([(200, OK)], sent))
