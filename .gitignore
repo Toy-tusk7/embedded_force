@@ -51,8 +51,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# EmbedForge local workspace runtime data
-workspace/projects/
-workspace/sources/
-workspace/cache/
+# EmbedForge local workspace runtime data (projects, run traces, downloaded sources, toolchains)
+workspace/
 *.log
+
+# Local tooling and scratch work
+.claude/
+.scratch/
+gemini-code-*.md
+
+# Converted vendor datasheets: copyrighted, kept local only
+docs/datasheets/
