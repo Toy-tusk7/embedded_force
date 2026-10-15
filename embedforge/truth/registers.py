@@ -35,7 +35,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from embedforge.truth.flow import FlowModel, Part, RxByte, Walker, is_int, writes_of
-from embedforge.truth.ledger import GAP, FactLedger, _index, _squash, bounded, parse_int, unescape_literals, value_in_text
+from embedforge.truth.ledger import (GAP, FactLedger, _index, _squash, bounded, parse_int, quote_mismatch, unescape_literals,
+                                     value_in_text)
 from embedforge.truth.source_store import SourceStore
 
 MAX_QUOTE = 2000
@@ -97,7 +98,8 @@ def _quote_ok(store: SourceStore, source_id: str, quote: str, what: str) -> Opti
     if len(quote) > MAX_QUOTE:
         return f"{what}: quote longer than {MAX_QUOTE} chars — quote only the rows that state it"
     if not verbatim(quote, src.text):
-        return f"{what}: quote is not verbatim in {source_id} (copy it exactly from read_source)"
+        where = quote_mismatch(quote, src.text)
+        return f"{what}: quote is not verbatim in {source_id}. " + (where or "Copy it exactly from read_source.")
     return None
 
 
@@ -703,6 +705,34 @@ def eval_expr(tree: ast.AST, env: Dict[str, float]) -> float:
 
 _BURST_WORDS = re.compile(r"burst|single|one\s+(?:read|transaction|command)|consecutive|sequential|auto-?increment|multi-?byte|shadow", re.I)
 _STEP_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=(?!=)\s*(.+)$", re.S)
+_CONST_ASSIGN = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)[fFuUlL]*\s*;")
+
+
+def _quote_constants(quote: str) -> Dict[str, str]:
+    """Names the quoted code sets to a number (temp_var = 0.00390625f;), when it sets each to only one value."""
+    seen: Dict[str, set] = {}
+    for m in _CONST_ASSIGN.finditer(quote or ""):
+        seen.setdefault(m.group(1).lower(), set()).add(m.group(2))
+    return {n: next(iter(v)) for n, v in seen.items() if len(v) == 1}
+
+
+_C_WORDS = {"double", "float", "int", "long", "short", "char", "unsigned", "signed", "const", "static", "return", "if", "else",
+            "for", "while", "void", "struct", "sizeof", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t",
+            "int32_t", "int64_t"}
+
+
+def _quote_names(quote: str, limit: int = 12) -> List[str]:
+    """The variables a quoted piece of code uses (calib_data->par_t1, temp_var), for an error that asks for them."""
+    code = re.sub(r"/\*.*?\*/|//[^\n]*", " ", quote or "", flags=re.S)
+    if ";" not in code:   # prose (a datasheet's formula): its words are not variables
+        return []
+    out: List[str] = []
+    for m in re.finditer(r"(?<![\w.>])[A-Za-z_]\w*(?:\s*(?:->|\.)\s*[A-Za-z_]\w*)*", code):
+        n = re.sub(r"\s+", "", m.group())
+        if code[m.end():].lstrip().startswith("(") or n.lower() in _C_WORDS or n in out:   # a function or macro call
+            continue
+        out.append(n)
+    return out[:limit]
 
 
 def _parse_part(raw: Any) -> Optional[LayoutPart]:
@@ -1154,6 +1184,7 @@ class RegisterBook:
         parsed: List[List[str]] = []
         defined: set = set()
         missing_consts: List[str] = []
+        local_consts = _quote_constants(quote)
         for k, s in enumerate(steps[:40], start=1):
             s = str(s).strip().rstrip(";")
             s = re.sub(r"^\s*(?:[A-Za-z_]\w*\s*(?:->|\.)\s*)+(?=[A-Za-z_]\w*\s*=)", "", s)   # calib_data->t_lin = ... -> t_lin = ...
@@ -1171,6 +1202,11 @@ class RegisterBook:
             except (RecursionError, MemoryError):
                 return {"ok": False, "error": f"step {k} ({var}): the expression is nested too deeply; split it into steps"}
             unknown = [n for n in _names(tree) if n not in defined and n not in known]
+            for n in dict.fromkeys(u for u in unknown if u in local_consts):
+                # the quoted code sets it to one number (temp_var = 0.00390625f;): that assignment is a step of its own
+                parsed.append([n, local_consts[n]])
+                defined.add(n)
+            unknown = [n for n in unknown if n not in defined]
             if unknown:
                 return {"ok": False, "error": f"step {k}: unknown name(s) {', '.join(sorted(set(unknown)))}. Every input must be a layout "
                                               f"(record_layouts) or a formula recorded before (known: {', '.join(sorted(known)) or 'none'}). "
@@ -1186,9 +1222,11 @@ class RegisterBook:
             parsed.append([name, parsed[-1][0]])
         foreign = self._names_not_in_quote(orig_steps, quote, inputs if isinstance(inputs, dict) else {})
         if foreign:
+            names = _quote_names(quote)
             return {"ok": False, "error": f"{', '.join(foreign)} do(es) not appear in the quote. Write the steps with the quote's own "
                                           "names (e.g. calib_data->par_t1, uncomp_temp) and bind them to recorded layouts/formulas "
-                                          "with inputs={...}: a value the quote uses must be the value it means, not a similar raw one."}
+                                          "with inputs={...}: a value the quote uses must be the value it means, not a similar raw one."
+                                          + (f" Names in this quote: {', '.join(names)}." if names else "")}
         if missing_consts:
             return {"ok": False, "error": f"constant(s) {', '.join(sorted(set(missing_consts)))} are not in the quote. Quote the "
                                           "text that states the formula (the datasheet, or the manufacturer's reference code)."}

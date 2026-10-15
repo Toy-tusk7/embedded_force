@@ -53,8 +53,8 @@ def digest(name: str, args: Dict[str, Any], result: Any) -> str:
         s = r.get("sequence") or {}
         return (f"record_sequence -> {s.get('id')} {s.get('subject')}.{s.get('name')} in {s.get('entry')}() ({len(s.get('steps') or [])} steps)"
                 if r.get("ok") else f"record_sequence REJECTED: {str(r.get('error'))[:140]}")
-    if name in ("record_facts", "record_registers", "record_layouts"):
-        rec = [str(x).split(":")[0] for x in (r.get("recorded") or [])] + [str(x).split(":")[0] for x in (r.get("bursts") or [])]
+    if name in ("record_facts", "record_registers", "record_layouts") or (name == "record_formula" and "recorded" in r):
+        rec =[str(x).split(":")[0] for x in (r.get("recorded") or [])] + [str(x).split(":")[0] for x in (r.get("bursts") or [])]
         rej = r.get("rejected") or []
         return (f"{name} -> {', '.join(rec[:14]) or 'none'}" + (f" (+{len(rec) - 14})" if len(rec) > 14 else "")
                 + (f"; {len(rej)} rejected, e.g. {rej[0].get('item') or rej[0].get('register') or rej[0].get('layout') or rej[0].get('burst')}: "

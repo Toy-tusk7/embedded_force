@@ -181,6 +181,38 @@ def anchor_pieces(quote: str, text: str) -> Optional[List[Tuple[int, int]]]:
     return place(0, 0, len(ix.s))
 
 
+def quote_mismatch(quote: str, text: str) -> str:
+    """For a quote that is not verbatim in the text: where it departs from the source and what the source says there,
+    so the model can fix that one spot instead of guessing again ('' when no useful part of it matches)."""
+    ix = _index(text)
+    for piece in GAP.split(unescape_literals(quote)):
+        q, qmap = _squash_map(piece)
+        if len(q) < GAP_MIN_PIECE or ix.s.find(q) >= 0:
+            continue
+        lo, hi = 0, len(q)                 # longest start of this piece that the source contains
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if ix.s.find(q[:mid]) >= 0:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo < 12:
+            return f"Its start {piece.strip()[:60]!r} is not in the source."
+        pos = ix.s.find(q[:lo])
+        sp = ix.span(pos, pos + lo)
+        if sp is None:
+            return ""
+        start = max(sp[0], sp[1] - 50)
+        if start > sp[0]:                  # from a word's start, not mid-word
+            start += len(re.match(r"\S*", text[start:sp[1]]).group())
+        said = re.sub(r"\s+", " ", text[start:sp[1]]).strip()
+        source_next = re.sub(r"\s+", " ", text[sp[1]:sp[1] + 90]).strip()
+        quote_next = re.sub(r"\s+", " ", piece[qmap[lo]:qmap[lo] + 60]).strip()
+        return (f"It matches the source up to {said!r}; then the quote has {quote_next!r} "
+                f"where the source has {source_next!r}. Copy that part exactly, or write … where you leave text out.")
+    return ""
+
+
 _UNIT_NAMES = {"s": "s", "sec": "s", "second": "s", "seconds": "s", "ms": "ms", "msec": "ms", "millisecond": "ms",
                "milliseconds": "ms", "us": "us", "µs": "us", "μs": "us", "usec": "us", "microsecond": "us", "microseconds": "us",
                "ns": "ns", "nanoseconds": "ns", "hz": "Hz", "khz": "kHz", "mhz": "MHz", "v": "V", "mv": "mV", "a": "A", "ma": "mA",

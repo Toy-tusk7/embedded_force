@@ -121,10 +121,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "or earlier formulas; `inputs` binds the quote's own names to them ({'uncomp_temp': 'UT'}); operators + - * / ^ "
         "(power) // (C integer division) >> << & | and pow/sqrt/exp/log/abs; C casts and struct prefixes (calib->par_t1) are "
         "ignored. Every constant must be in the quote. PDF text loses fraction bars and superscripts: 'X = NVM_X' followed by "
-        "'2−8' means X = NVM_X / 2^-8, and '230' is 2^30. verify runs the code on random register bytes and requires it to "
-        "compute exactly this value.",
-        {"device": S, "source_id": S, "name": S, "steps": _arr(), "quote": S, "unit": S, "inputs": {"type": "object"}},
-        ["device", "source_id", "name", "steps", "quote"]),
+        "'2−8' means X = NVM_X / 2^-8, and '230' is 2^30. A number the quoted code sets (temp_var = 0.00390625f;) may be "
+        "used directly. Several at once: formulas=[{name, steps, quote, inputs?, unit?}, ...] (recorded in order). verify "
+        "runs the code on random register bytes and requires it to compute exactly this value.",
+        {"device": S, "source_id": S, "name": S, "steps": _arr(), "quote": S, "unit": S, "inputs": {"type": "object"},
+         "formulas": _arr({"type": "object"})},
+        ["device", "source_id"]),
     _fn("record_sequence",
         "Record an ORDER/TIMING rule from a datasheet (power-up, soft reset, init, measurement start) so verify checks "
         "that the code follows it. Each step cites FACT ids you already recorded — never type values: "
@@ -1050,8 +1052,27 @@ class ToolBelt:
                 return s.id
         return None
 
-    def record_formula(self, device: str, source_id: str, name: str, steps: Any, quote: str, unit: str = "",
-                       inputs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def record_formula(self, device: str, source_id: str = "", name: str = "", steps: Any = None, quote: str = "", unit: str = "",
+                       inputs: Optional[Dict[str, str]] = None, formulas: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        if isinstance(formulas, list) and formulas and not steps:
+            # several in one call, in order (a later one may use an earlier one); device and source_id are defaults
+            recorded: List[str] = []
+            rejected: List[Dict[str, Any]] = []
+            for item in formulas[:20]:
+                item = item if isinstance(item, dict) else {}
+                res = self.record_formula(str(item.get("device") or device), str(item.get("source_id") or source_id),
+                                          str(item.get("name") or ""), item.get("steps"), str(item.get("quote") or ""),
+                                          str(item.get("unit") or ""), item.get("inputs") if isinstance(item.get("inputs"), dict) else None)
+                if res.get("ok"):
+                    recorded.append(res["formula"])
+                else:
+                    rejected.append({"item": item.get("name") or "?", "error": str(res.get("error"))[:500],
+                                     **{k: res[k] for k in ("candidate_quotes", "where_defined", "hint") if res.get(k)}})
+            out: Dict[str, Any] = {"ok": bool(recorded), "recorded": recorded}
+            if rejected:
+                out["rejected"] = rejected
+                out["note"] = "Recorded formulas are kept; resend only the rejected ones."
+            return out
         res = self._register_book().record_formula(self.store, device, self._sid(source_id), name, steps, quote, unit,
                                                    inputs if isinstance(inputs, dict) else None)
         if not res.get("ok") and "not verbatim" in str(res.get("error")):
@@ -1082,8 +1103,9 @@ class ToolBelt:
                     found.append({"name": n, "source_id": sid, "passage": passage})
             if found:
                 res["where_defined"] = found
-                res["hint"] = ("These names are assigned in the stored sources shown: record each as its own record_formula "
-                               "from that passage first (quote it exactly), then this formula.")
+                res["hint"] = ("These names are assigned in the stored sources shown. A number the code sets there "
+                               "(temp_var = 0.00390625f;) needs no formula of its own: quote that line with this formula. A "
+                               "computed value is its own record_formula first (quote its passage exactly), then this formula.")
         src = self.store.get(self._sid(source_id))
         if not res.get("ok") and src is not None and re.search(r"not verbatim|not in the quote", str(res.get("error"))):
             # the passage the formula comes from, so the model can quote it exactly instead of retyping it

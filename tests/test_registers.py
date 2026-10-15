@@ -341,8 +341,44 @@ def test_formulas_need_their_constants_and_inputs_on_record(tmp_path):
     assert "2^-6" in book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-6"], fq)["error"]
     assert "unknown name" in book.record_formula(store, "BMPX", src.id, "PAR_T2", ["PAR_T2 = NVM_PAR_T2 / 2^30"], fq)["error"]
     assert "not verbatim" in book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-8"], "PAR_T1 = NVM_PAR_T1 / 256 exactly")["error"]
+    # a quote that skips a line says where it departs from the source and what the source has there
+    err = book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = NVM_PAR_T1 / 2^-8"],
+                              "Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T3 = NVM_PAR_T3 / 2^48")["error"]
+    assert "up to 'Coefficients: PAR_T1 = NVM_PAR_T1 / 2^-8 and PAR_T'" in err and "the source has '2 = NVM_PAR_T2" in err
+    assert "write … where you leave text out" in err, err
     ok = book.record_formula(store, "BMPX", src.id, "PAR_T1", ["PAR_T1 = (float)calib->nvm_par_t1 / 2^-8;"], fq)
     assert ok["ok"] and "nvm_par_t1 / 2**-8" in ok["formula"], ok
+
+
+BMP3_C = """static void parse_calib_data(const uint8_t *reg_data, struct bmp3_calib_data *calib_data)
+{
+    double temp_var;
+
+    /* 1 / 2^8 */
+    temp_var = 0.00390625f;
+    reg_calib_data->par_t1 = BMP3_CONCAT_BYTES(reg_data[1], reg_data[0]);
+    quantized_calib_data->par_t1 = ((double)reg_calib_data->par_t1 / temp_var);
+    reg_calib_data->par_t2 = BMP3_CONCAT_BYTES(reg_data[3], reg_data[2]);
+    temp_var = 1073741824.0f;
+    quantized_calib_data->par_t2 = ((double)reg_calib_data->par_t2 / temp_var);
+"""
+
+
+def test_a_constant_the_quoted_code_sets_needs_no_step_of_its_own(tmp_path):
+    p, store, ledger, src, book = _book(tmp_path)
+    assert book.record_layouts(store, "BMPX", src.id, LAYOUTS[:1])["ok"]
+    code = store.add("https://github.com/boschsensortec/BMP3_SensorAPI/blob/master/bmp3.c", "bmp3.c", BMP3_C)
+    one = BMP3_C[BMP3_C.index("/* 1 / 2^8"):BMP3_C.index("reg_calib_data->par_t2")]
+    res = book.record_formula(store, "BMPX", code.id, "PAR_T1", ["par_t1 = reg_calib_data->par_t1 / temp_var"], one,
+                              inputs={"reg_calib_data->par_t1": "NVM_PAR_T1"})
+    assert res["ok"] and "temp_var = 0.00390625; par_t1 = NVM_PAR_T1 / temp_var" in res["formula"], res
+    # a quote that sets temp_var to two values does not say which one a step means
+    both = BMP3_C[BMP3_C.index("/* 1 / 2^8"):]
+    res = book.record_formula(store, "BMPX", code.id, "PAR_T1B", ["par_t1 = reg_calib_data->par_t1 / temp_var"], both,
+                              inputs={"reg_calib_data->par_t1": "NVM_PAR_T1"})
+    assert not res["ok"] and "unknown name(s) temp_var" in res["error"], res
+    res = book.record_formula(store, "BMPX", code.id, "PAR_T1C", ["t1 = reg_par_t1 / temp_var"], one, inputs={"reg_par_t1": "NVM_PAR_T1"})
+    assert "Names in this quote: temp_var, reg_calib_data->par_t1, reg_data, quantized_calib_data->par_t1." in res["error"], res
 
 
 def test_formula_must_compute_what_the_quote_states(tmp_path):
@@ -572,6 +608,24 @@ def test_formula_cannot_swap_a_converted_coefficient_for_the_raw_register(tmp_pa
     raw = book.record_formula(store, "BMPX", src.id, "PAR_T1", ["temp = reg_calib_data->par_t1 / 0.00390625"],
                               "par_t1 = (double)reg_calib_data->par_t1 / 0.00390625;", inputs={"reg_calib_data->par_t1": "NVM_PAR_T1"})
     assert raw["ok"], raw
+
+
+def test_several_formulas_in_one_call(tmp_path):
+    from embedforge.agent.context import digest
+    p = Project("r6", tmp_path / "r6")
+    store = SourceStore(p.root)
+    store.add("https://www.bosch-sensortec.com/x.pdf", "datasheet", DS, kind="pdf")
+    code = store.add("https://github.com/boschsensortec/BMP3_SensorAPI/blob/master/bmp3.c", "bmp3.c", BMP3_C)
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    assert belt.call("record_layouts", {"device": "BMPX", "source_id": "SRC-001", "layouts": LAYOUTS})["ok"]
+    t1 = BMP3_C[BMP3_C.index("/* 1 / 2^8"):BMP3_C.index("reg_calib_data->par_t2")]
+    t2 = BMP3_C[BMP3_C.index("temp_var = 1073741824"):]
+    res = belt.call("record_formula", {"device": "BMPX", "source_id": code.id, "formulas": [
+        {"name": "PAR_T1", "steps": ["par_t1 = reg_calib_data->par_t1 / temp_var"], "quote": t1, "inputs": {"reg_calib_data->par_t1": "NVM_PAR_T1"}},
+        {"name": "PAR_T2", "steps": ["par_t2 = reg_calib_data->par_t2 / temp_var"], "quote": t2, "inputs": {"reg_calib_data->par_t2": "NVM_PAR_T9"}}]})
+    assert res["ok"] and res["recorded"][0].startswith("FRM-001 PAR_T1:") and res["rejected"][0]["item"] == "PAR_T2", res
+    assert "resend only the rejected" in res["note"]
+    assert digest("record_formula", {}, res).startswith("record_formula -> FRM-001 PAR_T1; 1 rejected, e.g. PAR_T2")
 
 
 def test_formula_quoted_from_another_stored_source_is_recorded_with_it(tmp_path):
