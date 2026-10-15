@@ -326,7 +326,9 @@ def test_record_sequence_only_accepts_facts_and_verbatim_order(tmp_path):
     assert not bad_fact["ok"] and "FACT-999" in bad_fact["error"]
     bad_quote = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "write", "reg": f["cmd"]}], src.id, "reset first, then wait 5 ms")
     assert not bad_quote["ok"] and "verbatim" in bad_quote["error"]
-    no_unit = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "delay_min", "value": f["len"]}], src.id, DATASHEET[:60])
+    retyped = book.record(ledger, "BMP", "init", "bmp_init", [{"op": "write", "reg": f["cmd"]}], src.id, DATASHEET[:40] + " and then more")
+    assert "It matches the source up to " in retyped["error"] and "then the quote has 'and then more'" in retyped["error"], retyped
+    no_unit =book.record(ledger, "BMP", "init", "bmp_init", [{"op": "delay_min", "value": f["len"]}], src.id, DATASHEET[:60])
     assert not no_unit["ok"] and "time unit" in no_unit["error"]
     first = _record(p, ledger, src, f)
     again = _record(p, ledger, src, f)

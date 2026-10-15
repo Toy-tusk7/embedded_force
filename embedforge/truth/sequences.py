@@ -250,7 +250,10 @@ class SequenceBook:
         if src is None:
             problems.append(f"source_id {source_id!r} is not a stored source")
         elif len(_squash(order_quote)) < 12 or not verbatim(order_quote, src.text):
-            problems.append("order_quote must be a verbatim passage (12+ chars) of that source stating the order/timing")
+            from embedforge.truth.ledger import quote_mismatch
+            where = quote_mismatch(order_quote, src.text) if len(_squash(order_quote)) >= 12 else ""
+            problems.append("order_quote must be a verbatim passage (12+ chars) of that source stating the order/timing"
+                            + (f". {where}" if where else ""))
         if problems:
             return {"ok": False, "error": "; ".join(problems[:8])}
         with self._lock:
