@@ -36,6 +36,8 @@ class ScriptedLLM:
     def chat(self, messages, tools=None, **_):
         self.seen.append(messages)
         turn = self.turns.pop(0) if self.turns else "done"
+        if isinstance(turn, Exception):   # the provider failing
+            raise turn
         if isinstance(turn, dict):  # a full response (e.g. finish_reason='length')
             return {"content": "", "reasoning": "", "tool_calls": [], "finish_reason": "stop", "usage": {}, **turn}
         if isinstance(turn, str):
@@ -93,6 +95,34 @@ def test_step_budget_ends_a_run_that_stopped_making_progress(project, monkeypatc
     session = _run(project, turns, monkeypatch)
     assert any(f"Step budget ({loop_mod.STALL_NUDGE_STEPS + 2}) used up" in str(e.get("message")) for e in _events(session, "error"))
     assert not any("extended" in str(e.get("text")) for e in _events(session, "status"))
+
+
+def _run_end(project: Project) -> Dict[str, Any]:
+    events = [json.loads(line) for line in (project.root / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    return [e for e in events if e.get("event") == "run_end"][-1], events
+
+
+def test_a_provider_outage_retries_with_a_shorter_context(project, monkeypatch):
+    from embedforge.agent.llm import LLMError
+    turns = [[_call(i, "read_file", {"path": f"src/missing{i}.c"})] for i in range(4)]
+    turns += [LLMError("LLM unavailable after 6 attempts: HTTP 500: Internal server error", transient=True), "done"]
+    session = _run(project, turns, monkeypatch)
+    assert any("retrying with a shorter context" in str(e.get("text")) for e in _events(session, "status"))
+    end, events = _run_end(project)
+    short = next(e for e in events if e.get("event") == "context_shortened")
+    assert short["verbatim_turns"] == 5 and 0 < short["budget"] < short["ctx_chars"]
+    assert end["status"] != "failed" and not _events(session, "error")
+    assert session.llm.seen[-1] is not session.llm.seen[-2] and session.llm.seen[-1][0] == session.llm.seen[-2][0]
+
+
+def test_a_provider_that_stays_down_pauses_the_run_instead_of_failing_it(project, monkeypatch):
+    from embedforge.agent.llm import LLMError
+    down = LLMError("LLM unavailable after 6 attempts: HTTP 500: Internal server error", transient=True)
+    session = _run(project, [[_call(0, "read_file", {"path": "src/a.c"})], down, down], monkeypatch)
+    assert _run_end(project)[0]["status"] == "needs_input"
+    assert "send 'continue' to resume" in _events(session, "error")[-1]["message"]
+    session = _run(project, [LLMError("HTTP 401: key rejected")], monkeypatch, message="continue")
+    assert _run_end(project)[0]["status"] == "failed"   # a rejected key is not retried
 
 
 def test_progress_resets_research_budget(project, monkeypatch):

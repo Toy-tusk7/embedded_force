@@ -17,7 +17,11 @@ from embedforge.core.logger import logger
 
 
 class LLMError(RuntimeError):
-    pass
+    """`transient`: the provider failed on its side (5xx, rate limit, unreachable), so the request may work later."""
+
+    def __init__(self, message: str, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
 
 
 @dataclass(frozen=True)
@@ -200,7 +204,7 @@ class AgentLLM:
 
     def chat(
         self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None,
-        temperature: Optional[float] = None, max_tokens: Optional[int] = None, retries: int = 4,
+        temperature: Optional[float] = None, max_tokens: Optional[int] = None, retries: int = 6,
     ) -> Dict[str, Any]:
         if not self.api_key:
             raise LLMError(f"{self.provider.name} API key is not configured; the agent cannot reason without an LLM.")
@@ -221,13 +225,24 @@ class AgentLLM:
             payload["chat_template_kwargs"] = template
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last: Optional[str] = None
+
+        def wait(attempt: int, r: Any = None) -> None:
+            # the provider's Retry-After, else 2, 4, 8, 16, 32 s: a hosted endpoint's outage often lasts a minute or two
+            if attempt == retries - 1:
+                return
+            try:
+                after = float((getattr(r, "headers", None) or {}).get("retry-after") or 0)
+            except ValueError:
+                after = 0.0
+            time.sleep(min(after, 60.0) if after > 0 else min(2 ** attempt * 2.0, 45.0))
+
         for attempt in range(retries):
             try:
                 with httpx.Client(timeout=180.0) as c:
                     r = c.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
                 if r.status_code in (429, 500, 502, 503, 504):
                     last = f"HTTP {r.status_code}: {r.text[:200]}"
-                    time.sleep(min(2 ** attempt * 1.5, 20))
+                    wait(attempt, r)
                     continue
                 if r.status_code == 400 and "max_tokens" in r.text and payload["max_tokens"] > 8192:
                     self._max_tokens_cap = payload["max_tokens"] = 8192  # provider limit: remember it for this model
@@ -267,9 +282,9 @@ class AgentLLM:
                 }
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 last = str(e)
-                time.sleep(min(2 ** attempt * 1.5, 20))
+                wait(attempt)
         logger.log_event("LLM_ERROR", f"gave up after {retries} attempts: {last}")
-        raise LLMError(f"LLM unavailable after {retries} attempts: {last}")
+        raise LLMError(f"LLM unavailable after {retries} attempts: {last}", transient=True)
 
 
     # ------------------------------------------------------------------ Claude (Messages API)
@@ -308,11 +323,11 @@ class AgentLLM:
         except anthropic.BadRequestError as e:
             raise LLMError(f"Claude API rejected the request ({self.model}): {e.message}")
         except anthropic.RateLimitError as e:
-            raise LLMError(f"Claude API rate limit (after retries): {e.message}")
+            raise LLMError(f"Claude API rate limit (after retries): {e.message}", transient=True)
         except anthropic.APIStatusError as e:
-            raise LLMError(f"Claude API error HTTP {e.status_code}: {e.message}")
+            raise LLMError(f"Claude API error HTTP {e.status_code}: {e.message}", transient=e.status_code >= 500)
         except anthropic.APIConnectionError as e:
-            raise LLMError(f"Claude API unreachable: {e}")
+            raise LLMError(f"Claude API unreachable: {e}", transient=True)
         return from_anthropic_message(msg)
 
 

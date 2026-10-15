@@ -82,6 +82,25 @@ def test_the_nvidia_api_gets_its_own_model_id(monkeypatch):
     assert a.template_kwargs()["enable_thinking"] is True and a.sampling() == {"temperature": 1.0, "top_p": 0.95}
 
 
+def test_server_errors_are_retried_with_backoff_and_reported_as_transient(monkeypatch):
+    waits, sent = [], []
+    monkeypatch.setattr(llm.time, "sleep", waits.append)
+    monkeypatch.setattr(llm.httpx, "Client", _client([(500, "Internal server error"), (503, "busy"), (200, OK)], sent))
+    a = AgentLLM("nvidia/nemotron-3-ultra-550b-a55b", "nvidia")
+    assert a.chat([{"role": "user", "content": "go"}])["content"] == "done"
+    assert waits == [2.0, 4.0] and len(sent) == 3
+    waits.clear()
+    monkeypatch.setattr(llm.httpx, "Client", _client([(500, "Internal server error")] * 6, sent))
+    with pytest.raises(llm.LLMError) as e:
+        a.chat([{"role": "user", "content": "go"}])
+    assert e.value.transient and "after 6 attempts: HTTP 500" in str(e.value)
+    assert waits == [2.0, 4.0, 8.0, 16.0, 32.0]   # about a minute of waiting, none after the last attempt
+    monkeypatch.setattr(llm.httpx, "Client", _client([(401, "Unauthorized")], sent))
+    with pytest.raises(llm.LLMError) as e:
+        a.chat([{"role": "user", "content": "go"}])
+    assert not e.value.transient
+
+
 def test_other_models_get_no_template_options(monkeypatch):
     sent = []
     monkeypatch.setattr(llm.httpx, "Client", _client([(200, OK)], sent))

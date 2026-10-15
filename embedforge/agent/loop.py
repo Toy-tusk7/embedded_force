@@ -309,6 +309,9 @@ class AgentRunner:
 
             s.emit("status", text="Agent started", model=self.llm.model, provider=self.llm.provider.id)
             budget, extensions, step = config.agent_max_steps, 0, -1
+            # context size; shortened for the rest of the run if the provider keeps failing (some hosted endpoints answer
+            # a long request with HTTP 500 instead of rejecting it)
+            ctx_budget, verbatim, shortened = ctx.CONTEXT_BUDGET_CHARS, ctx.VERBATIM_TURNS, False
 
             def can_extend() -> bool:   # still moving (a recent fact, edit or build), or one call from done
                 return extensions < MAX_STEP_EXTENSIONS and (guard.steps_since_progress < STALL_NUDGE_STEPS or nxt.startswith("finish"))
@@ -339,14 +342,31 @@ class AgentRunner:
                 meta = project.meta()
                 state_text, nxt = ctx.state_block(project, ledger, belt, history)
                 messages = [{"role": "system", "content": get_active_prompt_text(meta.get("kind") or "") + "\n\n" + state_text}]
-                messages += ctx.build_context(history)
+                messages += ctx.build_context(history, ctx_budget, verbatim)
                 ctx_chars = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or [])) for m in messages)
                 t0 = time.time()
                 try:
-                    resp = self.llm.chat(messages, tools_for(meta))
+                    try:
+                        resp = self.llm.chat(messages, tools_for(meta))
+                    except LLMError as e:
+                        if not e.transient or shortened:
+                            raise
+                        shortened = True
+                        ctx_budget = int((ctx_chars - len(messages[0]["content"])) * 0.6)
+                        verbatim = max(3, verbatim // 2)
+                        s.emit("status", text=f"The model provider kept failing ({str(e)[:120]}) — retrying with a shorter context")
+                        project.trace({"event": "context_shortened", "error": str(e)[:300], "ctx_chars": ctx_chars,
+                                       "budget": ctx_budget, "verbatim_turns": verbatim})
+                        messages = messages[:1] + ctx.build_context(history, ctx_budget, verbatim)
+                        resp = self.llm.chat(messages, tools_for(meta), retries=2)
                 except LLMError as e:
-                    s.emit("error", message=str(e))
-                    status = "failed"
+                    if e.transient:   # the provider's side: nothing is lost, the next message resumes the run
+                        s.emit("error", message=f"The model provider ({self.llm.provider.name}) is not answering: {e}. "
+                                                f"Everything so far is saved; send 'continue' to resume. Next step: {nxt}")
+                        status = "needs_input"
+                    else:
+                        s.emit("error", message=str(e))
+                        status = "failed"
                     break
                 dt = round(time.time() - t0, 1)
                 if resp["reasoning"]:
