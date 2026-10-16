@@ -334,6 +334,8 @@ class ToolBelt:
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
         from embedforge.truth.outline import ReadLog
         self.reads = ReadLog(project.root)   # what of each source the agent has been shown (kept across runs)
+        if not self.reads.path.exists() and (project.root / "conversation.json").exists():
+            self.reads.seed(project.load_conversation())   # a project from before read tracking
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
         meta = project.meta()
         lb, lv = meta.get("last_build") or {}, meta.get("last_verify") or {}
@@ -801,6 +803,23 @@ class ToolBelt:
             res["next"] = ("Each `requirements` line is a rule the datasheet states: record the ones your code depends on "
                            "(record_fact for values and times, record_sequence for orders), quoting the text exactly.")
         return res
+
+    def _compiler_findings(self) -> List[Any]:
+        """GCC's warnings from the build of the current sources: the bug classes (uninitialized use, array bounds, shift
+        overflow, missing return, format mismatch...) are errors, the rest warnings."""
+        from embedforge.truth.verifier import Finding
+        lb = self.project.meta().get("last_build") or {}
+        if lb.get("hash") != self.source_hash():
+            return []
+        out = []
+        for w in lb.get("warnings") or []:
+            msg = str(w.get("message") or "")
+            bug = bool(pio.BUG_WARNINGS.search(msg))
+            out.append(Finding("ERROR" if bug else "WARNING", "COMPILER_WARNING", str(w.get("file") or ""), int(w.get("line") or 0),
+                               f"GCC: {msg}", suggestion=("This warning class marks code that can misbehave at run time: fix "
+                                                          "the code it points at." if bug else
+                                                          "Clean it up, or explain in a comment why it is intended.")))
+        return out
 
     def _code_uses(self, rep: Any) -> Dict[str, str]:
         """What the code does, as the datasheet topics it makes required reading (from verify's view of the code and
@@ -1551,10 +1570,14 @@ class ToolBelt:
                                    "then build.")
             else:
                 out["log_tail"] = "\n".join((out.get("log_tail") or "").splitlines()[-25:])
+        own = ("src/", "include/", "lib/")
         self.project.update_meta(last_build={
             "hash": h, "ok": res.ok, "source_errors": bool(out["diagnostics"]),
             "diagnostics": [f"{d.get('file')}:{d.get('line')}: {str(d.get('message'))[:160]}" for d in out["diagnostics"][:5]]
                            or ([out.get("error")] if out.get("error") else []),
+            # the compiler's warnings on the project's own files, for verify (it judges the build of the current sources)
+            "warnings": [{"file": d.file, "line": d.line, "message": d.message[:300]} for d in res.diagnostics
+                         if d.severity == "warning" and d.file.replace("\\", "/").lstrip("./").startswith(own)][:60],
         })
         if res.ok and res.artifacts:
             meta = self.project.meta()
@@ -1607,6 +1630,7 @@ class ToolBelt:
                                     "config); e.g. motors are MOTOR1_PIN..MOTOR8_PIN, gyros USE_ACCGYRO_<CHIP> or USE_GYRO_SPI_<CHIP>.")))
             rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
         rep.findings += self._unread_sections(rep)
+        rep.findings += self._compiler_findings()
         rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
         h = self.source_hash()
         inputs = self.verify_inputs_hash()

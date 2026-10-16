@@ -87,8 +87,9 @@ def _record(p, ledger, src, f, entry="bmp_init", steps=None):
 
 def _flow_codes(p, ledger):
     rep = verify_project(p.root, ledger)
-    # these tests are about order and timing; register meaning (and the rule that it must be recorded) is test_registers.py
-    rep.findings = [x for x in rep.findings if x.code != "REG_MAP_MISSING"]
+    # these tests are about order and timing; register meaning (and the rule that it must be recorded) is test_registers.py,
+    # unchecked statuses and unbounded waits are test_robust.py
+    rep.findings = [x for x in rep.findings if x.code not in ("REG_MAP_MISSING", "RESULT_IGNORED", "UNBOUNDED_WAIT")]
     rep.passed = not any(x.severity == "ERROR" for x in rep.findings)
     return rep, sorted({x.code for x in rep.findings if x.code.startswith("FLOW")})
 
@@ -335,10 +336,18 @@ def test_record_sequence_only_accepts_facts_and_verbatim_order(tmp_path):
     assert first["ok"] and again.get("replaced") and again["sequence"]["id"] == first["sequence"]["id"]
 
 
+# GOOD with every status checked (the whole agent verify judges robustness too); same line numbers
+GOOD_CHECKED = (GOOD.replace("    i2c_write_blocking(i2c0, ADDR, &reg, 1, true);", "    if (i2c_write_blocking(i2c0, ADDR, &reg, 1, true) != 1) return -1;")
+                .replace("    write_reg(REG_CMD, CMD_SOFTRESET);", "    if (write_reg(REG_CMD, CMD_SOFTRESET) < 0) return false;")
+                .replace("    read_regs(REG_CALIB, calib, sizeof(calib));", "    if (read_regs(REG_CALIB, calib, sizeof(calib)) < 0) return false;")
+                .replace("    write_reg(REG_PWR_CTRL, PWR_NORMAL);", "    if (write_reg(REG_PWR_CTRL, PWR_NORMAL) < 0) return false;")
+                .replace("int main(void) { bmp_init(); return 0; }", "int main(void) { return bmp_init() ? 0 : 1; }"))
+
+
 def test_record_sequence_tool_and_stale_verify_after_new_facts(tmp_path, monkeypatch):
     from embedforge.toolchain import pio
     from embedforge.toolchain.pio import BuildResult
-    p, store, ledger, src, f = _project(tmp_path)
+    p, store, ledger, src, f = _project(tmp_path, GOOD_CHECKED)
     belt = ToolBelt(p, RunSession("r", p.id), store, ledger)
     res = belt.call("record_sequence", {"subject": "BMP", "name": "power_on_init", "entry": "bmp_init", "device": f["addr"],
                                         "source_id": "SRC001", "order_quote": "issue a soft reset, wait for the start-up time",

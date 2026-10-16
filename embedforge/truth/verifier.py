@@ -346,12 +346,20 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False, ch
 
     if pico:
         report.findings += _pin_capability(project_dir, file_lines, chip)
-    for path, parts_list in file_lines.items():
-        rel = str(path.relative_to(project_dir)).replace("\\", "/")
-        for line, call, msg in pinmod.unchecked_reads(rel, [p["code"] for p in parts_list]):
-            report.findings.append(Finding("ERROR", "BUS_READ_UNCHECKED", rel, line, msg,
-                                           suggestion=f"Check what {call}() returns (the byte count or status) and return an "
-                                                      "error when the transfer failed, before using the buffer."))
+    from embedforge.truth import robust
+    texts = {str(path.relative_to(project_dir)).replace("\\", "/"): [p["code"] for p in parts_list]
+             for path, parts_list in file_lines.items()}
+    for rel, lines in texts.items():
+        for line, msg in robust.unbounded_waits(lines):
+            report.findings.append(Finding("ERROR", "UNBOUNDED_WAIT", rel, line, msg,
+                                           suggestion="Bound the wait: a timeout (uint32_t t0 = millis(); while (!ready && "
+                                                      "millis() - t0 < 100) {...}) or a retry limit, then handle the timeout "
+                                                      "(return an error, or continue without the device)."))
+    for rel, line, call, msg in robust.ignored_results(texts):
+        report.findings.append(Finding("ERROR", "RESULT_IGNORED", rel, line, msg,
+                                       suggestion=f"Check what {call}() returns and handle the failure (return an error, retry "
+                                                  "a bounded number of times); write (void){call}(...) only where ignoring it "
+                                                  "is safe (MISRA C:2012 Rule 17.7)."))
 
     for a, b in ledger.conflicts():
         if a.id in used_facts or b.id in used_facts:

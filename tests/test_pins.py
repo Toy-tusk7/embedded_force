@@ -104,7 +104,9 @@ def test_the_gpio_function_rule_matches_the_rp2350_pin_tables():
     ("size_t got = Wire.requestFrom(0x76, 6);\n    if (got != 6) return false;", False),
     ("return i2c_read_blocking(i2c0, 0x76, b, 6, false) == 6;", False),
     ("i2c_read_blocking(i2c0, 0x76, b, 6, false);", True),
+    ("(void)i2c_read_blocking(i2c0, 0x76, b, 6, false);", False),
 ])
 def test_a_bus_read_must_check_its_result(read, flagged):
-    lines = ("bool rd(uint8_t *b) {\n    int n = 0;\n    " + read + "\n    return true;\n}\n").split("\n")
-    assert bool(pins.unchecked_reads("src/x.cpp", lines)) == flagged
+    from embedforge.truth import robust
+    lines = ("void rd(uint8_t *b) {\n    int n = 0;\n    " + read + "\n}\n").split("\n")
+    assert bool(robust.ignored_results({"src/x.cpp": lines})) == flagged

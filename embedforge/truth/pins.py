@@ -1,9 +1,7 @@
 """Pins the code passes to calls (Wire.setSDA(16), pinMode(LED_PIN, OUTPUT), gpio_init(25)) are wiring claims, like a
 `#define X_PIN`: verify traces each to a schematic fact, checks the function the call gives the pin (SDA, SCL, SCK, TX,
 RX, CS) against the role the fact records, and on RP2040/RP2350 checks that the peripheral instance can reach that GPIO
-(an I2C0 SDA must sit on a GPIO with number % 4 == 0; the chip silently routes nothing otherwise).
-
-Also: a bus read whose result is never looked at (a failed transfer then delivers stale buffer bytes as data)."""
+(an I2C0 SDA must sit on a GPIO with number % 4 == 0; the chip silently routes nothing otherwise)."""
 
 import re
 from typing import Dict, List, Optional, Tuple
@@ -26,13 +24,6 @@ _ROLE_WORDS = {"SDA": "SDA", "SCL": "SCL", "SCK": "SCK", "SCLK": "SCK", "CLK": "
 
 # Arduino-Pico (earlephilhower) objects -> RP2040/RP2350 peripheral instance
 INSTANCES = {"I2C": {"Wire": 0, "Wire1": 1}, "SPI": {"SPI": 0, "SPI1": 1}, "UART": {"Serial1": 0, "Serial2": 1}}
-
-# bus reads that return a status or a byte count (ESP-IDF's i2c_master_read only queues a command: its result comes
-# from i2c_master_cmd_begin)
-_READ_CALLS = ("requestFrom", "i2c_read_blocking", "i2c_read_timeout_us", "i2c_read_blocking_until", "HAL_I2C_Mem_Read",
-               "HAL_I2C_Master_Receive", "i2c_master_read_from_device", "i2c_master_write_read_device",
-               "i2c_master_transmit_receive", "i2c_master_receive", "i2c_burst_read_dt", "i2c_read_dt", "i2c_write_read_dt")
-_READ_RE = re.compile(r"(?:\b[A-Za-z_]\w*\s*(?:\.|->)\s*)?\b(" + "|".join(_READ_CALLS) + r")\s*\(")
 
 
 def role_of(name: str) -> str:
@@ -101,41 +92,3 @@ def rp_function(fam: str, gpio: int, rp2350: bool) -> Optional[Tuple[int, str]]:
 
 def legal_pins(fam: str, inst: int, role: str, rp2350: bool, max_gpio: int) -> List[int]:
     return [g for g in range(max_gpio + 1) if rp_function(fam, g, rp2350) == (inst, role)]
-
-
-def unchecked_reads(rel: str, lines: List[str]) -> List[Tuple[int, str, str]]:
-    """(line, call, message) for bus reads whose result the code never looks at: the call is a statement of its own and
-    no available() check follows, or its result goes into a variable that is never read."""
-    code = "\n".join(lines)
-    starts = [0]
-    for ln in lines:
-        starts.append(starts[-1] + len(ln) + 1)
-    out = []
-    for m in _READ_RE.finditer(code):
-        line = next(i for i in range(len(starts) - 1) if starts[i] <= m.start() < starts[i + 1]) + 1
-        # the rest of the enclosing block
-        depth, j = 0, m.end()
-        while j < len(code):
-            if code[j] == "{":
-                depth += 1
-            elif code[j] == "}":
-                if depth == 0:
-                    break
-                depth -= 1
-            j += 1
-        _, call_end = _first_arg(code, m.end())
-        while call_end < len(code) and code[call_end] != ")":   # the rest of the argument list
-            _, call_end = _first_arg(code, call_end + 1)
-        rest = code[call_end + 1:j]
-        before = code[starts[line - 1]:m.start()]
-        assigned = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*=\s*(?:\([^()]*\)\s*)?$", before)
-        stmt = re.fullmatch(r"\s*(?:\(void\)\s*)?", before)
-        if assigned and not re.search(r"(==|!=|<=|>=|return|\bif\b|\?)", before):
-            var = assigned.group(1)
-            if not re.search(rf"\b{re.escape(var)}\b", rest):
-                out.append((line, m.group(1), f"{m.group(1)}() puts its result in {var}, which is never read: a failed "
-                                              "transfer is not noticed and the buffer's old bytes are used as data."))
-        elif stmt and not re.search(r"\bavailable\s*\(", rest):
-            out.append((line, m.group(1), f"The result of {m.group(1)}() is ignored: a failed transfer is not noticed and "
-                                          "the buffer's old bytes are used as data."))
-    return out

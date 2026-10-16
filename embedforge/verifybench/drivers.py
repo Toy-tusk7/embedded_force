@@ -2,6 +2,7 @@
 top of a bus layer per framework, and the mutations (bugs) verify has to catch. `@F(key)@` stands for the FACT id the
 ground truth recorded for `key`."""
 
+import re
 from typing import Dict, List, Tuple
 
 CORE = r"""
@@ -321,6 +322,10 @@ CORE_MUTATIONS: List[Tuple[str, str, str, str]] = [
      "    write_reg(DM388_PWR_REG, DM388_PWR_NORMAL);\n    write_reg(DM388_OSR_REG, DM388_OSR_VALUE);\n    write_reg(DM388_ODR_REG, DM388_ODR_VALUE);\n"),
     ("forced_mode", "PWR_CTRL written with forced mode instead of normal mode",
      "write_reg(DM388_PWR_REG, DM388_PWR_NORMAL);", "write_reg(DM388_PWR_REG, DM388_PWR_NORMAL & 0x1F);"),
+    ("read_status_unused", "the data read's status goes into a variable nobody checks",
+     "    read_regs(DM388_DATA_REG, d, DM388_DATA_LEN);\n", "    int rc = read_regs(DM388_DATA_REG, d, DM388_DATA_LEN);\n"),
+    ("unbounded_chip_wait", "waits for the chip to answer with no timeout",
+     "    delay_ms(DM388_STARTUP_MS);\n", "    delay_ms(DM388_STARTUP_MS);\n    while (read_regs(DM388_CHIP_ID_REG, &id, 1) != 0) {\n    }\n"),
     ("burst_split", "data registers read in two transactions",
      "    read_regs(DM388_DATA_REG, d, DM388_DATA_LEN);\n",
      "    read_regs(DM388_DATA_REG, d, 3);\n    read_regs(DM388_DATA_REG + 3, d + 3, 3);\n"),
@@ -571,21 +576,40 @@ MUST_FAIL: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {
 MUST_FAIL_TRUTH: Dict[str, str] = {"conversion_without_formula": "no_formulas"}
 
 
+# Every status the drivers get is checked (MISRA C:2012 Rule 17.7): bare write_reg / read_regs / i2c_write_blocking /
+# dm388_init statements become checked ones. Applied the same way to the drivers and to the bugs planted in them.
+_CHECKS = [
+    (re.compile(r"(?m)^([ \t]*)(read_regs\((?:dev, )?DM388_DATA_REG[^;\n]*\));"), r"\1if (\2 != 0) return NAN;"),
+    (re.compile(r"(?m)^([ \t]*)((?:write_reg|read_regs)\([^;\n]*\));"), r"\1if (\2 != 0) return -3;"),
+    (re.compile(r"(?m)^([ \t]*)(i2c_write_blocking\([^;\n]*\));"), r"\1if (\2 < 0) return -3;"),
+    (re.compile(r"(?m)^([ \t]*)dm388_init\(\);"), r"\1if (dm388_init() != 0) return;"),
+]
+
+
+def _checked(src: str) -> str:
+    for rx, rep in _CHECKS:
+        src = rx.sub(rep, src)
+    return src
+
+
 def driver(framework: str) -> Tuple[str, str]:
     """(file name, source with @F(key)@ placeholders) of the correct driver for a framework or idiom variant."""
     if framework in IDIOMS or framework in MUST_FAIL:
         base, edits = IDIOMS[framework][:2] if framework in IDIOMS else MUST_FAIL[framework]
         name, src = driver(base)
         for old, new in edits:
+            old, new = _checked(old), _checked(new)
             assert old in src, f"{framework}: {old!r} not in the {base} driver"
             src = src.replace(old, new, 1)
         return name, src
     name, bus, entry = FRAMEWORKS[framework]
-    return name, bus + _core_for(framework, CORE) + entry
+    return name, _checked(bus + _core_for(framework, CORE) + entry)
 
 
 # core mutations that are not bugs in a variant: there the changed code still does what the datasheet requires
-HARMLESS = {"freertos_100hz": {"short_delay"}}   # 1 ms rounds up to 2 ticks at 100 Hz: at least 10 ms
+HARMLESS = {"freertos_100hz": {"short_delay"},   # 1 ms rounds up to 2 ticks at 100 Hz: at least 10 ms
+            # an SPI transfer cannot fail there (read_regs always returns 0), so an unused status loses nothing
+            "pico_spi": {"read_status_unused"}, "arduino_spi": {"read_status_unused"}}
 
 
 def mutants(framework: str) -> List[Tuple[str, str, str]]:
@@ -596,6 +620,7 @@ def mutants(framework: str) -> List[Tuple[str, str, str]]:
     out = []
     core_bugs = [(k, w, _core_for(base, o), _core_for(base, n)) for k, w, o, n in CORE_MUTATIONS]
     for key, what, old, new in core_bugs + BUS_MUTATIONS.get(base, []) + own:
+        old, new = _checked(old), _checked(new)
         if key in HARMLESS.get(framework, ()):
             continue
         if old not in src:

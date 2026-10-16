@@ -32,6 +32,19 @@ def core_dir() -> Path:
     return p
 
 
+# The project's own sources (never the framework) are compiled with GCC's bug-finding warnings on: they change no
+# generated code, and verify turns the classes that mark run-time misbehaviour into errors (see BUG_WARNINGS).
+STRICT_WARNINGS = "-Wall -Wextra -Wshadow -Wformat=2 -Wnull-dereference -Wduplicated-cond -Wlogical-op"
+
+# GCC warning classes that mean the program can misbehave when it runs (not style): verify reports them as errors
+BUG_WARNINGS = re.compile(r"\[-W(uninitialized|maybe-uninitialized|array-bounds|stringop-\w+|shift-count-\w+|shift-overflow\S*|"
+                          r"shift-negative-value|overflow|return-type|sequence-point|format\S*|null-dereference|type-limits|"
+                          r"duplicated-cond|logical-op|div-by-zero|int-in-bool-context|tautological-compare|misleading-indentation|"
+                          r"implicit-function-declaration|incompatible-pointer-types|int-conversion|dangling-\w+|return-local-addr|"
+                          r"free-nonheap-object|use-after-free|address|enum-compare|aggressive-loop-optimizations|"
+                          r"restrict|nonnull|bool-compare|sizeof-pointer-\w+|memset-\w+|class-memaccess)\]")
+
+
 def _env() -> Dict[str, str]:
     env = dict(os.environ)
     env["PLATFORMIO_CORE_DIR"] = str(core_dir())
@@ -39,6 +52,7 @@ def _env() -> Dict[str, str]:
     env["PLATFORMIO_NO_ANSI"] = "true"
     env["PLATFORMIO_SETTING_ENABLE_TELEMETRY"] = "no"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PLATFORMIO_BUILD_SRC_FLAGS"] = (env.get("PLATFORMIO_BUILD_SRC_FLAGS", "") + " " + STRICT_WARNINGS).strip()
     return env
 
 

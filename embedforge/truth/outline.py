@@ -141,6 +141,28 @@ class ReadLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(self.spans), encoding="utf-8")
 
+    def seed(self, messages: List[dict]) -> int:
+        """A project from before read tracking: rebuild the log from the read_source results in its saved conversation
+        (each excerpt carries its offset). Returns the number of excerpts found."""
+        calls = {tc.get("id"): tc for m in messages for tc in (m.get("tool_calls") or [])}
+        n = 0
+        for m in messages:
+            tc = calls.get(m.get("tool_call_id"))
+            if m.get("role") != "tool" or not tc or (tc.get("function") or {}).get("name") != "read_source":
+                continue
+            try:
+                res = json.loads(m.get("content") or "{}")
+            except ValueError:
+                continue
+            for e in res.get("excerpts") or []:
+                if isinstance(e, dict) and isinstance(e.get("offset"), int) and res.get("source_id"):
+                    self.add(res["source_id"], e["offset"], e["offset"] + len(str(e.get("text") or "")))
+                    n += 1
+        if not n:   # nothing to rebuild: still mark the log as started so it is not rebuilt again
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.spans), encoding="utf-8")
+        return n
+
     def seen(self, source_id: str, a: int, b: int) -> float:
         """Share of a..b shown so far."""
         if b <= a:
