@@ -341,6 +341,12 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
         lines.append(f"- Register map: {len(regs)} registers (" + ", ".join(f"{r.name} 0x{r.addr:02X}" for r in regs[:16])
                      + f"), {len(book.layouts)} layouts, {len(book.bursts)} burst rules, {len(book.formulas)} formulas"
                      + (" (" + ", ".join(f.name for f in list(book.formulas.values())[:12]) + ")" if book.formulas else ""))
+    unread = []
+    for sid in (belt.state.get("unread") or {}):   # datasheet sections the code depends on (known after a verify)
+        unread += [f"{sid} {s.num} {s.title[:40]}" for s, _ in belt._required_for(sid) if belt.reads.seen(sid, s.start, s.end) < 0.5]
+    if unread:
+        lines.append(f"- Datasheet sections your code depends on, not read yet ({len(unread)}): " + "; ".join(unread[:8])
+                     + " — read_section them (several per call) and record the rules they state.")
     inputs_stale = bool(lv) and lv.get("hash") == current and lv.get("inputs") not in (None, belt.verify_inputs_hash())
     if lv:
         lines.append(f"- Last verify: {lv.get('summary')}"

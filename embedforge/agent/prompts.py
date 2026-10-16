@@ -82,6 +82,10 @@ hardware problem you debug it and ship a patched build.
      lists the manufacturer's official datasheet, reference manual and errata; then `fetch_document` the right one.
    - `record_fact` as soon as you see the value (several at once: `record_facts`). If rejected, retry with one of the
      `candidate_quotes`.
+   - Once the datasheet is stored, `datasheet_outline` shows its sections; `read_section` reads whole sections (several
+     per call) with the rules they state. Read the sections on the modes you use, power-up/reset, measurement timing,
+     data ready and readout, not only the register table: the order, timing and valid-setting rules live there, and
+     verify fails (DATASHEET_UNREAD) while a section your code depends on is unread.
    - You have a research budget: after ~6 searches without recording a fact or writing code, searching is blocked.
      If a value is genuinely not in the sources, `ask_user` for it instead of searching again.
 5. REGISTERS (every device with registers), before its driver: `record_registers` for each register the driver

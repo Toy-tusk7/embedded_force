@@ -66,6 +66,15 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Retrieve the most relevant verbatim excerpts of a stored source for a query (register names, addresses, "
         "'WHO_AM_I', 'slave address'...). Copy quotes from these excerpts exactly when recording facts.",
         {"source_id": S, "query": S, "max_chunks": {"type": "integer"}}, ["source_id", "query"]),
+    _fn("datasheet_outline",
+        "A stored datasheet's numbered sections with how much of each you have read; sections your code depends on and "
+        "you have not read are marked '<< needed' (known after the first verify).",
+        {"source_id": S}, ["source_id"]),
+    _fn("read_section",
+        "Read whole datasheet sections: section='3.3.3' or 'Normal mode', or several in one call: '3.3.3, 3.9.1, Data "
+        "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
+        "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
+        {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
     _fn("record_fact",
         "Record a hardware fact. REJECTED unless `quote` appears verbatim in the cited source and contains `value`. "
         "value examples: '0x68', '400', '3.3'. Returns FACT-nnn to tag in code comments. On rejection, "
@@ -323,6 +332,8 @@ class ToolBelt:
         self._failed_calls: Dict[str, int] = {}      # identical record_* calls that were rejected (per run)
         self._failed_errors: Dict[str, str] = {}
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
+        from embedforge.truth.outline import ReadLog
+        self.reads = ReadLog(project.root)   # what of each source the agent has been shown (kept across runs)
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
         meta = project.meta()
         lb, lv = meta.get("last_build") or {}, meta.get("last_verify") or {}
@@ -334,7 +345,8 @@ class ToolBelt:
             "resolve_target": self.resolve_target, "init_project": self.init_project, "init_betaflight": self.init_betaflight,
             "web_search": self.web_search, "find_documents": self.find_documents,
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
-            "read_source": self.read_source, "record_fact": self.record_fact,
+            "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
+            "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
             "record_layouts": self.record_layouts, "record_formula": self.record_formula,
@@ -397,7 +409,7 @@ class ToolBelt:
                                                         or (ptype == "integer" and isinstance(val, int) and not isinstance(val, bool))):
             call_args[missing[0]] = args[ignored[0]]
             ignored = [f"{ignored[0]} (used as {missing[0]})"]
-        limit = 14000 if name == "query_board" else 7000
+        limit = 14000 if name in ("query_board", "read_section") else 7000
         import json as _json
         sig = name + _json.dumps(call_args, sort_keys=True, default=str)
         if name.startswith("record_") and self._failed_calls.get(sig, 0) >= 2:
@@ -425,10 +437,10 @@ class ToolBelt:
         return build_inputs_hash(self.project.root)
 
     def verify_inputs_hash(self) -> str:
-        """Build inputs plus what verify judges them against (facts, sequences, schematic): a new fact or a re-imported
-        board after verify makes the old verify stale."""
+        """Build inputs plus what verify judges them against (facts, sequences, schematic, the datasheet sections read): a
+        new fact, a section read or a re-imported board after verify makes the old verify stale."""
         h = hashlib.sha256(self.source_hash().encode())
-        for n in ("ledger.json", "sequences.json", "registers.json", "board.json"):
+        for n in ("ledger.json", "sequences.json", "registers.json", "board.json", "sources/reads.json"):
             p = self.project.root / n
             h.update(n.encode())
             if p.exists():
@@ -606,6 +618,8 @@ class ToolBelt:
                     pass
             ex = self.store.excerpts(r["source_id"], query, max_chunks=1)
             r["excerpt"] = re.sub(r"[ \t]+", " ", ex[0]["text"])[:900] if ex else ""
+            if ex:
+                self.reads.add(r["source_id"], ex[0]["offset"], ex[0]["offset"] + min(len(ex[0]["text"]), 900))
             r["is_datasheet"] = bool(src and _looks_like_datasheet(src.url))
             r.pop("snippet", None)
             self.session.emit("source", **{k: v for k, v in r.items() if k != "excerpt"},
@@ -698,12 +712,179 @@ class ToolBelt:
             return {"error": f"Unknown source_id {source_id}. Stored sources: "
                              + ", ".join(f"{s.id} ({s.title[:40]})" for s in list(self.store.sources.values())[:12])}
         ex = self.store.excerpts(source_id, query, max_chunks=max(1, min(int(max_chunks or 4), 6)))
+        for e in ex:
+            self.reads.add(source_id, e["offset"], e["offset"] + len(e["text"]))
         note = ""
         if not ex:
             note = "No passage matched. Try the vendor's own names (e.g. TMR vs TIM, CHxC vs CHxN) or register names."
             if src.chars < 20_000 and src.url.startswith("http"):
                 note += f" This source is only a {src.chars}-char snippet; fetch_document('{src.url}') downloads the full document."
+        elif len(self._outline(source_id)) >= 8:
+            note = ("Excerpts are fragments: for a datasheet, read whole sections with read_section (datasheet_outline lists "
+                    "them) — modes, timing and readout rules often sit in sections a keyword does not reach.")
         return {"source_id": source_id, "url": src.url, "tier": src.tier, "chars": src.chars, "excerpts": ex, "note": note}
+
+    # ------------------------------------------------------------ datasheet structure
+    def _outline(self, source_id: str):
+        from embedforge.truth.outline import sections
+        cache = self.__dict__.setdefault("_outlines", {})
+        src = self.store.get(source_id)
+        if src is None:
+            return []
+        key = (source_id, src.chars)
+        if key not in cache:
+            cache[key] = sections(src.text) if src.chars > 3000 and not src.url.startswith("user://board") else []
+        return cache[key]
+
+    def datasheet_outline(self, source_id: str) -> Dict[str, Any]:
+        source_id = self._sid(source_id)
+        secs = self._outline(source_id)
+        if not secs:
+            return {"error": f"{source_id} has no section structure (or is not a stored document). Use read_source with the "
+                             "names you need."}
+        need = {s.num: why for s, why in self._required_for(source_id)}
+        lines = []
+        for s in secs:
+            pct = self.reads.seen(source_id, s.start, s.end)
+            lines.append(f"{s.num} {s.title[:70]} ({s.end - s.start} chars, {pct:.0%} read)"
+                         + (f"  << needed: {need[s.num]}" if s.num in need and pct < 0.5 else ""))
+        unread = [n for n in need if self.reads.seen(source_id, *self._span(source_id, n)) < 0.5]
+        out: Dict[str, Any] = {"source_id": source_id, "sections": lines}
+        if unread:
+            out["next"] = (f"read_section('{source_id}', {unread[:6]}) — the sections marked << your code depends on and "
+                           "you have not read; record what they require (record_fact / record_sequence).")
+        return out
+
+    def _span(self, source_id: str, num: str):
+        s = next((x for x in self._outline(source_id) if x.num == num), None)
+        return (s.start, s.end) if s else (0, 0)
+
+    def read_section(self, source_id: str, section: Any = "", part: int = 1) -> Dict[str, Any]:
+        """Whole sections of a datasheet (one, or a list), with the sentences in each that state a rule."""
+        from embedforge.truth.outline import find_section, requirements, subtree_end
+        source_id = self._sid(source_id)
+        src = self.store.get(source_id)
+        secs = self._outline(source_id)
+        if src is None or not secs:
+            return {"error": f"{source_id} has no section structure. Use read_source with the names you need."}
+        keys = section if isinstance(section, list) else [x for x in re.split(r"\s*[,;]\s*", str(section or "")) if x]
+        if not keys:
+            return {"error": "section: a number ('3.3.3') or title ('Normal mode'), or a list of them; datasheet_outline lists them."}
+        page, budget = 4500, 11000   # a section is read in pages of `page` chars; one call returns up to `budget`
+        part = max(1, int(part or 1))
+        out, missing, later, total = [], [], [], 0
+        for key in keys[:10]:
+            s = find_section(secs, str(key))
+            if s is None:
+                missing.append(str(key))
+                continue
+            end = subtree_end(secs, s)
+            a = s.start + (part - 1) * page
+            b = min(end, a + page)
+            if out and total + (b - a) > budget:
+                later.append(s.num)
+                continue
+            text = src.text[a:b]
+            total += len(text)
+            self.reads.add(source_id, a, b)
+            item = {"section": s.label, "text": text, "requirements": requirements(text)}
+            if b < end:
+                item["more"] = f"read_section('{source_id}', '{s.num}', part={part + 1}) for the rest ({end - b} chars)"
+            out.append(item)
+        res: Dict[str, Any] = {"source_id": source_id, "sections": out}
+        if later:
+            res["not_read_yet"] = f"read_section('{source_id}', {later}) — they did not fit in this reply"
+        if missing:
+            res["not_found"] = missing
+            res["hint"] = "datasheet_outline lists the section numbers and titles."
+        if out:
+            res["next"] = ("Each `requirements` line is a rule the datasheet states: record the ones your code depends on "
+                           "(record_fact for values and times, record_sequence for orders), quoting the text exactly.")
+        return res
+
+    def _code_uses(self, rep: Any) -> Dict[str, str]:
+        """What the code does, as the datasheet topics it makes required reading (from verify's view of the code and
+        the recorded truth): the modes it sets, the registers it touches, the data it reads, its formulas and bus."""
+        from embedforge.truth.registers import RegisterBook
+        from embedforge.truth.sequences import SequenceBook
+        regs = rep.registers or {}
+        writes = regs.get("writes") or []
+        uses: Dict[str, str] = {}
+        names = {m.group(1) for w in writes for m in [re.search(r":\d+ ([A-Za-z_]\w*) \(0x", w)] if m}
+        modes = {}
+        for w in writes:
+            reg = re.search(r":\d+ ([A-Za-z_]\w*) \(0x", w)
+            for fm in re.finditer(r"(\w*mode\w*)=\S+ \(([\w-]+)\)", w, re.I):
+                modes[fm.group(2).lower()] = f"the code sets {reg.group(1) if reg else 'a register'}.{fm.group(1)} = {fm.group(2)}"
+            for fm in re.finditer(r"(\w+)=", w):
+                f = fm.group(1).lower()
+                if f.startswith("osr") and "oversampling" not in uses:
+                    uses["oversampling"] = f"the code sets {f}"
+                if ("iir" in f or "filter" in f) and "filter" not in uses:
+                    uses["filter"] = f"the code sets {f}"
+                if f.startswith("odr") and "timing" not in uses:
+                    uses["timing"] = f"the code sets {f} (the output data rate)"
+                if "fifo" in f:
+                    uses.setdefault("fifo", f"the code sets {f}")
+                if re.match(r"(int|irq)(_|\d|$)", f) or f.startswith("drdy_en"):
+                    uses.setdefault("interrupts", f"the code sets {f}")
+        if modes:
+            uses["modes"] = next(iter(modes.values()))
+            uses["mode_words"] = ",".join(modes)
+        book = RegisterBook(self.project.root)
+        data = [l.name for l in book.layouts.values() if not re.search(r"nvm|calib|par_|trim|coef|dig_", l.name, re.I)]
+        if data or book.bursts:
+            why = f"the code reads measurement data ({(data or ['a burst'])[0]})"
+            uses.setdefault("timing", why)
+            uses["ready"] = why
+            uses["readout"] = why
+        if book.formulas:
+            uses["formulas"] = f"the code implements {len(book.formulas)} recorded formulas"
+        if SequenceBook(self.project.root).items:
+            uses["reset"] = "the code runs a recorded init sequence"
+        names |= {r.name for r in book.registers.values() if re.search(rf"\b{re.escape(r.name)}\b", " ".join(writes))}
+        if names:
+            uses["register_names"] = ",".join(sorted(names))
+        code = " ".join(p.read_text(encoding="utf-8", errors="ignore") for p in collect_sources(self.project.root))
+        if re.search(r"\bWire1?\s*\.|\bTwoWire\b|\bi2c_\w+\(|HAL_I2C_|i2c_master_", code):
+            uses["i2c"] = "the code talks I2C"
+        if re.search(r"\bSPI1?\s*\.|\bspi_\w+\(|HAL_SPI_|spi_device_", code):
+            uses["spi"] = "the code talks SPI"
+        return uses
+
+    def _unread_sections(self, rep: Any) -> List[Any]:
+        """DATASHEET_UNREAD: sections of a datasheet the code relies on that the agent was never shown."""
+        from embedforge.truth.verifier import Finding
+        self.state["uses"] = self._code_uses(rep)
+        cited = {f.source_id for f in self.ledger.facts.values()}
+        try:
+            from embedforge.truth.registers import RegisterBook
+            book = RegisterBook(self.project.root)
+            cited |= {x.source_id for x in list(book.registers.values()) + list(book.layouts.values()) + list(book.formulas.values())}
+        except Exception:
+            pass
+        out = []
+        for sid in sorted(cited):
+            src = self.store.get(sid)
+            if src is None or src.url.startswith("user://") or len(self._outline(sid)) < 8:
+                continue
+            unread = [(s, why) for s, why in self._required_for(sid) if self.reads.seen(sid, s.start, s.end) < 0.5]
+            self.state.setdefault("unread", {})[sid] = [f"{s.num} {s.title[:50]}" for s, _ in unread]
+            if unread:
+                listed = "; ".join(f"{s.label[:60]} ({why})" for s, why in unread[:8])
+                out.append(Finding(
+                    "ERROR", "DATASHEET_UNREAD", "", 0,
+                    f"{len(unread)} section(s) of {sid} describe what this code does but were never read, so the rules in them "
+                    f"(order, timing, valid settings) are unchecked: {listed}.",
+                    suggestion=(f"read_section('{sid}', {[s.num for s, _ in unread[:8]]}) and record what they require "
+                                "(record_fact for values and times, record_sequence for orders); then fix the code if it breaks one.")))
+        return out
+
+    def _required_for(self, source_id: str):
+        """Sections of this source the code depends on (from what the last verify saw the code do)."""
+        from embedforge.truth.outline import required
+        uses = self.state.get("uses") or {}
+        return required(self._outline(source_id), uses) if uses else []
 
     def record_fact(self, subject: str, property: str, value: Any, source_id: str, quote: str, unit: str = "") -> Dict[str, Any]:
         # a quote copied from a clipped line may end in an ellipsis; the text before it is still verbatim
@@ -1425,6 +1606,8 @@ class ToolBelt:
                         suggestion=(f"Use the define name Betaflight reads (search_framework('{name.split('_')[0]}_') or a reference "
                                     "config); e.g. motors are MOTOR1_PIN..MOTOR8_PIN, gyros USE_ACCGYRO_<CHIP> or USE_GYRO_SPI_<CHIP>.")))
             rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
+        rep.findings += self._unread_sections(rep)
+        rep.passed = not any(f.severity == "ERROR" for f in rep.findings)
         h = self.source_hash()
         inputs = self.verify_inputs_hash()
         self.state.update(verify_hash=h, verify_ok=rep.passed, verify_inputs=inputs)

@@ -30,7 +30,8 @@ MAX_SDK_WITHOUT_PROGRESS = 10
 MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
 MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments while its result is still visible
 READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_framework", "query_board", "list_facts",
-                   "read_source", "init_betaflight", "init_project", "resolve_target", "set_plan"}
+                   "read_source", "read_section", "datasheet_outline", "init_betaflight", "init_project", "resolve_target",
+                   "set_plan"}
 ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
 # failing builds/verifies between edits are the normal fix loop; finish and the record tools have their own truth gates
 NO_FAILURE_STREAK_TOOLS = {"build", "verify", "finish", "record_fact", "record_user_fact", "record_board_pins", "record_facts",
