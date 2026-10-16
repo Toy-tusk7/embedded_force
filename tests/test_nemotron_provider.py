@@ -95,6 +95,10 @@ def test_server_errors_are_retried_with_backoff_and_reported_as_transient(monkey
         a.chat([{"role": "user", "content": "go"}])
     assert e.value.transient and "after 6 attempts: HTTP 500" in str(e.value)
     assert waits == [2.0, 4.0, 8.0, 16.0, 32.0]   # about a minute of waiting, none after the last attempt
+    waits.clear()   # NVIDIA's "function not found" while a model is redeployed is an outage, retried like a 503
+    monkeypatch.setattr(llm.httpx, "Client", _client([(404, '{"detail":"Function id \'948f\' version \'null\': Specified function '
+                                                             'in account \'x\' is not found"}'), (200, OK)], sent))
+    assert a.chat([{"role": "user", "content": "go"}])["content"] == "done" and waits == [2.0]
     monkeypatch.setattr(llm.httpx, "Client", _client([(401, "Unauthorized")], sent))
     with pytest.raises(llm.LLMError) as e:
         a.chat([{"role": "user", "content": "go"}])

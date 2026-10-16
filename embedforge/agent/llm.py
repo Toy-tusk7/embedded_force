@@ -240,7 +240,10 @@ class AgentLLM:
             try:
                 with httpx.Client(timeout=180.0) as c:
                     r = c.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
-                if r.status_code in (429, 500, 502, 503, 504):
+                # NVIDIA's API answers 404 "Function id ... is not found" while a listed model's deployment is being
+                # replaced: an outage on their side, like a 503
+                gone = r.status_code == 404 and re.search(r"function id|specified function", r.text or "", re.I)
+                if r.status_code in (429, 500, 502, 503, 504) or gone:
                     last = f"HTTP {r.status_code}: {r.text[:200]}"
                     wait(attempt, r)
                     continue
