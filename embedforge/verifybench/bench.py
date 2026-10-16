@@ -42,6 +42,15 @@ FACTS = [
 ]
 
 
+# the boards' wiring (an imported schematic's lines), for the pins the SPI drivers drive: key, property, value, line
+BOARD = ("U1 pin 22 (GPIO17) -> net DM388_CS -> U2.6 (CSB)    [Pico board]\n"
+         "J1 pin 10 (GPIO10) -> net DM388_CS -> U2.6 (CSB)    [Arduino board]\n")
+PIN_FACTS = [
+    ("cs_pico", "cs_pin_pico_board", "GPIO17", "U1 pin 22 (GPIO17) -> net DM388_CS -> U2.6 (CSB)"),
+    ("cs_arduino", "cs_pin_arduino_board", "GPIO10", "J1 pin 10 (GPIO10) -> net DM388_CS -> U2.6 (CSB)"),
+]
+
+
 def _cut(start: str, end: str) -> str:
     i = DATASHEET.index(start)
     return DATASHEET[i:DATASHEET.index(end, i) + len(end)]
@@ -65,6 +74,12 @@ def build_truth(root: Path, facts_only: bool = False, formulas: bool = True) -> 
         r = ledger.record(DEVICE, prop, value, src.id, quote, unit)
         if not r.get("ok"):
             raise RuntimeError(f"ground truth fact {key} rejected: {r.get('error')}")
+        ids[key] = r["fact"]["id"]
+    board = store.add("user://board", "Imported schematic", BOARD, kind="user")
+    for key, prop, value, quote in PIN_FACTS:
+        r = ledger.record(DEVICE, prop, value, board.id, quote)
+        if not r.get("ok"):
+            raise RuntimeError(f"ground truth pin {key} rejected: {r.get('error')}")
         ids[key] = r["fact"]["id"]
     if facts_only:
         return ids

@@ -87,7 +87,7 @@ static void delay_ms(uint32_t ms) { sleep_ms(ms); }
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
-#define DM388_CS 17
+#define DM388_CS 17   /* @F(cs_pico)@ */
 static int write_reg(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {(uint8_t)(reg & 0x7F), val};
     gpio_put(DM388_CS, 0);
@@ -144,7 +144,7 @@ void loop() {
 #include <Arduino.h>
 #include <SPI.h>
 #include <math.h>
-#define DM388_CS 10
+#define DM388_CS 10   /* @F(cs_arduino)@ */
 static int write_reg(uint8_t reg, uint8_t val) {
     digitalWrite(DM388_CS, LOW);
     SPI.transfer(reg & 0x7F);

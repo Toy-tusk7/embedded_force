@@ -1396,8 +1396,9 @@ class ToolBelt:
 
     def verify(self) -> Dict[str, Any]:
         meta = self.project.meta()
-        pico = bool(re.search(r"RP2[03]", f"{meta.get('mcu') or ''} {meta.get('bf_target') or ''}", re.I))
-        rep = verify_project(self.project.root, self.ledger, pico=pico)
+        chip = f"{meta.get('mcu') or ''} {meta.get('board') or ''} {meta.get('bf_target') or ''}"
+        pico = bool(re.search(r"RP2[03]", chip, re.I))
+        rep = verify_project(self.project.root, self.ledger, pico=pico, chip=chip.strip())
         if self._is_betaflight():
             from embedforge.truth import betaflight_rp2350
             from embedforge.truth.verifier import Finding

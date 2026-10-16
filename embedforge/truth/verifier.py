@@ -28,6 +28,9 @@ _HW_NAME_RE = re.compile(r"(ADDR|REG|WHO_?AM_?I|CHIP_?ID|DEVICE_?ID|_ID\b|OPCODE
 # Pin assignments are wiring claims: they must trace to the schematic or the user (e.g. #define GYRO_CS_PIN 14).
 _PIN_NAME_RE = re.compile(r"(_PIN\b|^PIN_|_GPIO\b|_GPIO_NUM\b|_IO_NUM\b)", re.I)
 _PIN_VALUE_RE = re.compile(r"^(?:GPIO|GP|IO|P)?(\d{1,3})$", re.I)
+# const int LED_PIN = 25;  static constexpr uint8_t SDA = 16;  (a pin when named like one or passed to a pin call)
+_CONST_INT_RE = re.compile(r"^\s*(?:static\s+)?(?:(?:constexpr|const)\s+)+(?:unsigned\s+|signed\s+)?[A-Za-z_][\w:]*\s+"
+                           r"([A-Za-z_]\w*)\s*=\s*\(?\s*(\d{1,3})[uU]?\s*\)?\s*;")
 
 
 def fact_int(value: str) -> Optional[int]:
@@ -171,8 +174,10 @@ def quote_pins(quote: str) -> set:
     return {f"GPIO{int(n)}" for n in _QUOTE_GPIO_RE.findall(quote or "")}
 
 
-def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) -> VerifyReport:
-    """`pico`: the target is an RP2040/RP2350, so GPIO n may be written n, GPIOn, GPn or (Betaflight) PAn."""
+def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False, chip: str = "") -> VerifyReport:
+    """`pico`: the target is an RP2040/RP2350, so GPIO n may be written n, GPIOn, GPn or (Betaflight) PAn. `chip`: the
+    MCU/board names (e.g. 'RP2350 weact_rp2350b'), for the pins the package has and the RP2350's extra UART pins."""
+    from embedforge.truth import pins as pinmod
     project_dir = Path(project_dir)
     report = VerifyReport(passed=True)
 
@@ -193,15 +198,26 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
         report.findings.append(Finding("ERROR", "NO_SOURCES", "", 0, "No source files found under src/, include/ or lib/."))
         return report
 
+    file_lines: Dict[Path, List[Dict[str, str]]] = {}
     for path in files:
-        rel = str(path.relative_to(project_dir)).replace("\\", "/")
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:   # still checked: a Latin-1 comment must not hide the file's constants
             text = path.read_bytes().decode("latin-1")
+        file_lines[path] = _strip_comments(text)
+    # names the code passes to pin calls (gpio_put(DM388_CS, 0)): their definitions are wiring claims too
+    pin_names: Dict[str, str] = {}
+    for parts_list in file_lines.values():
+        for parts in parts_list:
+            for call, _recv, arg in pinmod.pin_args(parts["code"]):
+                if re.fullmatch(r"[A-Za-z_]\w*", arg):
+                    pin_names.setdefault(arg, pinmod.PIN_CALLS[call] or pinmod.role_of(arg))
+
+    for path in files:
+        rel = str(path.relative_to(project_dir)).replace("\\", "/")
         # a FACT tag in a comment on the previous line also covers the next line
         prev_tags: List[str] = []
-        for ln, parts in enumerate(_strip_comments(text), start=1):
+        for ln, parts in enumerate(file_lines[path], start=1):
             code, comment = parts["code"], parts["comment"]
             tags = _FACT_TAG_RE.findall(comment) or prev_tags
             prev_tags = _FACT_TAG_RE.findall(comment) if (not code.strip() and comment.strip()) else []
@@ -209,23 +225,29 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
             if not stripped or stripped.startswith(("#include", "#pragma", "#if", "#endif", "#else")):
                 continue
 
-            candidates: List[tuple] = []  # (literal text, key, macro name, is_pin)
+            candidates: List[tuple] = []  # (literal text, key, macro name, is_pin, pin role)
             m = _DEFINE_RE.match(code)
-            define_name = m.group(1) if m else ""
-            is_pin_define = bool(m and _PIN_NAME_RE.search(define_name))
-            raw = m.group(2).split("//")[0].split("/*")[0].strip() if m else ""
+            cm = None if m else _CONST_INT_RE.match(code)
+            define_name = m.group(1) if m else cm.group(1) if cm else ""
+            is_pin_define = bool((m or cm) and (_PIN_NAME_RE.search(define_name) or define_name in pin_names))
+            raw = m.group(2).split("//")[0].split("/*")[0].strip() if m else cm.group(2) if cm else ""
             if is_pin_define and pin_key(raw, pico):
-                candidates.append((raw.strip("() "), pin_key(raw, pico), define_name, True))
+                role = pinmod.role_of(define_name) or pin_names.get(define_name, "")
+                candidates.append((raw.strip("() "), pin_key(raw, pico), define_name, True, role))
             else:
                 for hm in _HEX_RE.finditer(code):
                     lit = hm.group(0)
                     n = parse_int(lit.rstrip("uUlL"))
                     if n is not None:
-                        candidates.append((lit, n, define_name, False))
+                        candidates.append((lit, n, define_name, False, ""))
                 if m and _HW_NAME_RE.search(define_name):
                     dm = re.fullmatch(r"\(?\s*(\d+)[uUlL]*\s*\)?", raw)
                     if dm:
-                        candidates.append((dm.group(1), int(dm.group(1)), define_name, False))
+                        candidates.append((dm.group(1), int(dm.group(1)), define_name, False, ""))
+            for call, _recv, arg in pinmod.pin_args(code):   # Wire.setSDA(16), pinMode(25, OUTPUT)
+                lp = pinmod.literal_pin(arg)
+                if lp is not None:
+                    candidates.append((str(lp), pin_key(str(lp), pico), f"{call}()", True, pinmod.PIN_CALLS[call]))
 
             for fid in tags:
                 fact = ledger.get(fid)
@@ -238,7 +260,7 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                         f"'{bad}' is not a fact id. Fact ids look like FACT-001 and come from record_fact results.",
                         suggestion="Replace it with the FACT-nnn id that record_fact returned (list_facts shows them)."))
 
-            for lit, n, name, is_pin in candidates:
+            for lit, n, name, is_pin, role in candidates:
                 # small "generic" values (masks, 0/1) are skipped unless they name hardware (e.g. #define CTRL_REG 0x01)
                 if not is_pin and n in GENERIC_OK and not tags and not (name and _HW_NAME_RE.search(name)):
                     continue
@@ -289,12 +311,23 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                             f"{lit} is {n}, but the quote of {match.id} names {', '.join(sorted(qp))}.", literal=lit,
                             suggestion="Cite a fact whose board line is for this pin."))
                         continue
-                    if re.fullmatch(r"[A-Z][A-Z0-9_]*_PIN", match.property) and name and match.property != name:
+                    if re.fullmatch(r"[A-Z][A-Z0-9_]*_PIN", match.property) and name and not name.endswith("()") \
+                            and match.property != name:
                         report.findings.append(Finding(
                             "ERROR", "FACT_DEFINE_MISMATCH", rel, ln,
                             f"{name} cites {match.id}, which was recorded for {match.property}.", literal=lit,
                             suggestion=f"record_board_pins with define='{name}' and this pin's board line (add replace: true if "
                                        f"{name} was recorded for another pin), or cite the right fact."))
+                        continue
+                    fact_role = pinmod.role_of(match.property)
+                    if role and fact_role and fact_role != role:   # setSDA(17) citing the SCL pin's fact
+                        right = [f"{f.id} {f.property}={f.value}" for f in ledger.facts.values()
+                                 if pinmod.role_of(f.property) == role and pin_key(str(f.value), pico)]
+                        report.findings.append(Finding(
+                            "ERROR", "PIN_ROLE_MISMATCH", rel, ln,
+                            f"{name} uses {lit} as {role}, but {match.id} records {match.value} as {match.property} ({fact_role}).",
+                            literal=lit, suggestion=("The schematic's " + role + " pin: " + ", ".join(right[:3]) + ". Swap the pins."
+                                                     if right else f"Use the schematic's {role} pin (query_board) and cite its fact.")))
                         continue
                 justified += 1
                 used_facts[match.id] = used_facts.get(match.id, 0) + 1
@@ -311,6 +344,15 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                     report.findings.append(Finding("INFO", "LOOSE_MATCH", rel, ln,
                         f"{lit}: {match.id} matched under form '{match.match_form}'.", literal=lit))
 
+    if pico:
+        report.findings += _pin_capability(project_dir, file_lines, chip)
+    for path, parts_list in file_lines.items():
+        rel = str(path.relative_to(project_dir)).replace("\\", "/")
+        for line, call, msg in pinmod.unchecked_reads(rel, [p["code"] for p in parts_list]):
+            report.findings.append(Finding("ERROR", "BUS_READ_UNCHECKED", rel, line, msg,
+                                           suggestion=f"Check what {call}() returns (the byte count or status) and return an "
+                                                      "error when the transfer failed, before using the buffer."))
+
     for a, b in ledger.conflicts():
         if a.id in used_facts or b.id in used_facts:
             report.findings.append(Finding("ERROR", "FACT_CONFLICT", "", 0,
@@ -324,6 +366,68 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False) ->
                     "formulas_matched": sum(1 for x in report.registers.get("formulas", []) if "matches the code" in x)}
     report.passed = not any(f.severity == "ERROR" for f in report.findings)
     return report
+
+
+def _pin_capability(project_dir: Path, stripped: Dict[Path, List[Dict[str, str]]], chip: str) -> List[Finding]:
+    """RP2040/RP2350: each Wire/SPI/Serial pin call names a GPIO that the instance can actually route to (the chip's GPIO
+    function table), and a GPIO the package has. A pin the peripheral cannot reach is silently not connected."""
+    from embedforge.truth import pins as pinmod
+    rp2350 = bool(re.search(r"235[04]", chip))
+    max_gpio = 47 if re.search(r"235[04]_?b|rp235[04]b", chip, re.I) else 29 if chip else 47
+    chip_name = ("RP2350B" if max_gpio == 47 else "RP2350A") if rp2350 else "RP2040" if chip else "RP2040/RP2350"
+    values: Dict[str, int] = {}
+    code_all: List[str] = []
+    for parts_list in stripped.values():
+        for p in parts_list:
+            code = p["code"]
+            if code.strip().startswith("#include"):
+                continue
+            code_all.append(code)
+            m = _DEFINE_RE.match(code) or _CONST_INT_RE.match(code)
+            if m:
+                v = re.fullmatch(r"\(?\s*(\d{1,3})[uU]?\s*\)?", m.group(2).split("//")[0].split("/*")[0].strip())
+                if v:
+                    values[m.group(1)] = int(v.group(1))
+    text = "\n".join(code_all)
+    used = {fam: [n for n in names if re.search(rf"\b{n}\b", text)] for fam, names in pinmod.INSTANCES.items()}
+    out: List[Finding] = []
+    for path, parts_list in stripped.items():
+        rel = str(path.relative_to(project_dir)).replace("\\", "/")
+        for ln, p in enumerate(parts_list, start=1):
+            for call, recv, arg in pinmod.pin_args(p["code"]):
+                gpio = pinmod.literal_pin(arg)
+                gpio = values.get(arg) if gpio is None else gpio
+                if gpio is None:
+                    continue
+                if gpio > max_gpio:
+                    out.append(Finding("ERROR", "PIN_NOT_ON_CHIP", rel, ln, f"{call}({arg}): GPIO{gpio} does not exist on the "
+                                       f"{chip_name} (GPIO0-{max_gpio}).", suggestion="Use the GPIO the schematic connects."))
+                    continue
+                fam = pinmod.family(call, recv)
+                if not fam:
+                    continue
+                inst = pinmod.INSTANCES[fam].get(recv)
+                obj = recv
+                if inst is None:   # a member or reference (_wire): the one instance of that kind the code uses
+                    if len(used[fam]) != 1:
+                        continue
+                    obj = used[fam][0]
+                    inst = pinmod.INSTANCES[fam][obj]
+                role = pinmod.PIN_CALLS[call]
+                fn = pinmod.rp_function(fam, gpio, rp2350)
+                if fn == (inst, role):
+                    continue
+                legal = pinmod.legal_pins(fam, inst, role, rp2350, max_gpio)
+                via = f" ({recv} is {obj})" if recv != obj else ""
+                out.append(Finding(
+                    "ERROR", "PIN_CAPABILITY", rel, ln,
+                    f"{recv or obj}.{call}({arg}){via}: GPIO{gpio} cannot be {fam}{inst} {role} on the {chip_name}"
+                    + (f"; it is {fam}{fn[0]} {fn[1]}" if fn else "") + ". The peripheral would not be connected to that pin.",
+                    suggestion=(f"{fam}{inst} {role} is on GPIO {', '.join(map(str, legal))}. " if legal else "")
+                               + (f"For GPIO{gpio} use {next((n for n, i in pinmod.INSTANCES[fam].items() if i == fn[0]), fam + str(fn[0]))}"
+                                  f" as {fn[1]}, or " if fn else "")
+                               + "check the schematic's pin with query_board."))
+    return out
 
 
 def _check_registers(project_dir: Path, ledger: FactLedger, report: VerifyReport) -> None:
