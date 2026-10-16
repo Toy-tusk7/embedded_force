@@ -237,6 +237,34 @@ class AgentRunner:
         self.project.append_user_message(user_message)
         return prior + [user_message]
 
+    def _mutation_report(self, belt: ToolBelt) -> None:
+        """Verification strength on the delivered code: plant faults one at a time and count those verify catches
+        (embedforge/truth/mutate.py). Only for sources that built and verified; written to artifacts/mutation_report.json."""
+        h = belt.source_hash()
+        if not config.mutation_test or not (belt.state["build_ok"] and belt.state["build_hash"] == h
+                                            and belt.state["verify_ok"] and belt.state["verify_hash"] == h):
+            return
+        from embedforge.agent.events import RunSession
+        from embedforge.agent.workspace import Project
+        from embedforge.truth import mutate
+        root = self.project.root
+
+        def verify(copy) -> List[str]:
+            p = Project(self.project.id, copy)
+            st = SourceStore(copy)
+            r = ToolBelt(p, RunSession("mutate", self.project.id), st, FactLedger(copy, st)).verify()
+            return [f"{f['code']} {f.get('file')}:{f.get('line') or ''}" for f in r.get("findings", []) if f.get("severity") == "ERROR"]
+        self.session.emit("status", text="Measuring verification strength: planting faults in the delivered code…")
+        try:
+            res = mutate.run(root, verify, write_funcs=mutate.write_functions(root))
+        except Exception as e:   # the measurement must never cost the delivery
+            self.session.emit("status", text=f"Mutation test could not run: {type(e).__name__}: {e}")
+            return
+        (root / "artifacts").mkdir(exist_ok=True)
+        (root / "artifacts" / "mutation_report.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
+        self.project.trace({"event": "mutation_test", **{k: res[k] for k in ("total", "caught", "score", "by_operator")}})
+        self.session.emit("status", text=f"Verification strength: {res['caught']}/{res['total']} planted faults caught")
+
     def _walkthrough(self, belt: ToolBelt, store: SourceStore, ledger: FactLedger, fin: Optional[Dict[str, Any]] = None) -> str:
         meta = self.project.meta()
         builds = self.project.builds()
@@ -260,6 +288,20 @@ class AgentRunner:
             hx = b.get("files", {}).get("hex", "—")
             lines.append(f"- v{b['version']}: flash {b.get('flash_used')}/{b.get('flash_total')} B, RAM {b.get('ram_used')}/{b.get('ram_total')} B, "
                          f"hex `{hx}` sha256 `{(b.get('sha256') or {}).get('hex', '—')[:16]}…`, verified: {b.get('verified')}")
+        mr = self.project.root / "artifacts" / "mutation_report.json"
+        if mr.exists():
+            try:
+                m = json.loads(mr.read_text(encoding="utf-8"))
+            except ValueError:
+                m = {}
+            if m.get("total"):
+                lines += ["", "## Verification strength (mutation test)", "",
+                          f"{m['caught']} of {m['total']} faults planted in this code one at a time were caught by verify "
+                          f"({m['score']:.0%}). By kind: " + ", ".join(f"{k} {v}" for k, v in m.get("by_operator", {}).items()) + "."]
+                if m.get("survivors"):
+                    lines += ["", "Not caught (review each: a gap in what is on record, or a change that does not matter):", ""]
+                    lines += [f"- `{s['file']}:{s['line']}` {s['what']}: `{s['before'].strip()}` → `{s['after'].strip() or '(deleted)'}`"
+                              for s in m["survivors"][:12]]
         lines += ["", "## Files", ""] + [f"- `{f['path']}` ({f['bytes']} B)" for f in self.project.list_files()]
         h = belt.source_hash()
         built = bool(belt.state["build_ok"] and belt.state["build_hash"] == h)
@@ -494,6 +536,8 @@ class AgentRunner:
                     break
                 if belt.ended == "finish":
                     fin = belt.final
+                    if fin.get("status") == "success":
+                        self._mutation_report(belt)
                     self._walkthrough(belt, store, ledger, fin)
                     s.emit("done", status=fin["status"], summary=fin["summary"])
                     status = "completed" if fin["status"] == "success" else "failed"

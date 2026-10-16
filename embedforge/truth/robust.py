@@ -195,6 +195,39 @@ def _status_functions(texts: Dict[str, List[str]]) -> Dict[str, Tuple[str, str]]
     return out
 
 
+def failures_reported_as_success(texts: Dict[str, List[str]]) -> List[Tuple[str, int, str]]:
+    """(file, line, message) for a branch taken because a call failed that returns success (true from a bool function,
+    0 from one that returns negative codes): the caller then carries on as if the device were set up."""
+    own = _status_functions(texts)
+    names = READ_CALLS + WRITE_CALLS + tuple(own)
+    call = r"(?:[A-Za-z_]\w*\s*(?:\.|->)\s*)?\b(" + "|".join(map(re.escape, names)) + r")\s*\("
+    out = []
+    for rel, lines in texts.items():
+        code = "\n".join(lines)
+        starts = [0]
+        for ln in lines:
+            starts.append(starts[-1] + len(ln) + 1)
+        for f in _FUNC_DEF.finditer(code):
+            kind = f.group(1)
+            fbody, _ = _block(code, f.end() - 1)
+            success = "true" if kind == "bool" else "0" if re.search(r"\breturn\s+-\s*\d", fbody) else None
+            if success is None:
+                continue
+            base = f.end()
+            for m in re.finditer(r"\bif\s*\(", fbody):
+                cond, end = _block(fbody, m.end() - 1)
+                failed = re.match(r"\s*!\s*\(?\s*" + call, cond) or (re.search(call, cond) and re.search(
+                    r"\)\s*(!=\s*(0|true|\w*OK\b|\w+)|<\s*0|==\s*(false|-\s*\d))", cond))
+                if not failed:
+                    continue
+                branch, _ = _body(fbody, end)
+                if re.search(rf"\breturn\s+{success}\s*;", branch) or re.fullmatch(rf"\s*return\s+{success}\s*", branch):
+                    line = _line_of(starts, base + m.start())
+                    out.append((rel, line, f"When {failed.group(1)}() fails, this branch returns {success} (success): the "
+                                           "caller carries on as if it had worked."))
+    return out
+
+
 def _objects(code: str, cls: str) -> Set[str]:
     """Names declared as objects (or references / pointers) of a class: 'BMP388 bmp388;' -> {'bmp388'}."""
     return set(re.findall(rf"\b{re.escape(cls)}\s*[&*]?\s+([A-Za-z_]\w*)\s*(?=[;=(\[{{,)])", code))

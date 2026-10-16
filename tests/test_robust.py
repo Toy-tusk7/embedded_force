@@ -58,3 +58,17 @@ def test_a_same_named_method_of_another_object_is_not_the_projects_function():
 def test_statuses_that_report_failure_must_be_checked(call, flagged):
     texts = {"src/main.c": (OWN + "void g(uint8_t *b) {\n    " + call + "\n}\n").split("\n")}
     assert bool(robust.ignored_results(texts)) == flagged, robust.ignored_results(texts)
+
+
+@pytest.mark.parametrize("branch, flagged", [
+    ("if (!write_reg(0x7E, 0xB6)) {\n        return true;\n    }", True),
+    ("if (!write_reg(0x7E, 0xB6)) {\n        return false;\n    }", False),
+    ("if (read_regs(0x04, b, 6) != 0) return true;", True),
+    ("if (read_regs(0x04, b, 6) == 0) return true;", False),      # the success branch
+    ("if (n != 3) return true;", False),                          # not a call that reports failure
+])
+def test_a_failure_must_not_be_reported_as_success(branch, flagged):
+    code = OWN.replace("static bool ok_read", "static bool wr2").replace("bool wr2", "bool ok_read") + \
+        "bool setup_dev(uint8_t *b) {\n    int n = 0;\n    " + branch + "\n    if (!ok_read(b)) return false;\n    return true;\n}\n"
+    found = robust.failures_reported_as_success({"src/main.c": code.split("\n")})
+    assert bool(found) == flagged, found

@@ -355,6 +355,9 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False, ch
                                            suggestion="Bound the wait: a timeout (uint32_t t0 = millis(); while (!ready && "
                                                       "millis() - t0 < 100) {...}) or a retry limit, then handle the timeout "
                                                       "(return an error, or continue without the device)."))
+    for rel, line, msg in robust.failures_reported_as_success(texts):
+        report.findings.append(Finding("ERROR", "FAILURE_AS_SUCCESS", rel, line, msg,
+                                       suggestion="Return the failure (false, or the negative error code) from this branch."))
     for rel, line, call, msg in robust.ignored_results(texts):
         report.findings.append(Finding("ERROR", "RESULT_IGNORED", rel, line, msg,
                                        suggestion=f"Check what {call}() returns and handle the failure (return an error, retry "
