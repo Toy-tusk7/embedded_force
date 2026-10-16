@@ -826,6 +826,22 @@ class ToolBelt:
         if lb.get("hash") != self.source_hash():
             return []
         out = []
+        st = lb.get("static") or {}
+        for d in st.get("defects") or []:
+            ident = str(d.get("id") or "")
+            misra = ident.startswith("misra-c2012-")
+            defect = not misra and (d.get("severity") == "high" or d.get("category") in ("error", "warning"))
+            msg = (f"MISRA C:2012 Rule {ident[len('misra-c2012-'):]} is not followed here" if misra
+                   else f"cppcheck {ident}: {d.get('message')}")
+            out.append(Finding("ERROR" if defect else "WARNING", "MISRA_C" if misra else "STATIC_ANALYSIS",
+                               str(d.get("file") or ""), int(d.get("line") or 0), msg,
+                               suggestion=("Fix the defect cppcheck points at (a value used before it is set, an index out of "
+                                           "range, a leak...)." if defect else
+                                           "Follow the rule, or keep the code and explain the deviation in a comment "
+                                           "(// cppcheck-suppress <id>: why) — MISRA C is advisory for C++ code.")))
+        if st and not st.get("ok"):
+            out.append(Finding("WARNING", "STATIC_ANALYSIS_NOT_RUN", "", 0, f"cppcheck did not run: {st.get('error')}",
+                               suggestion="Report it to the user; the other checks still ran."))
         for w in lb.get("warnings") or []:
             msg = str(w.get("message") or "")
             bug = bool(pio.BUG_WARNINGS.search(msg))
@@ -1604,6 +1620,14 @@ class ToolBelt:
             "warnings": [{"file": d.file, "line": d.line, "message": d.message[:300]} for d in res.diagnostics
                          if d.severity == "warning" and d.file.replace("\\", "/").lstrip("./").startswith(own)][:60],
         })
+        if res.ok and not self._is_betaflight() and config.static_analysis:
+            # cppcheck + MISRA C:2012 on the project's own code; verify reports it for the build of the current sources
+            self.session.emit("status", text="Static analysis (cppcheck, MISRA C:2012)…")
+            st = pio.check(self.project.root)
+            self.project.update_meta(last_build={**(self.project.meta().get("last_build") or {}),
+                                                 "static": {"ok": st["ok"], "defects": st["defects"][:80], "error": st.get("error", "")}})
+            if st["ok"]:
+                out["static_analysis"] = f"cppcheck: {len(st['defects'])} finding(s); verify reports them"
         if res.ok and res.artifacts:
             meta = self.project.meta()
             manifest = {

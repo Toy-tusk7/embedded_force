@@ -397,6 +397,40 @@ def build(project_dir: Path, on_line: LineSink = None, timeout_s: int = 1500) ->
     return res
 
 
+CPPCHECK_FLAGS = "--addon=misra --enable=warning,style,performance,portability --inline-suppr"
+
+
+def check(project_dir: Path, timeout_s: int = 600) -> Dict[str, Any]:
+    """cppcheck (with its MISRA C:2012 add-on) on the project's own sources through `pio check`; PlatformIO installs the
+    tool on first use. Returns {"ok", "defects": [{severity, category, id, file (project-relative), line, message}], "error"}."""
+    project_dir = Path(project_dir).resolve()
+    code, lines, timed_out = _run_streaming(_pio_cmd(["check", "-d", str(project_dir), "--skip-packages", "--json-output",
+                                                      "--flags", CPPCHECK_FLAGS]), project_dir, None, timeout_s)
+    text = "\n".join(lines)
+    start = text.find('[{"env"')
+    if timed_out or start < 0:
+        return {"ok": False, "defects": [], "error": "static analysis timed out" if timed_out else
+                (lines[-1] if lines else "pio check produced no report")[:300]}
+    try:
+        report = json.loads(text[start:text.rindex("]") + 1])
+    except ValueError as e:
+        return {"ok": False, "defects": [], "error": f"unreadable pio check report: {e}"}
+    defects, seen = [], set()
+    for env in report:
+        for d in env.get("defects") or []:
+            try:
+                rel = str(Path(d.get("file", "")).resolve().relative_to(project_dir)).replace("\\", "/")
+            except ValueError:
+                continue                       # a framework file: not the project's code
+            key = (d.get("id"), rel, d.get("line"), d.get("message"))
+            if key in seen:                    # cppcheck reports a header's defect once per file that includes it
+                continue
+            seen.add(key)
+            defects.append({"severity": d.get("severity", ""), "category": d.get("category", ""), "id": d.get("id", ""),
+                            "file": rel, "line": int(d.get("line") or 0), "message": str(d.get("message", ""))[:300]})
+    return {"ok": True, "defects": defects}
+
+
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
