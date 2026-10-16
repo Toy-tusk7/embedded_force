@@ -61,6 +61,9 @@ def digest(name: str, args: Dict[str, Any], result: Any) -> str:
                    f"{str(rej[0].get('error'))[:90]}" if rej else ""))
     if name == "record_formula":
         return f"record_formula -> {str(r.get('formula'))[:150]}" if r.get("ok") else f"record_formula REJECTED: {str(r.get('error'))[:140]}"
+    if name == "record_constraint":
+        return (f"record_constraint -> {str(r.get('constraint'))[:150]}" if r.get("ok")
+                else f"record_constraint REJECTED: {str(r.get('error'))[:140]}")
     if name == "read_file":
         return f"read_file {args.get('path')} lines {r.get('start')}-{r.get('end')}/{r.get('total_lines')}"
     if name in ("write_file", "replace_in_file"):

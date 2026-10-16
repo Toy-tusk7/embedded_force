@@ -199,6 +199,56 @@ def test_a_constant_formula_is_not_compared_with_the_code(tmp_path):
     assert not res["ok"] and "uses no register value" in res["error"] and "record_fact" in res["error"], res
 
 
+RULES = ("Memory map: 0x1C OSR 0x05 osr_t osr_p (default value). 0x1B PWR_CTRL 0x00 mode temp_en press_en.\n"
+         "In normal mode the pressure oversampling osr_p must not exceed 3 (x8).\n")
+
+
+def _constraint_setup(tmp_path, code):
+    from embedforge.truth.registers import RegisterBook
+    p, store, ledger, src, f = _setup(tmp_path, code)
+    rules = store.add("https://www.bosch-sensortec.com/x-app-note.pdf", "app note", RULES, kind="pdf")
+    book = RegisterBook(p.root)
+    regs = [dict(r) for r in REGISTERS if r["name"] in ("PWR_CTRL", "OSR")]
+    regs[0].update(reset="0x00", reset_quote="0x1B PWR_CTRL 0x00 mode temp_en press_en", source_id=src.id)
+    regs[1].update(reset="0x05", reset_quote="0x1C OSR 0x05 osr_t osr_p", source_id=src.id)
+    for r in regs:   # the reset rows are in the app note, the fields in the datasheet
+        r["reset_quote_source"] = rules.id
+    res = book.record_registers(store, ledger, "BMPX", src.id, regs)
+    return p, store, ledger, src, rules, book, res
+
+
+def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
+    from embedforge.truth.registers import RegisterBook
+    p, store, ledger, src, rules, book, res = _constraint_setup(tmp_path, driver())
+    assert res["ok"] and any("reset value not kept" in n for n in res.get("notes", [])), res   # rows are in another source
+    book = RegisterBook(p.root)
+    regs = [dict(r) for r in REGISTERS if r["name"] in ("PWR_CTRL", "OSR")]
+    store.add("https://www.bosch-sensortec.com/x-map.pdf", "memory map", RULES, kind="pdf")
+    for r, q, v in ((regs[0], "0x1B PWR_CTRL 0x00 mode temp_en press_en", "0x00"), (regs[1], "0x1C OSR 0x05 osr_t osr_p", "0x05")):
+        r.update(reset=v, reset_quote=q, quote=r["quote"])
+    # reset rows and fields from one source: the datasheet text plus its memory map
+    src2 = store.add("https://www.bosch-sensortec.com/x-full.pdf", "datasheet + map", DS + "\n" + RULES, kind="pdf")
+    res = book.record_registers(store, ledger, "BMPX", src2.id, regs)
+    assert res["ok"] and not res.get("notes"), res
+    assert book.register_at(0x1C).reset == 0x05
+    r = book.record_constraint(store, "BMPX", src2.id, "osr_in_normal_mode", "OSR.osr_p <= 3",
+                               ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."], when="PWR_CTRL.mode == normal")
+    assert r["ok"] and "CON-001" in r["constraint"], r
+    assert "not in the quotes" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p <= 4",
+                                                         ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."])["error"]
+    assert "no field" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_q <= 3",
+                                                ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."])["error"]
+    summary, codes, found = _codes(p, ledger)
+    assert "CONSTRAINT_VIOLATED" not in codes and any("holds after each of" in s for s in summary["constraints"]), summary
+    # the same values written in the other order: normal mode starts while OSR still holds its reset value 0x05
+    swapped = driver(**{"  wr(REG_OSR, 0x0B);\n  wr(REG_PWR, 0x33);": "  wr(REG_PWR, 0x33);\n  wr(REG_OSR, 0x0B);"})
+    assert swapped != driver()
+    (p.root / "src" / "main.cpp").write_text(swapped, encoding="utf-8")
+    summary, codes, found = _codes(p, ledger)
+    bad = next(x for x in found if x.code == "CONSTRAINT_VIOLATED")
+    assert "OSR.osr_p=5" in bad.message and "mode=3 (normal)" in bad.message and bad.line == swapped.split("\n").index("  wr(REG_PWR, 0x33);") + 1, bad
+
+
 def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):
     p, store, ledger, src, f = _setup(tmp_path, driver())
     book = RegisterBook(p.root)

@@ -102,17 +102,30 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Record the datasheet REGISTER MAP so verify checks what every value MEANS, not just that it was cited. registers: "
         "[{name:'PWR_CTRL', addr:'0x1B', quote:<the register's table text, verbatim>, fields:[{name:'mode', bits:'5:4', "
         "values:{sleep:'0b00', forced:['0b01','0b10'], normal:'0b11'}, quote?:<the field's rows if they are elsewhere>}, "
-        "{name:'press_en', bits:'0'}], id_value?:<FACT id or value, for an ID register>}]. bursts: [{name:'data', start:'0x04', "
-        "end:'0x09', quote:<text requiring one burst read>}]. Field names, bit numbers and each named value must be in the quote. "
-        "verify then decodes every register write into its fields, rejects bit masks on undefined bits and reads that split a "
-        "burst range. Record every register the code writes, polls or tests.",
+        "{name:'press_en', bits:'0'}], id_value?:<FACT id or value, for an ID register>, reset?:'0x00', reset_quote?:<the "
+        "memory map row with its default value, e.g. '0x1D ODR 0x00 reserved odr_sel'>}]. bursts: [{name:'data', "
+        "start:'0x04', end:'0x09', quote:<text requiring one burst read>}]. Field names, bit numbers and each named value must "
+        "be in the quote. verify then decodes every register write into its fields, rejects bit masks on undefined bits and "
+        "reads that split a burst range; reset values let it check record_constraint rules before the code writes a register. "
+        "Record every register the code writes, polls or tests.",
         {"device": S, "source_id": S,
          "registers": _arr({"type": "object", "properties": {"name": S, "addr": S, "quote": S, "id_value": S, "source_id": S,
+                                                              "reset": S, "reset_quote": S,
                                                               "fields": _arr({"type": "object", "properties": {"name": S, "bits": S, "values": {"type": "object"}, "quote": S},
                                                                               "required": ["name", "bits"]})},
                             "required": ["name", "addr", "quote"]}),
          "bursts": _arr({"type": "object", "properties": {"name": S, "start": S, "end": S, "quote": S}, "required": ["start", "end", "quote"]})},
         ["device", "source_id", "registers"]),
+    _fn("record_constraint",
+        "Record a RULE the datasheet states over register settings, so verify checks it after EVERY register write the code "
+        "makes (starting from the reset values): valid combinations and timing, e.g. normal mode needs the conversion to fit "
+        "in the sampling period: name='normal_mode_timing', when='PWR_CTRL.mode == normal', require='234 + PWR_CTRL.press_en "
+        "* (392 + 2^OSR.osr_p * 2000) + PWR_CTRL.temp_en * (313 + 2^OSR.osr_t * 2000) <= 5000 * 2^ODR.odr_sel', unit='us', "
+        "quotes=[<the formula passage>, <the sampling-period table rows>]. Fields are REGISTER.field from record_registers; "
+        "named values (normal) may be used; operators + - * / ^, comparisons, and/or/not. Every number must be in the quotes. "
+        "A violation shows the write after which the rule breaks (e.g. OSR raised while ODR is still at its 5 ms default).",
+        {"device": S, "source_id": S, "name": S, "require": S, "when": S, "quotes": _arr(), "unit": S},
+        ["device", "source_id", "name", "require", "quotes"]),
     _fn("record_layouts",
         "Record how each MULTI-BYTE value is spread over registers (calibration coefficients, raw measurements): layouts: "
         "[{name:'NVM_PAR_T1', bytes:['0x31','0x32'], signed:false, quote:<the rows listing those addresses>}]. `bytes` are "
@@ -352,6 +365,7 @@ class ToolBelt:
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
             "record_layouts": self.record_layouts, "record_formula": self.record_formula,
+            "record_constraint": self.record_constraint,
             "list_facts": self.list_facts, "query_board": self.query_board,
             "search_framework": self.search_framework, "read_framework_file": self.read_framework_file,
             "write_file": self.write_file, "replace_in_file": self.replace_in_file, "read_file": self.read_file,
@@ -1182,6 +1196,17 @@ class ToolBelt:
                            "record_sequence, write steps can name fields: {op:'write', reg:FACT, fields:{...}}.")
         return res
 
+    def record_constraint(self, device: str, source_id: str, name: str, require: str, quotes: Any = None, when: str = "",
+                          unit: str = "", quote: str = "") -> Dict[str, Any]:
+        qs = quotes if isinstance(quotes, list) else [quotes] if quotes else []
+        if quote:
+            qs.append(quote)
+        res = self._register_book().record_constraint(self.store, device, self._sid(source_id), name, require, qs, when, unit)
+        if not res.get("ok") and "not verbatim" in str(res.get("error")):
+            res["hint"] = ("Copy each quote exactly from read_section / read_source (several short passages are fine: the "
+                           "formula's line and the table rows).")
+        return res
+
     def record_layouts(self, device: str, source_id: str, layouts: List[Dict[str, Any]]) -> Dict[str, Any]:
         lays = layouts if isinstance(layouts, list) else []
         for l in lays:
@@ -1668,6 +1693,8 @@ class ToolBelt:
         if regs.get("writes") or regs.get("formulas"):
             # what the code's register values mean, per the recorded register map, and which formulas it implements
             out["meaning"] = {"register_writes": regs.get("writes", [])[:12], "formulas": regs.get("formulas", [])[:16]}
+            if regs.get("constraints"):
+                out["meaning"]["constraints"] = regs["constraints"][:8]
         if prev_inputs == inputs:
             out["unchanged"] = True  # same sources and facts as the last verify: same answer, not progress
         shown = sum(len(x.get("lines") or [1]) for x in findings)

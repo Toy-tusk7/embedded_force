@@ -104,6 +104,10 @@ hardware problem you debug it and ship a patched build.
    - `record_sequence`: the datasheet's required order and timing (power-up / soft reset / init / start of
      measurement), steps citing the register, value and delay FACT ids (write steps preferably as register-map
      `fields`), plus a verbatim quote of the order.
+   - `record_constraint`: each rule over settings the datasheet states (valid oversampling/ODR combinations, a
+     conversion that must fit in the sampling period, a setting only allowed in sleep mode), with the registers'
+     `reset` values in record_registers. verify checks the rule after every register write, so writing settings in
+     the wrong order (normal mode first, then a slow oversampling) fails even though the final values are valid.
    Record what it asks (you may record these before the first build if the datasheet is open in front of you), fix
    the code, rebuild if it changed, and verify again. Verify decodes every register write, checks every byte shift
    against the layouts, rejects split burst reads, runs your code on random register bytes to check each formula, and

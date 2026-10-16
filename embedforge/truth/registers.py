@@ -317,6 +317,8 @@ class RegisterDef:
     source_id: str
     quote: str
     id_value: Optional[int] = None
+    reset: Optional[int] = None        # the value after power-on / soft reset (the memory map's default column)
+    reset_quote: str = ""
 
     @property
     def defined_mask(self) -> int:
@@ -383,6 +385,21 @@ class LayoutDef:
     def describe(self) -> str:
         terms = [p.text() + (f" << {self.offset_of(k)}" if self.offset_of(k) else "") for k, p in enumerate(self.parts)]
         return f"{self.name} = {' | '.join(terms)} ({'signed' if self.signed else 'unsigned'} {self.width}-bit)"
+
+
+@dataclass
+class ConstraintDef:
+    """A rule the datasheet states over register settings, checked after every register write the code makes: e.g. in
+    normal mode the conversion time must fit in the sampling period. `require` (and `when`, if given) are expressions
+    over REGISTER.field names."""
+    id: str
+    device: str
+    name: str
+    require: str
+    when: str
+    source_id: str
+    quotes: List[str]
+    unit: str = ""
 
 
 @dataclass
@@ -707,6 +724,118 @@ def eval_expr(tree: ast.AST, env: Dict[str, float]) -> float:
     return ev(tree)
 
 
+# ------------------------------------------------------------------ constraint expressions
+_FIELD_REF = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\b")
+_RULE_NODES = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.UnaryOp, ast.Not, ast.USub, ast.UAdd, ast.BinOp, ast.Add,
+               ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow, ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr,
+               ast.Compare, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Eq, ast.NotEq, ast.Name, ast.Load)
+
+
+@dataclass
+class _Rule:
+    tree: ast.AST
+    refs: Dict[str, Tuple["RegisterDef", "FieldDef"]]   # variable -> the register field it reads
+    names: Dict[str, int]                               # a field's named value used in the rule ('normal') -> its value
+
+
+def _constraint_tree(text: str, regs: Dict[str, "RegisterDef"]) -> _Rule:
+    """Parse a constraint: REGISTER.field names, a field's named values (PWR_CTRL.mode == normal), numbers, + - * / ^,
+    comparisons and and / or / not (&&, ||, !). Nothing else (no calls), so a rule cannot run code."""
+    s = str(text).replace("≤", "<=").replace("≥", ">=").replace("≠", "!=")
+    s = s.translate(str.maketrans({"·": "*", "×": "*", "∙": "*", "−": "-"}))
+    s = s.replace("&&", " and ").replace("||", " or ").replace("^", "**")
+    s = re.sub(r"!(?!=)", " not ", s)
+    refs: Dict[str, Tuple[RegisterDef, FieldDef]] = {}
+
+    def ref(m: "re.Match[str]") -> str:
+        reg = regs.get(m.group(1).lower())
+        if reg is None:
+            raise ValueError(f"{m.group(1)} is not a recorded register of this device (recorded: {', '.join(sorted(r.name for r in regs.values())) or 'none'})")
+        f = reg.field(m.group(2))
+        if f is None:
+            raise ValueError(f"{reg.name} has no field {m.group(2)} on record (fields: {', '.join(x.name for x in reg.fields) or 'none'})")
+        var = f"{reg.name}__{f.name}".lower()
+        refs[var] = (reg, f)
+        return var
+    s = _FIELD_REF.sub(ref, s)
+    if not refs:
+        raise ValueError("name the register fields it depends on as REGISTER.field (e.g. OSR.osr_p, ODR.odr_sel)")
+    try:
+        tree = ast.parse(s, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"cannot parse {text!r}: {e.msg}")
+    names: Dict[str, int] = {}
+    for node in ast.walk(tree):
+        ok = isinstance(node, _RULE_NODES) or (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+                                               and not isinstance(node.value, bool))
+        if not ok:
+            raise ValueError(f"unsupported syntax {type(node).__name__}: use numbers, REGISTER.field, + - * / ^, comparisons, and/or/not")
+        if isinstance(node, ast.Name) and node.id not in refs:
+            hits = {vs[0] for _r, f in refs.values() for n, vs in f.values.items() if n.lower() == node.id.lower() and len(vs) == 1}
+            if len(hits) != 1:
+                raise ValueError(f"unknown name {node.id}: use REGISTER.field or a named value of one of its fields")
+            names[node.id.lower()] = hits.pop()
+    return _Rule(tree, refs, names)
+
+
+def _eval_constraint(rule: _Rule, state: Dict[int, Optional[int]], regs: Any = None) -> Any:
+    """The rule's value on register contents `state` (address -> byte); KeyError when a register it reads is unknown."""
+    env: Dict[str, Any] = dict(rule.names)
+    for var, (reg, f) in rule.refs.items():
+        v = state.get(reg.addr)
+        if v is None:
+            raise KeyError(reg.name)
+        env[var] = f.get(v)
+
+    def ev(n: ast.AST) -> Any:
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.BoolOp):
+            vals = [ev(x) for x in n.values]
+            return all(vals) if isinstance(n.op, ast.And) else any(vals)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            return not ev(n.operand)
+        if isinstance(n, ast.Compare):
+            left = ev(n.left)
+            for op, right_node in zip(n.ops, n.comparators):
+                right = ev(right_node)
+                ok = {ast.Lt: left < right, ast.LtE: left <= right, ast.Gt: left > right, ast.GtE: left >= right,
+                      ast.Eq: left == right, ast.NotEq: left != right}[type(op)]
+                if not ok:
+                    return False
+                left = right
+            return True
+        if isinstance(n, ast.UnaryOp):
+            v = ev(n.operand)
+            return -v if isinstance(n.op, ast.USub) else v
+        if isinstance(n, ast.BinOp):
+            return _BINOPS[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.Name):
+            return env[n.id.lower()]
+        if isinstance(n, ast.Constant):
+            return n.value
+        raise ValueError(f"unsupported {type(n).__name__}")
+    return ev(rule.tree)
+
+
+_BINOPS: Dict[type, Callable[[Any, Any], Any]] = {
+    ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b, ast.Div: lambda a, b: a / b,
+    ast.FloorDiv: lambda a, b: a // b, ast.Mod: lambda a, b: a % b, ast.Pow: lambda a, b: a ** b,
+    ast.LShift: lambda a, b: int(a) << int(b), ast.RShift: lambda a, b: int(a) >> int(b),
+    ast.BitAnd: lambda a, b: int(a) & int(b), ast.BitOr: lambda a, b: int(a) | int(b)}
+
+
+def describe_state(rule: _Rule, state: Dict[int, Optional[int]]) -> str:
+    """'PWR_CTRL.mode=3 (normal), OSR.osr_p=1, ODR.odr_sel=0' for the fields a rule reads."""
+    parts = []
+    for reg, f in rule.refs.values():
+        v = state.get(reg.addr)
+        fv = f.get(v) if v is not None else None
+        nm = f.value_name(fv) if fv is not None else ""
+        parts.append(f"{reg.name}.{f.name}={'?' if fv is None else fv}" + (f" ({nm})" if nm else ""))
+    return ", ".join(dict.fromkeys(parts))
+
+
 # ------------------------------------------------------------------ the book
 
 
@@ -783,6 +912,7 @@ class RegisterBook:
         self.layouts: Dict[str, LayoutDef] = {}
         self.bursts: Dict[str, BurstDef] = {}
         self.formulas: Dict[str, FormulaDef] = {}
+        self.constraints: Dict[str, ConstraintDef] = {}
         if self.path.exists():
             try:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
@@ -796,17 +926,75 @@ class RegisterBook:
                     self.bursts[b["id"]] = BurstDef(**b)
                 for f in d.get("formulas", []):
                     self.formulas[f["id"]] = FormulaDef(**f)
+                for c in d.get("constraints", []):
+                    self.constraints[c["id"]] = ConstraintDef(**c)
             except (ValueError, TypeError, KeyError):
                 pass
 
     def empty(self) -> bool:
-        return not (self.registers or self.layouts or self.bursts or self.formulas)
+        return not (self.registers or self.layouts or self.bursts or self.formulas or self.constraints)
 
     def _save(self) -> None:
         self.path.write_text(json.dumps({
             "registers": [asdict(r) for r in self.registers.values()], "layouts": [asdict(l) for l in self.layouts.values()],
-            "bursts": [asdict(b) for b in self.bursts.values()], "formulas": [asdict(f) for f in self.formulas.values()]}, indent=1),
+            "bursts": [asdict(b) for b in self.bursts.values()], "formulas": [asdict(f) for f in self.formulas.values()],
+            "constraints": [asdict(c) for c in self.constraints.values()]}, indent=1),
             encoding="utf-8")
+
+    # ---------------------------------------------------------- constraints
+    def record_constraint(self, store: SourceStore, device: str, source_id: str, name: str, require: str, quotes: Any,
+                          when: str = "", unit: str = "") -> Dict[str, Any]:
+        """A datasheet rule over register settings (see ConstraintDef). Every REGISTER.field must be on record for the
+        device, every number must be in a quote, and the rule must be decidable on the registers' reset values."""
+        device, name = (device or "").strip(), (name or "").strip()
+        if not device or not re.fullmatch(r"[A-Za-z_][\w-]{0,40}", name):
+            return {"ok": False, "error": "device and name (e.g. 'normal_mode_timing') are required"}
+        quotes = [quotes] if isinstance(quotes, str) else [str(q) for q in (quotes or []) if str(q).strip()]
+        if not quotes:
+            return {"ok": False, "error": "quotes: the datasheet text that states the rule, verbatim (several passages allowed: "
+                                          "e.g. the conversion-time formula and the sampling-period table)"}
+        for q in quotes:
+            err = _quote_ok(store, source_id, q, f"constraint {name}")
+            if err:
+                return {"ok": False, "error": err}
+        regs = {r.name.lower(): r for r in self.registers.values() if r.device.lower() == device.lower()}
+        trees: List[Optional[_Rule]] = []
+        for label, text in (("when", when), ("require", require)):
+            if label == "when" and not str(text or "").strip():
+                trees.append(None)
+                continue
+            try:
+                rule = _constraint_tree(str(text), regs)
+            except ValueError as e:
+                return {"ok": False, "error": f"{label}: {e}"}
+            trees.append(rule)
+            for t, value, exp in _constants(rule.tree):
+                unit_factor = exp is None and value > 0 and abs(math.log10(value) - round(math.log10(value))) < 1e-9
+                if not any(_const_in_quote(q, value, exp) for q in quotes) and not (value in (0, 1) and exp is None) \
+                        and not unit_factor:   # 1000, 1e-6: a unit conversion (5 ms = 5 * 1000 us), not a datasheet claim
+                    return {"ok": False, "error": f"{label}: the constant {t} is not in the quotes. Every number must come from the "
+                                                  "quoted datasheet text (PDF math loses exponents: 2𝑜𝑠𝑟_𝑝 is 2^osr_p); "
+                                                  "unit factors (1000, 1e-6) are allowed: 5 ms is 5 * 1000 us."}
+        state = {r.addr: (r.reset if r.reset is not None else 0) for r in regs.values()}
+        try:
+            _eval_constraint(trees[1], state, regs)
+        except (ValueError, KeyError, ZeroDivisionError, OverflowError) as e:
+            return {"ok": False, "error": f"require cannot be evaluated: {e}"}
+        with self._lock:
+            old = next((c for c in self.constraints.values() if c.device.lower() == device.lower() and c.name.lower() == name.lower()), None)
+            c = ConstraintDef(old.id if old else self._next(self.constraints, "CON"), device, name, str(require).strip(),
+                              str(when or "").strip(), source_id, quotes, unit)
+            self.constraints[c.id] = c
+            self._save()
+        missing = sorted(r.name for r in regs.values() if r.reset is None and r.name.lower() in
+                         {n.split(".")[0].lower() for n in re.findall(r"[A-Za-z_]\w*\.[A-Za-z_]\w*", f"{when} {require}")})
+        out = {"ok": True, "constraint": f"{c.id} {c.name}: " + (f"when {c.when}: " if c.when else "") + c.require,
+               "next": "verify checks it after every register write the code makes, starting from the registers' reset values."}
+        if missing:
+            out["warning"] = (f"No reset value on record for {', '.join(missing)}: until the code writes them their value is "
+                              "unknown and the rule cannot be checked. record_registers again with reset='0x..' and reset_quote "
+                              "= the memory map row (e.g. '0x1D ODR 0x00 reserved odr_sel').")
+        return out
 
     @staticmethod
     def _next(items: Dict[str, Any], prefix: str) -> str:
@@ -842,6 +1030,12 @@ class RegisterBook:
             (recorded if isinstance(res, RegisterDef) else rejected).append(res if isinstance(res, RegisterDef) else
                                                                            {"register": raw.get("name") or f"#{k}", "error": res})
             if isinstance(res, RegisterDef):
+                old = self.register_at(res.addr, device)
+                if old is not None and old.reset is not None and raw.get("reset") in (None, ""):
+                    res.reset, res.reset_quote = old.reset, old.reset_quote   # re-recorded fields keep the reset value
+                err = self._reset_of(store, res, raw, str(raw.get("source_id") or source_id))
+                if err:
+                    notes.append(f"{res.name}: reset value not kept ({err})")
                 values = [d for d in dropped if not d.startswith("@")]
                 if values:
                     notes.append(f"{res.name}: kept without the value name(s) {', '.join(values)} (not stated next to the name in the quote)")
@@ -877,6 +1071,26 @@ class RegisterBook:
                            "number(s) must be in that quote or the field's own `quote`, and each named value must appear next to its "
                            "name (e.g. '11 normal mode' -> values {normal: '0b11'}). Recorded items are kept; resend only the rejected ones.")
         return out
+
+    @staticmethod
+    def _reset_of(store: SourceStore, reg: RegisterDef, raw: Dict[str, Any], source_id: str) -> Optional[str]:
+        """reset / reset_quote of a register item: the quote (the memory map row, or the register's own quote) must be
+        verbatim, name the register or its address, and contain the value."""
+        if raw.get("reset") in (None, ""):
+            return None
+        v = parse_int(str(raw.get("reset")))
+        if v is None or not 0 <= v <= 0xFF:
+            return "reset must be the register's byte value, e.g. '0x00'"
+        q = str(raw.get("reset_quote") or reg.quote)
+        err = _quote_ok(store, source_id, q, "reset_quote")
+        if err:
+            return err
+        if reg.name.lower() not in q.lower().replace("\n", "") and not re.search(rf"\b0x{reg.addr:02x}\b", q, re.I):
+            return "the reset quote names neither the register nor its address"
+        if not value_in_text(f"0x{v:02X}", q):
+            return f"0x{v:02X} is not in the reset quote"
+        reg.reset, reg.reset_quote = v, q
+        return None
 
     def _one_register(self, store: SourceStore, ledger: Optional[FactLedger], device: str, source_id: str, raw: Dict[str, Any],
                       dropped: Optional[List[str]] = None) -> Any:
@@ -1665,6 +1879,68 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            f"register {_hex(e.reg)} is read over SPI without bit 7 (0x80) set in the register byte, so "
                                            "the part takes it as a write command.",
                                            "Send (reg | 0x80) to start an SPI read, as the datasheet's SPI protocol section requires."))
+
+    # 4b. datasheet constraints over the register settings, after every write the code makes (from the reset values)
+    if book.constraints:
+        summary["constraints"] = []
+        for c in book.constraints.values():
+            regs_c = {r.name.lower(): r for r in book.registers.values() if r.device.lower() == c.device.lower()}
+            try:
+                when = _constraint_tree(c.when, regs_c) if c.when else None
+                req = _constraint_tree(c.require, regs_c)
+            except ValueError as ex:   # a register re-recorded without a field the rule names
+                findings.append(RegFinding("ERROR", "CONSTRAINT_INVALID", "", 0, f"{c.id} {c.name}: {ex}",
+                                           "record_constraint again with the fields now on record."))
+                continue
+            checked, bad = 0, None
+            for _, w in walkers:
+                state: Dict[int, Optional[int]] = {r.addr: r.reset for r in regs_c.values()}
+                for e in w.events:
+                    if e.kind != "write" or not mine(e.addr):
+                        continue
+                    hit = False
+                    for r, v in writes_of(e, lambda r, a=e.addr: reg_at(r, a) is not None):
+                        reg = reg_at(r, e.addr) if is_int(r) else None
+                        if reg is None or reg.device.lower() != c.device.lower():
+                            continue
+                        if isinstance(v, Part):        # read-modify-write: only the bits it sets are known
+                            old = state.get(r)
+                            state[r] = None if old is None else (old & ~v.mask & 0xFF) | (v.value & v.mask)
+                        elif is_int(v):
+                            state[r] = v & 0xFF
+                        else:
+                            state[r] = None
+                        hit = True
+                    if not hit:
+                        continue
+                    try:
+                        if when is not None and not _eval_constraint(when, state):
+                            checked += 1
+                            continue
+                        ok = bool(_eval_constraint(req, state))
+                    except (KeyError, ZeroDivisionError, OverflowError, ValueError, TypeError):
+                        continue                       # a register it reads is not known yet
+                    checked += 1
+                    if not ok and bad is None:   # the settings the rule reads, the `when` fields first
+                        both = _Rule(req.tree, {**(when.refs if when else {}), **req.refs}, {})
+                        bad = (e, describe_state(both, state))
+            if bad is not None:
+                e, st = bad
+                wf, wl = where(model, e)
+                summary["constraints"].append(f"{c.id} {c.name}: VIOLATED after {wf}:{wl}")
+                findings.append(RegFinding("ERROR", "CONSTRAINT_VIOLATED", wf, wl,
+                                           f"{c.id} {c.name}: after this write the settings are {st}"
+                                           + (f", so {c.when}" if c.when else "") + f", and {c.require} is false.",
+                                           "Change the order or the values so the rule holds after every write (datasheets "
+                                           "usually want settings written in sleep mode, then the mode)."))
+            elif checked:
+                summary["constraints"].append(f"{c.id} {c.name}: holds after each of {checked} register writes")
+            else:
+                summary["constraints"].append(f"{c.id} {c.name}: not checked")
+                findings.append(RegFinding("WARNING", "CONSTRAINT_UNCHECKED", "", 0,
+                                           f"{c.id} {c.name}: the code never sets all the registers it reads, and their reset values "
+                                           "are not on record, so it could not be checked.",
+                                           "record_registers with reset (and reset_quote: the memory map row) for those registers."))
 
     # 5. formulas: probe runs with concrete register bytes
     if book.formulas:
