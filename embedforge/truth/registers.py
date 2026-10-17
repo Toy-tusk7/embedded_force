@@ -34,6 +34,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from embedforge.core.files import load_json, write_atomic
 from embedforge.truth.flow import FlowModel, Part, RxByte, Walker, is_int, writes_of
 from embedforge.truth.ledger import (GAP, FactLedger, _index, _squash, bounded, parse_int, quote_mismatch, unescape_literals,
                                      value_in_text)
@@ -913,9 +914,9 @@ class RegisterBook:
         self.bursts: Dict[str, BurstDef] = {}
         self.formulas: Dict[str, FormulaDef] = {}
         self.constraints: Dict[str, ConstraintDef] = {}
-        if self.path.exists():
+        d = load_json(self.path, {})   # a book that does not parse is kept aside, not overwritten
+        if isinstance(d, dict):
             try:
-                d = json.loads(self.path.read_text(encoding="utf-8"))
                 for r in d.get("registers", []):
                     r["fields"] = [FieldDef(**f) for f in r.get("fields", [])]
                     self.registers[r["id"]] = RegisterDef(**r)
@@ -935,11 +936,10 @@ class RegisterBook:
         return not (self.registers or self.layouts or self.bursts or self.formulas or self.constraints)
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps({
+        write_atomic(self.path, json.dumps({
             "registers": [asdict(r) for r in self.registers.values()], "layouts": [asdict(l) for l in self.layouts.values()],
             "bursts": [asdict(b) for b in self.bursts.values()], "formulas": [asdict(f) for f in self.formulas.values()],
-            "constraints": [asdict(c) for c in self.constraints.values()]}, indent=1),
-            encoding="utf-8")
+            "constraints": [asdict(c) for c in self.constraints.values()]}, indent=1))
 
     # ---------------------------------------------------------- constraints
     def record_constraint(self, store: SourceStore, device: str, source_id: str, name: str, require: str, quotes: Any,
@@ -949,6 +949,8 @@ class RegisterBook:
         device, name = (device or "").strip(), (name or "").strip()
         if not device or not re.fullmatch(r"[A-Za-z_][\w-]{0,40}", name):
             return {"ok": False, "error": "device and name (e.g. 'normal_mode_timing') are required"}
+        if str(when or "").strip().lower() in ("true", "always", "1", "none", "-"):
+            when = ""   # a rule that always holds (models write when='true')
         quotes = [quotes] if isinstance(quotes, str) else [str(q) for q in (quotes or []) if str(q).strip()]
         if not quotes:
             return {"ok": False, "error": "quotes: the datasheet text that states the rule, verbatim (several passages allowed: "

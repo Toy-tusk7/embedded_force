@@ -11,10 +11,12 @@ The LLM therefore cannot create a fact from its own weights: it has to point at 
 import json
 import re
 import threading
+import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
+from embedforge.core.files import load_json, write_atomic
 from embedforge.truth.source_store import SourceStore
 from embedforge.truth.trust import TrustTier, is_authoritative
 
@@ -25,12 +27,19 @@ _DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2212"), "-")
 _QUOTES = {ord("\u2018"): "'", ord("\u2019"): "'", ord("\u201c"): '"', ord("\u201d"): '"'}
 # super/subscript digits are the digits (I\u00b2C is I2C; a PDF's 2\u00b3\u2070 and a model's 2^30 both squash to 230)
 _SCRIPT_DIGITS = {**{ord(c): str(i) for i, c in enumerate("\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079")}, **{ord(c): str(i) for i, c in enumerate("\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089")}}
+# PDF equations come out in Unicode's mathematical letters and digits ('234\u00b5\ud835\udc5d\ud835\udc5d + \ud835\udc5d\ud835\udc5d\ud835\udc5d\ud835\udc5d_\ud835\udc52\ud835\udc52' in the BMP388's conversion-time
+# formula): to a reader, and so to a quote, they are the plain letters; the bullet and dot operators are one mark
+_MATH = {cp: unicodedata.normalize("NFKC", chr(cp)) for cp in range(0x1D400, 0x1D800)
+         if len(unicodedata.normalize("NFKC", chr(cp))) == 1 and unicodedata.normalize("NFKC", chr(cp)) != chr(cp)}
+_MATH.update({ord("\u2219"): "\u00b7", ord("\u22c5"): "\u00b7"})
+# the letters alone, one character for one, for showing a source (offsets into it stay valid)
+MATH_FOLD = {cp: c for cp, c in _MATH.items() if 0x1D400 <= cp < 0x1D800}
 
 
 def _squash(s: str) -> str:
     """Whitespace-free, case-folded form used for robust verbatim-quote containment."""
     s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl").replace("\u00b5", "\u03bc")   # micro sign = Greek mu
-    s = s.translate(_DASHES).translate(_QUOTES).translate(_SCRIPT_DIGITS)
+    s = s.translate(_DASHES).translate(_QUOTES).translate(_SCRIPT_DIGITS).translate(_MATH)
     # Markdown table/emphasis markup from the PDF converter ('| Bit 5..4 | mode |', '**Table 40**', '<br>') is layout,
     # not text: a quote matches with or without it
     s = re.sub(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]", " ", s)   # 2<sup>osr_p</sup> = 2^osr_p
@@ -41,7 +50,7 @@ def _squash(s: str) -> str:
 
 _MARKUP = re.compile(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]")
 _DROP = re.compile(r"[\s\"'`´]")
-_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES, **_SCRIPT_DIGITS}
+_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES, **_SCRIPT_DIGITS, **_MATH}
 
 
 def _squash_map(s: str) -> Tuple[str, List[int]]:
@@ -336,16 +345,15 @@ class FactLedger:
         self._load()
 
     def _load(self) -> None:
-        if self.path.exists():
+        for item in load_json(self.path, []):   # a ledger that does not parse is kept aside, not overwritten
             try:
-                for item in json.loads(self.path.read_text(encoding="utf-8")):
-                    f = Fact(**item)
-                    self.facts[f.id] = f
+                f = Fact(**item)
+                self.facts[f.id] = f
             except Exception:
                 pass
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps([f.public() for f in self.facts.values()], indent=2), encoding="utf-8")
+        write_atomic(self.path, json.dumps([f.public() for f in self.facts.values()], indent=2))
 
     @property
     def _retired_path(self) -> Path:
@@ -376,7 +384,7 @@ class FactLedger:
                 except Exception:
                     retired = []
             retired.append({**f.public(), "retired_reason": reason})
-            self._retired_path.write_text(json.dumps(retired, indent=2), encoding="utf-8")
+            write_atomic(self._retired_path, json.dumps(retired, indent=2))
             self._save()
             return True
 
@@ -414,10 +422,19 @@ class FactLedger:
         # the value is checked in the source's own text of the quoted pieces, not in the model's copy or the omitted text
         stated_text = " … ".join(src.text[a:b] for a, b in spans)
         match = value_in_text(value, stated_text)
+        # '78.09 ms' from a table whose unit is in the column header ('Measurement time[ms]'): the number is the value
+        num_unit = re.fullmatch(r"([-+]?\d+(?:[.,]\d+)?(?:[eE][-+]?\d+)?)\s*([A-Za-zµμ°%Ω][A-Za-zµμ°%Ω/]{0,5})", value)
+        if match is None and num_unit and (not unit or norm_unit(unit) == norm_unit(num_unit.group(2))):
+            match = value_in_text(num_unit.group(1), stated_text)
+            if match is not None:
+                value, unit = num_unit.group(1), unit or num_unit.group(2)
         if match is None:
+            several = re.search(r"\d[^,;]*[,;]|\band\b|\bor\b", value)
             return {
                 "ok": False,
-                "error": f"REJECTED: value '{value}' does not appear inside the quoted text, so the quote does not support it.",
+                "error": f"REJECTED: value '{value}' does not appear inside the quoted text, so the quote does not support it."
+                         + (" One value per fact: the number in value, its unit in unit (value '7.96', unit 'ms'); "
+                            "record_facts records several at once." if several or num_unit else ""),
             }
         form, conf = match
         stated_units = units_after(stated_text, value) if unit else []

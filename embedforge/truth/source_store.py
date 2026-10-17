@@ -20,6 +20,7 @@ import urllib.parse
 import httpx
 
 from embedforge.core.config import config
+from embedforge.core.files import load_json, write_atomic
 from embedforge.core.logger import logger
 from embedforge.truth.trust import TrustTier, classify_url
 
@@ -194,11 +195,8 @@ class SourceStore:
         return self.dir / "index.json"
 
     def _load(self) -> None:
-        p = self._index_path()
-        if not p.exists():
-            return
         try:
-            for item in json.loads(p.read_text(encoding="utf-8")):
+            for item in load_json(self._index_path(), []):   # an index that does not parse is kept aside
                 txt_path = self.dir / f"{item['id']}.txt"
                 text = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
                 s = Source(**{**item, "text": text})
@@ -208,9 +206,7 @@ class SourceStore:
             logger.log_event("SOURCE_STORE_WARN", f"Could not load index: {e}")
 
     def _save(self) -> None:
-        self._index_path().write_text(
-            json.dumps([s.public() for s in self.sources.values()], indent=2), encoding="utf-8"
-        )
+        write_atomic(self._index_path(), json.dumps([s.public() for s in self.sources.values()], indent=2))
 
     # ---------- core API ----------
     def add(self, url: str, title: str, text: str, kind: str = "web", replace: bool = False, via: str = "",

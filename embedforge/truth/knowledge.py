@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from embedforge.core.files import load_json, write_atomic
+
 STATUSES = ("open", "covered", "implemented", "not_applicable")
 
 
@@ -40,14 +42,14 @@ class Requirements:
         self.path = Path(root) / "requirements.json"
         self._lock = threading.Lock()
         self.items: Dict[str, Requirement] = {}
-        try:
-            for r in json.loads(self.path.read_text(encoding="utf-8")):
+        for r in load_json(self.path, []):
+            try:
                 self.items[r["id"]] = Requirement(**r)
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
+            except (TypeError, KeyError):
+                pass
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps([asdict(r) for r in self.items.values()], indent=1), encoding="utf-8")
+        write_atomic(self.path, json.dumps([asdict(r) for r in self.items.values()], indent=1))
 
     def sync(self, source_id: str, found: Iterable[Tuple[str, str, int, int]]) -> List[Requirement]:
         """Add the requirements (section, text, start, end) of a source not yet on record; returns them all."""

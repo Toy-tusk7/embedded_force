@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from embedforge.core.config import config
+from embedforge.core.files import load_json, write_atomic
 
 TEXT_EXTS = {
     ".c", ".h", ".cpp", ".hpp", ".cc", ".ino", ".ini", ".md", ".txt", ".json",
@@ -47,17 +48,14 @@ class Project:
         return self.root / "project.json"
 
     def meta(self) -> Dict[str, Any]:
-        if self.meta_path.exists():
-            try:
-                return json.loads(self.meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {"id": self.id, "name": self.id, "created": time.time()}
+        m = load_json(self.meta_path, None)
+        return m if isinstance(m, dict) else {"id": self.id, "name": self.id, "created": time.time()}
 
     def update_meta(self, **kw) -> Dict[str, Any]:
-        m = self.meta()
-        m.update(kw)
-        self.meta_path.write_text(json.dumps(m, indent=2), encoding="utf-8")
+        with self._lock:
+            m = self.meta()
+            m.update(kw)
+            write_atomic(self.meta_path, json.dumps(m, indent=2))
         return m
 
     # ------------------------------------------------------------ files
@@ -82,7 +80,7 @@ class Project:
         p = self.safe_path(rel, allow_binary=False)
         p.parent.mkdir(parents=True, exist_ok=True)
         existed = p.exists()
-        p.write_text(content, encoding="utf-8")
+        write_atomic(p, content)
         return {"path": rel.replace("\\", "/"), "bytes": len(content.encode("utf-8")), "created": not existed}
 
     def write_bytes(self, rel: str, data: bytes) -> Dict[str, Any]:
@@ -123,16 +121,11 @@ class Project:
 
     # ------------------------------------------------------------ conversation
     def load_conversation(self) -> List[Dict[str, Any]]:
-        p = self.root / "conversation.json"
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                return []
-        return []
+        m = load_json(self.root / "conversation.json", [])
+        return m if isinstance(m, list) else []
 
     def save_conversation(self, messages: List[Dict[str, Any]]) -> None:
-        (self.root / "conversation.json").write_text(json.dumps(messages, indent=1), encoding="utf-8")
+        write_atomic(self.root / "conversation.json", json.dumps(messages, indent=1))
 
     def user_messages(self, seed: Optional[List[str]] = None) -> List[str]:
         """Everything the user has typed, append-only (the USER-tier source is built from this, never from the
@@ -181,7 +174,7 @@ class Project:
             shutil.copy2(src, dst)
             files[kind] = dst.name
         mf = {"version": n, "timestamp": time.time(), "files": files, **manifest}
-        (d / "manifest.json").write_text(json.dumps(mf, indent=2), encoding="utf-8")
+        write_atomic(d / "manifest.json", json.dumps(mf, indent=2))
         return mf
 
     def build_file(self, version: int, kind: str) -> Optional[Path]:

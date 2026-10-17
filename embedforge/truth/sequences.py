@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from embedforge.core.files import load_json, write_atomic
 from embedforge.truth.flow import Event, FlowModel, Part, Trace, is_int, write_reading, writes_of
 from embedforge.truth.ledger import FactLedger, parse_int
 
@@ -88,17 +89,16 @@ class SequenceBook:
         self.path = Path(root) / "sequences.json"
         self._lock = threading.Lock()
         self.items: Dict[str, SequenceRecord] = {}
-        if self.path.exists():
+        for d in load_json(self.path, []):   # a file that does not parse is kept aside, not overwritten
             try:
-                for d in json.loads(self.path.read_text(encoding="utf-8")):
-                    d["steps"] = [Step(**s) for s in d.get("steps", [])]
-                    rec = SequenceRecord(**d)
-                    self.items[rec.id] = rec
-            except (ValueError, TypeError, KeyError):
+                d["steps"] = [Step(**s) for s in d.get("steps", [])]
+                rec = SequenceRecord(**d)
+                self.items[rec.id] = rec
+            except (ValueError, TypeError, KeyError, AttributeError):
                 pass
 
     def _save(self) -> None:
-        self.path.write_text(json.dumps([r.public() for r in self.items.values()], indent=2), encoding="utf-8")
+        write_atomic(self.path, json.dumps([r.public() for r in self.items.values()], indent=2))
 
     def _resolve_fields(self, st: Step, raw: Any, ledger: FactLedger, subject: str) -> str:
         """fields {'mode': 'normal', 'press_en': 1} -> {'mode': 3, 'press_en': 1}, checked against the register map; a value

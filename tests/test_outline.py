@@ -51,6 +51,27 @@ def test_required_reading_follows_what_the_code_does():
     assert "2.4" in {s.num for s, _ in required(secs, dict(uses, fifo="the code sets fifo_en"))}
 
 
+def test_legal_pages_are_not_required_reading_and_state_no_rules():
+    """The BMP388's '8.3 Application examples and hints' is part of its legal disclaimer: its title looks like the
+    recommended-settings sections, and its warranty sentences ('shall in no event be regarded as a guarantee') became
+    rules no record could settle."""
+    from embedforge.truth.outline import administrative, required_topics
+    legal = ("4. Legal disclaimer\n" + "Bosch Sensortec products are released on the basis of the legal terms. " * 3 + "\n\n"
+             "4.1. Engineering samples\n" + "Engineering samples are marked with an asterisk. " * 4 + "\n\n"
+             "4.2. Application examples and hints\nWith respect to any examples or hints given herein, Bosch Sensortec "
+             "hereby disclaims any and all warranties and liabilities of any kind. The information given in this document "
+             "shall in no event be regarded as a guarantee of conditions or characteristics. " * 2 + "\n\n"
+             "5. Document history and modification\n" + "Rev. 1.7 updated the application examples. " * 4 + "\n")
+    ds = DS + "\n" + legal
+    secs = sections(ds)
+    assert administrative(secs) == {"4", "4.1", "4.2", "5"}, [s.label for s in secs]
+    uses = {"settings_choice": "the code chooses oversampling", "modes": "the code sets mode = normal", "mode_words": "normal"}
+    assert not {s.num for s, _w, _t in required_topics(secs, uses)} & {"4", "4.1", "4.2", "5"}
+    sec = find_section(secs, "4.2")
+    assert requirements(ds[sec.start:sec.end]) == []
+    assert requirements("Write the settings in sleep mode before you set normal mode.") != []
+
+
 def test_read_log_adds_up_and_persists(tmp_path):
     log = ReadLog(tmp_path)
     log.add("SRC-001", 0, 100)

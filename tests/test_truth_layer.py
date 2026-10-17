@@ -63,6 +63,35 @@ def test_value_must_be_inside_quote(env):
     assert not r["ok"] and "does not appear inside" in r["error"]
 
 
+def test_a_table_value_written_with_its_unit_is_the_number(tmp_path):
+    """BMP388 Table 22: the unit is in the column header, the row has bare numbers. A model writes '7.96 ms'."""
+    store = SourceStore(tmp_path)
+    table = ("Table 22: measurement time\nOversampling setting Pressure oversampling Temperature oversampling Measurement "
+             "time[ms]\nTyp Max Typ Min\nLow power ×2 ×1 6.84 7.96 146.00 125.56\n")
+    src = store.add("https://www.bosch-sensortec.com/bmp388.pdf", "BMP388", table, kind="pdf")
+    ledger = FactLedger(tmp_path, store)
+    r = ledger.record("BMP388", "t_meas_max_osr_x2_x1", "7.96 ms", src.id, "Low power ×2 ×1 6.84 7.96 146.00 125.56")
+    assert r["ok"] and r["fact"]["value"] == "7.96" and r["fact"]["unit"] == "ms", r
+    two = ledger.record("BMP388", "t_meas", "6.84 ms typical, 7.96 ms maximum", src.id, "Low power ×2 ×1 6.84 7.96 146.00 125.56")
+    assert not two["ok"] and "One value per fact" in two["error"]
+    assert not ledger.record("BMP388", "t", "7.97 ms", src.id, "Low power ×2 ×1 6.84 7.96 146.00 125.56")["ok"]
+
+
+def test_pdf_math_letters_are_the_letters(tmp_path):
+    """The BMP388's conversion-time equation as its PDF gives it: Unicode mathematical italic letters, garbled."""
+    from embedforge.truth.ledger import MATH_FOLD, anchor_pieces
+    eq = ("𝑇𝑇𝑐𝑐𝑜𝑜𝑠𝑠𝑐𝑐 = 234µ𝑝𝑝 + 𝑝𝑝𝑝𝑝𝑝𝑝𝑝𝑝𝑝𝑝_𝑝𝑝𝑐𝑐 ∙ (392µ𝑝𝑝 + 2𝑜𝑜𝑠𝑠𝑓𝑓_𝑠𝑠 ∙ 2000µ𝑝𝑝) + 𝑑𝑑𝑝𝑝𝑡𝑡𝑝𝑝_𝑝𝑝𝑐𝑐 ∙ "
+          "(313µ𝑝𝑝 + 2𝑜𝑜𝑠𝑠𝑓𝑓_𝑓𝑓 ∙ 2000µ𝑝𝑝)")
+    shown = eq.translate(MATH_FOLD)
+    assert len(shown) == len(eq) and shown.startswith("TTccoosscc = 234µpp + pppppppppp_ppcc")
+    assert anchor_pieces("= 234µpp + … ⋅ (392µpp + 2oossff_ss · 2000µpp) + … ∙ (313µpp + 2oossff_ff ∙ 2000µpp)", eq)
+    assert anchor_pieces(eq, eq) and not anchor_pieces("= 234µpp + … ∙ (393µpp + 2oossff_ss ∙ 2000µpp)", eq)
+    store = SourceStore(tmp_path)
+    src = store.add("https://www.bosch-sensortec.com/bmp388.pdf", "BMP388", "The equation:\n" + eq + "\n", kind="pdf")
+    r = FactLedger(tmp_path, store).record("BMP388", "t_conv_offset_us", "234", src.id, "= 234µpp + pppppppppp_ppcc ∙ (392µpp")
+    assert r["ok"], r
+
+
 def test_pdf_whitespace_and_hex_forms_are_tolerated(env):
     _, _, ledger, src = env
     # datasheet writes the address as bare hex "6B" -> accepted but flagged LOOSE

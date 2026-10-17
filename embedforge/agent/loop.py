@@ -530,6 +530,10 @@ class AgentRunner:
                     if belt.ended:
                         break
                 project.trace({**trace, "results": results_trace})
+                try:   # every step: a stopped server keeps the run so far, and 'continue' resumes from it
+                    project.save_conversation(ctx.for_persistence(history))
+                except Exception:
+                    pass
 
                 if belt.ended in ("ask_user", "finish"):  # the same unbuilt-firmware check as for plain replies
                     built = belt.state["build_ok"] and belt.state["build_hash"] == belt.source_hash()

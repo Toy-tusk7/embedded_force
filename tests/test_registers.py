@@ -247,6 +247,9 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     summary, codes, found = _codes(p, ledger)
     bad = next(x for x in found if x.code == "CONSTRAINT_VIOLATED")
     assert "OSR.osr_p=5" in bad.message and "mode=3 (normal)" in bad.message and bad.line == swapped.split("\n").index("  wr(REG_PWR, 0x33);") + 1, bad
+    always = book.record_constraint(store, "BMPX", src2.id, "osr_limit", "OSR.osr_p <= 3",   # models write when='true'
+                                    ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."], when="true")
+    assert always["ok"] and "when" not in always["constraint"], always
 
 
 def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):

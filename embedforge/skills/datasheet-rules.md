@@ -30,6 +30,11 @@ quoting the datasheet text that says the same.
 ## Formulas in PDF text
 PDF extraction loses exponents and fraction bars: "2osr_p" is 2^osr_p, "230" next to a coefficient is 2^30.
 Write the rule with REGISTER.field names and the quoted numbers; unit factors (1000 for ms to us) are allowed.
+Some PDFs garble the letters of an equation too (the BMP388's conversion time reads
+"= 234μpp + pppppppppp_ppcc ∙ (392μpp + 2oossff_ss ∙ 2000μpp) + ..."): copy the line as read_section shows it, put
+'…' over a garbled name if you like, and keep every number and the 2 before an exponent. A limit like that one is a
+record_constraint: when PWR_CTRL.mode == normal: <conversion time from the formula> <= <sampling period from the ODR
+table>, quoting the formula line and the table row.
 
 ## When "not applicable" is right
 Only when the rule is about something the code does not use: another mode, an interrupt pin the code never enables,

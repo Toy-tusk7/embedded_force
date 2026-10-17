@@ -9,8 +9,10 @@ from embedforge import eda
 from embedforge.agent.events import RunSession
 from embedforge.agent.workspace import Project
 from embedforge.core.config import config
+from embedforge.core.files import write_atomic
 from embedforge.toolchain import betaflight, pio, wsl
 from embedforge.truth import FactLedger, SourceStore, verify_project
+from embedforge.truth.ledger import MATH_FOLD
 from embedforge.truth.verifier import build_inputs_hash, collect_sources
 
 
@@ -377,7 +379,8 @@ class ToolBelt:
         # (prompt, png) -> text: reads datasheet figures; None = the configured vision model (agent/vision.py)
         self.vision: Optional[Callable[[str, bytes], str]] = None
         if not self.reads.path.exists() and (project.root / "conversation.json").exists():
-            self.reads.seed(project.load_conversation())   # a project from before read tracking
+            # a project from before read tracking, or a damaged log (kept aside as reads.json.corrupt)
+            self.reads.seed(project.load_conversation())
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
         meta = project.meta()
         lb, lv = meta.get("last_build") or {}, meta.get("last_verify") or {}
@@ -834,10 +837,12 @@ class ToolBelt:
             if out and total + (b - a) > budget:
                 later.append(s.num)
                 continue
-            text = src.text[a:b]
+            # PDF math letters shown as the plain letters (one character each, so offsets hold; quotes match either form)
+            text = src.text[a:b].translate(MATH_FOLD)
             total += len(text)
             self.reads.add(source_id, a, b)
-            item = {"section": s.label, "text": text, "requirements": requirements(text)}
+            # offset: where the text sits in the source, so the read log can be rebuilt from the conversation
+            item = {"section": s.label, "offset": a, "text": text, "requirements": requirements(text)}
             figs = [x for x in self._figure_index(source_id) if s.start <= x.start < end]
             if figs:   # drawings the text extraction cannot carry
                 item["figures"] = [f"{x.label}: {x.caption} — read_figure('{source_id}', '{x.label}')" for x in figs[:8]]
@@ -2017,7 +2022,7 @@ class ToolBelt:
                 mf = json.loads(mf_path.read_text(encoding="utf-8"))
                 mf["verified"] = rep.passed
                 mf["verification_summary"] = rep.summary()
-                mf_path.write_text(json.dumps(mf, indent=2), encoding="utf-8")
+                write_atomic(mf_path, json.dumps(mf, indent=2))
                 self.session.emit("build_manifest", manifest=mf)
         pub = rep.public()
         self.session.emit("verify", report=pub, summary=rep.summary())

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from embedforge.core.files import load_json, write_atomic
+
 
 @dataclass
 class Section:
@@ -138,6 +140,9 @@ def xrefs(text: str) -> List[str]:
 _NORMATIVE = re.compile(r"\b(must|shall|should|required|requires?|recommended|strongly|has to|have to|needs? to|only|never|"
                         r"do not|not allowed|prohibited|before|after|prior to|until|wait|at least|at most|minimum|maximum|"
                         r"ensure|valid|invalid|error)\b", re.I)
+# a vendor's legal wording uses 'shall' and 'must' too, about warranties, not about the device
+_DISCLAIMER = re.compile(r"disclaim|warrant(y|ies)|liabilit|infringement|in no event|without (prior )?notice|"
+                         r"patent|intellectual property|life[- ]support|safety[- ]critical", re.I)
 
 
 def requirements(text: str, limit: int = 12) -> List[str]:
@@ -147,7 +152,7 @@ def requirements(text: str, limit: int = 12) -> List[str]:
     for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z])|\n{2,}|\n(?=[•\-–]\s)", flat):
         s = re.sub(r"\s+", " ", sent).strip(" •-–")
         s = re.split(r"\s*={3,}\s*PDF PAGE", s)[0].strip()   # a page break's running header is not part of the sentence
-        if 25 <= len(s) <= 400 and _NORMATIVE.search(s) and s not in out:
+        if 25 <= len(s) <= 400 and _NORMATIVE.search(s) and not _DISCLAIMER.search(s) and s not in out:
             out.append(s)
         if len(out) >= limit:
             break
@@ -162,10 +167,8 @@ class ReadLog:
     def __init__(self, root: Path):
         self.path = Path(root) / "sources" / "reads.json"
         self._lock = threading.Lock()
-        try:
-            self.spans: Dict[str, List[List[int]]] = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.spans = {}
+        spans = load_json(self.path, {})   # a damaged log is kept aside; the agent's tools rebuild it from the conversation
+        self.spans: Dict[str, List[List[int]]] = spans if isinstance(spans, dict) else {}
 
     def add(self, source_id: str, a: int, b: int) -> None:
         if b <= a:
@@ -180,28 +183,29 @@ class ReadLog:
                     merged.append([s, e])
             self.spans[source_id] = merged
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.spans), encoding="utf-8")
+            write_atomic(self.path, json.dumps(self.spans))
 
     def seed(self, messages: List[dict]) -> int:
-        """A project from before read tracking: rebuild the log from the read_source results in its saved conversation
-        (each excerpt carries its offset). Returns the number of excerpts found."""
+        """Rebuild the log from the read_source excerpts and read_section texts in a saved conversation (each carries
+        its offset): a project from before read tracking, or a log that was damaged. Returns the number found."""
         calls = {tc.get("id"): tc for m in messages for tc in (m.get("tool_calls") or [])}
         n = 0
         for m in messages:
             tc = calls.get(m.get("tool_call_id"))
-            if m.get("role") != "tool" or not tc or (tc.get("function") or {}).get("name") != "read_source":
+            name = (tc.get("function") or {}).get("name") if tc else None
+            if m.get("role") != "tool" or name not in ("read_source", "read_section"):
                 continue
             try:
                 res = json.loads(m.get("content") or "{}")
             except ValueError:
                 continue
-            for e in res.get("excerpts") or []:
+            for e in (res.get("excerpts") or []) + (res.get("sections") or []):
                 if isinstance(e, dict) and isinstance(e.get("offset"), int) and res.get("source_id"):
                     self.add(res["source_id"], e["offset"], e["offset"] + len(str(e.get("text") or "")))
                     n += 1
         if not n:   # nothing to rebuild: still mark the log as started so it is not rebuilt again
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.spans), encoding="utf-8")
+            write_atomic(self.path, json.dumps(self.spans))
         return n
 
     def seen(self, source_id: str, a: int, b: int) -> float:
@@ -231,6 +235,19 @@ _TOPICS = {   # topic -> section titles about it
 # features whose sections matter only when the code uses them
 _UNLESS_USED = {"fifo": r"\bFIFO\b", "interrupts": r"interrupt|\bINT_|watermark"}
 
+# legal and document-keeping sections, with everything under them: the BMP388's '8.3 Application examples and hints'
+# is part of its legal disclaimer, and its warranty sentences ('shall in no event be regarded as a guarantee') became
+# rules about the settings the code chooses that no record could ever settle
+_ADMINISTRATIVE = re.compile(r"\blegal\b|disclaimer|document (history|change|revision)|revision history|"
+                             r"engineering samples?|product use|trademarks?|ordering information|contact (information|us)|"
+                             r"imprint|copyright", re.I)
+
+
+def administrative(secs: List[Section]) -> set:
+    """Numbers of the legal / document-history sections and their subsections."""
+    top = {s.num for s in secs if _ADMINISTRATIVE.search(s.title)}
+    return {s.num for s in secs if any(s.num == t or s.num.startswith(t + ".") for t in top)}
+
 
 def required(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Section, str]]:
     """Sections the code depends on, with why (required_topics also gives the topic)."""
@@ -248,8 +265,9 @@ def required_topics(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Sec
     words = [w for w in (uses.get("mode_words") or "").lower().split(",") if w]
     regs = [r for r in (uses.get("register_names") or "").split(",") if r]
     out: List[Tuple[Section, str, str]] = []
+    admin = administrative(secs)
     for s in secs:
-        if s.end - s.start < 120:          # a heading over a figure or table only
+        if s.end - s.start < 120 or s.num in admin:   # a heading over a figure or table only; the legal pages
             continue
         if any(t not in uses and re.search(rx, s.title, re.I) for t, rx in _UNLESS_USED.items()):
             continue
@@ -272,7 +290,7 @@ def required_topics(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Sec
 def with_xrefs(text: str, secs: List[Section], need: List[Tuple[Section, str, str]]) -> List[Tuple[Section, str, str]]:
     """The required sections plus the ones they point to ('see Sec. 3.9.1'), one hop: a rule that defers to another
     section is only understood with it."""
-    have = {s.num for s, _w, _t in need}
+    have = {s.num for s, _w, _t in need} | administrative(secs)
     out = list(need)
     for s, _w, topic in need:
         for num in xrefs(text[s.start:s.end]):
