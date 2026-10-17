@@ -30,7 +30,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 # Datasheet PDF -> Markdown (headings, tables, reconstructed equations). PyMuPDF is AGPL-3.0 (or commercial licence);
-# without it PDFs are read with pypdf (plain text).
+# without it PDFs are read with pypdf (plain text). It also renders datasheet figures for the vision model (read_figure).
 pdf = [
     "pymupdf4llm>=1.28",
 ]

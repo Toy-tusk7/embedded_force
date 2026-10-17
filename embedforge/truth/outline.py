@@ -99,6 +99,41 @@ def subtree_end(secs: List[Section], sec: Section) -> int:
     return secs[-1].end
 
 
+# ------------------------------------------------------------------ the document map: figures, tables, cross-references
+@dataclass
+class Figure:
+    label: str      # 'Figure 3' / 'Table 22'
+    caption: str    # 'Normal mode timing diagram'
+    page: int       # 1-based PDF page (0: unknown)
+    start: int      # offset of the caption line
+    section: str    # number of the section it sits in
+
+
+_CAPTION = re.compile(r"(?m)^[ \t]*((?:Figure|Fig\.|Table)\s+\d{1,3})\s*[:.]\s*(\S[^\n]{2,120}?)[ \t]*$")
+_PAGE = re.compile(r"={3,}\s*PDF PAGE\s+(\d+)\s*={3,}")
+_XREF = re.compile(r"\b(?:see\s+)?(?:Sec(?:tion)?s?\.?|chapter|§)\s*(\d{1,2}(?:\.\d{1,2}){1,4})", re.I)
+
+
+def figures(text: str, secs: List[Section]) -> List[Figure]:
+    """Every figure and table caption, with its PDF page and section."""
+    pages = [(m.start(), int(m.group(1))) for m in _PAGE.finditer(text)]
+    out, seen = [], set()
+    for m in _CAPTION.finditer(text):
+        label = re.sub(r"^Fig\.", "Figure", re.sub(r"\s+", " ", m.group(1)))
+        if label in seen or re.search(r"\.{4,}", m.group(2)):   # the list of figures at the front, or a repeat
+            continue
+        seen.add(label)
+        page = next((p for off, p in reversed(pages) if off <= m.start()), 0)
+        sec = next((s.num for s in reversed(secs) if s.start <= m.start()), "")
+        out.append(Figure(label, m.group(2).strip(), page, m.start(), sec))
+    return out
+
+
+def xrefs(text: str) -> List[str]:
+    """Section numbers a passage points to ('see Sec. 3.9.1' -> '3.9.1')."""
+    return list(dict.fromkeys(m.group(1) for m in _XREF.finditer(text)))
+
+
 # ------------------------------------------------------------------ requirement sentences
 _NORMATIVE = re.compile(r"\b(must|shall|should|required|requires?|recommended|strongly|has to|have to|needs? to|only|never|"
                         r"do not|not allowed|prohibited|before|after|prior to|until|wait|at least|at most|minimum|maximum|"
@@ -231,4 +266,18 @@ def required_topics(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Sec
                     continue               # 'Forced mode' when the code uses normal mode
             out.append((s, why, topic))
             break
+    return out
+
+
+def with_xrefs(text: str, secs: List[Section], need: List[Tuple[Section, str, str]]) -> List[Tuple[Section, str, str]]:
+    """The required sections plus the ones they point to ('see Sec. 3.9.1'), one hop: a rule that defers to another
+    section is only understood with it."""
+    have = {s.num for s, _w, _t in need}
+    out = list(need)
+    for s, _w, topic in need:
+        for num in xrefs(text[s.start:s.end]):
+            ref = next((x for x in secs if x.num == num), None)
+            if ref is not None and ref.num not in have and ref.end - ref.start >= 120:
+                have.add(ref.num)
+                out.append((ref, f"section {s.num} refers to it", topic if topic in STRICT_TOPICS else "xref"))
     return out

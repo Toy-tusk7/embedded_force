@@ -71,6 +71,44 @@ void loop() {}
 """
 
 
+def _project(tmp_path, ds=DS):
+    p = Project("t", tmp_path / "t")
+    store = SourceStore(p.root)
+    src = store.add("https://www.bosch-sensortec.com/dm388.pdf", "DM388 datasheet", ds, kind="pdf")
+    ledger = FactLedger(p.root, store)
+    store.add("https://www.bosch-sensortec.com/dm388-addr.pdf", "addr", "The 7-bit I2C address is 0x76.", kind="pdf")
+    addr = ledger.record("DM388", "i2c_address", "0x76", "SRC-002", "The 7-bit I2C address is 0x76.")["fact"]["id"]
+    reg = ledger.record("DM388", "pwr_ctrl_reg", "0x1B", src.id, "3.1. Register 0x1B “PWR_CTRL”")["fact"]["id"]
+    (p.root / "src").mkdir(exist_ok=True)
+    (p.root / "src" / "main.cpp").write_text(DRIVER.replace("{reg}", reg).replace("{addr}", addr), encoding="utf-8")
+    from embedforge.truth.registers import RegisterBook
+    q = ds[ds.index("3.1. Register 0x1B"):ds.index("normal. ", ds.index("3.1. Register 0x1B")) + 7]
+    assert RegisterBook(p.root).record_registers(store, ledger, "DM388", src.id, [
+        {"name": "PWR_CTRL", "addr": "0x1B", "quote": q,
+         "fields": [{"name": "mode", "bits": "5:4", "values": {"sleep": "00", "normal": "11"}}]}])["ok"]
+    return ToolBelt(p, RunSession("r", p.id), store, ledger), store, src
+
+
+def test_figures_in_the_sections_about_what_the_code_sets_must_be_read(tmp_path):
+    body = dict(BODY)
+    body["2.1.2. Normal mode"] += "\nFigure 3: Normal mode timing diagram\n"
+    body["2.4. FIFO read out"] += "\nFigure 9: FIFO frame layout\n"   # the FIFO is not used: its figure is not needed
+    ds = TOC + "\n" + "".join(f"{h}\n{text}\n\n1 Write the register first, then wait.\n\n" for h, text in body.items())
+    belt, store, src = _project(tmp_path, ds)
+
+    def figure_findings():
+        return [f for f in belt.call("verify", {})["findings"] if f["code"] == "FIGURE_UNREAD"]
+    first = figure_findings()
+    assert len(first) == 1 and first[0]["severity"] == "WARNING", first
+    assert "Figure 3: Normal mode timing diagram (section 2.1.2)" in first[0]["message"] and "Figure 9" not in first[0]["message"]
+    assert "not stored" in first[0]["suggestion"]
+    store.keep_pdf(src.id, b"%PDF-1.4 stand-in")
+    assert f"read_figure('{src.id}'" in figure_findings()[0]["suggestion"]
+    (store.dir / "figures").mkdir(exist_ok=True)
+    (store.dir / "figures" / f"{src.id}-figure-3.md").write_text("1. Set OSR and ODR\n2. mode = normal", encoding="utf-8")
+    assert figure_findings() == []
+
+
 def test_verify_requires_the_sections_the_code_depends_on(tmp_path):
     p = Project("t", tmp_path / "t")
     store = SourceStore(p.root)

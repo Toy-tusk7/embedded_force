@@ -420,6 +420,7 @@ class SourceStore:
         """Store the full text of a document. Web pages are read with Tavily Extract (advanced, Markdown: rendered pages,
         tables kept); PDFs are downloaded and converted locally (tables and equations kept), with Extract as the fallback."""
         text, kind, via, request = "", "web", "", ""
+        pdf_data = b""
         err: Optional[str] = None
         is_pdf_url = url.lower().split("?")[0].endswith(".pdf")
 
@@ -450,7 +451,7 @@ class SourceStore:
                         ctype = resp.headers.get("content-type", "").lower()
                 data = bytes(buf)
                 if "pdf" in ctype or is_pdf_url or data[:5] == b"%PDF-":
-                    text, kind = pdf_to_text(data), "pdf"
+                    text, kind, pdf_data = pdf_to_text(data), "pdf", data
                 else:
                     text = html_to_text(data.decode("utf-8", "ignore"))
                 via = "download"
@@ -461,4 +462,16 @@ class SourceStore:
 
         if len(text.strip()) < 200:
             raise RuntimeError(f"Could not retrieve readable content from {url}: {err or 'empty document'}")
-        return self.add(url, url.rsplit("/", 1)[-1] or url, text, kind=kind, via=via, tavily_request=request)
+        src = self.add(url, url.rsplit("/", 1)[-1] or url, text, kind=kind, via=via, tavily_request=request)
+        if kind == "pdf" and via == "download" and pdf_data[:5] == b"%PDF-":
+            self.keep_pdf(src.id, pdf_data)
+        return src
+
+    # ---------- the original document ----------
+    def pdf_path(self, source_id: str) -> Path:
+        return self.dir / f"{source_id}.pdf"
+
+    def keep_pdf(self, source_id: str, data: bytes) -> None:
+        """Keep a datasheet's original PDF next to its text: its figures and tables can be rendered and read later."""
+        if data[:5] == b"%PDF-":
+            self.pdf_path(source_id).write_bytes(data)

@@ -407,7 +407,8 @@ async def upload_files(
 
                             if entry_suffix == ".pdf":
                                 pdf_txt = _extract_pdf_text(data)
-                                store.add(f"user://upload/{norm}", f"Schematic/Datasheet: {Path(norm).name}", pdf_txt, kind="pdf")
+                                s = store.add(f"user://upload/{norm}", f"Schematic/Datasheet: {Path(norm).name}", pdf_txt, kind="pdf")
+                                store.keep_pdf(s.id, data)   # its figures can be read later (read_figure)
                             elif entry_suffix in {".sch", ".kicad_sch", ".kicad_pcb", ".brd"}:
                                 sch_txt = data.decode("utf-8", errors="replace")
                                 store.add(f"user://upload/{norm}", f"Schematic: {Path(norm).name}", sch_txt, kind="schematic")
@@ -438,7 +439,8 @@ async def upload_files(
             dest = f"docs/schematics/{clean_name}"
             p.write_bytes(dest, content)
             pdf_txt = _extract_pdf_text(content)
-            store.add(f"user://upload/{dest}", f"Schematic/Datasheet: {clean_name}", pdf_txt if pdf_txt.strip() else f"Schematic PDF: {clean_name}", kind="pdf")
+            s = store.add(f"user://upload/{dest}", f"Schematic/Datasheet: {clean_name}", pdf_txt if pdf_txt.strip() else f"Schematic PDF: {clean_name}", kind="pdf")
+            store.keep_pdf(s.id, content)   # its figures can be read later (read_figure)
             uploaded_records.append({
                 "name": clean_name,
                 "path": dest,

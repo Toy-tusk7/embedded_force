@@ -71,6 +71,10 @@ class EmbedForgeConfig(BaseModel):
     llm_provider: str = Field(
         default_factory=lambda: os.getenv("EMBEDFORGE_PROVIDER", "").strip().lower()
     )
+    # the vision model that transcribes datasheet figures (timing diagrams, mode transitions, tables drawn as images);
+    # any OpenAI-compatible provider with image input: NVIDIA's Nemotron VL, Gemini, a self-hosted VLM
+    vision_provider: str = Field(default_factory=lambda: os.getenv("EMBEDFORGE_VISION_PROVIDER", "nvidia").strip().lower())
+    vision_model: str = Field(default_factory=lambda: os.getenv("EMBEDFORGE_VISION_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b"))
     # an independent model call reviews the agent's 'implemented' / 'not applicable' claims about datasheet requirements
     claim_review: bool = Field(default_factory=lambda: os.getenv("EMBEDFORGE_CLAIM_REVIEW", "1") != "0")
     # cppcheck + MISRA C:2012 after each PlatformIO build (PlatformIO installs tool-cppcheck on first use)

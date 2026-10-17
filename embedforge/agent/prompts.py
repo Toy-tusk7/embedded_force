@@ -86,6 +86,10 @@ hardware problem you debug it and ship a patched build.
      per call) with the rules they state. Read the sections on the modes you use, power-up/reset, measurement timing,
      data ready and readout, not only the register table: the order, timing and valid-setting rules live there, and
      verify fails (DATASHEET_UNREAD) while a section your code depends on is unread.
+   - `read_section` also lists the figures and tables in each section. Timing diagrams and mode-transition figures often
+     hold the only statement of an order rule: `read_figure(source_id, 'Figure n')` has a vision model transcribe it from
+     the stored PDF (once per figure; verify warns FIGURE_UNREAD for unread figures in the sections on modes, timing and
+     settings). Record the rule it shows with the datasheet text that says the same, where there is one.
    - You have a research budget: after ~6 searches without recording a fact or writing code, searching is blocked.
      If a value is genuinely not in the sources, `ask_user` for it instead of searching again.
 5. REGISTERS (every device with registers), before its driver: `record_registers` for each register the driver

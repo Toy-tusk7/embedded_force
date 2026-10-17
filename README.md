@@ -71,6 +71,7 @@ flowchart LR
 | Pins in calls vs. schematic and chip | `setSDA(17)` on the SCL pin; `Wire1` on GPIO16 (an I2C0 pin) | `PIN_ROLE_MISMATCH`, `PIN_CAPABILITY` |
 | Settings vs. datasheet rules, after every write | Normal mode entered while the 200 Hz default ODR cannot fit the conversion | `CONSTRAINT_VIOLATED` |
 | Reading vs. what the code depends on | The Normal mode / Data ready sections never read; a rule in them never settled | `DATASHEET_UNREAD`, `REQUIREMENT_OPEN` |
+| Figures in those sections (warning) | The BMP388's normal-mode timing diagram never transcribed; `read_figure` renders the PDF page for Nemotron 3.5 Super VL | `FIGURE_UNREAD` |
 | Robustness | `while (!Serial)` with no timeout; a bus status ignored; a failure branch returning success | `UNBOUNDED_WAIT`, `RESULT_IGNORED`, `FAILURE_AS_SUCCESS` |
 | Compiler and static analysis | Uninitialised use, shift overflow (GCC `-Wall -Wextra`); cppcheck defects; MISRA C:2012 | `COMPILER_WARNING`, `STATIC_ANALYSIS`, `MISRA_C` |
 

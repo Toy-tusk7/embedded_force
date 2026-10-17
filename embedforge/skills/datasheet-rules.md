@@ -19,6 +19,14 @@ build. Prefer the record whenever the rule says something about values, order or
 | Compensation / conversion formulas | record_formula (quote the datasheet or the vendor's reference code) |
 | Recommended settings per use case | record_fact for the chosen row's values, citing the table row; use them in the code |
 
+## Figures and large datasheets
+On a 100-page datasheet, read by section: datasheet_outline, then read_section on the sections the code depends on
+(verify lists them; a section they refer to, "see Sec. 3.11", becomes required too). Timing diagrams and mode
+diagrams are drawn, so the text extraction loses them: read_section lists each section's figures, and
+read_figure(source_id, 'Figure n') transcribes one from the stored PDF. A transcription is the vision model's reading,
+not the datasheet's words: record the rule it shows (record_sequence for an order, record_constraint for a limit)
+quoting the datasheet text that says the same.
+
 ## Formulas in PDF text
 PDF extraction loses exponents and fraction bars: "2osr_p" is 2^osr_p, "230" next to a coefficient is 2^30.
 Write the rule with REGISTER.field names and the quoted numbers; unit factors (1000 for ms to us) are allowed.

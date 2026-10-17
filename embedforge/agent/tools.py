@@ -75,6 +75,12 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
         "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
         {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
+    _fn("read_figure",
+        "Read a datasheet FIGURE or TABLE drawn as an image (timing diagrams, mode transitions, state machines): "
+        "figure='Figure 3' or a caption word. A vision model transcribes it from the stored PDF (order of steps, "
+        "values, arrows). read_section lists the figures of each section; rules about order and timing are often "
+        "only in the figure.",
+        {"source_id": S, "figure": S}, ["source_id", "figure"]),
     _fn("load_skill",
         "Load a skill: a playbook for a kind of work (the SKILLS list in your instructions names them), e.g. "
         "'sensor-driver' before writing a sensor driver, 'datasheet-rules' before settling datasheet requirements.",
@@ -368,6 +374,8 @@ class ToolBelt:
         self.reads = ReadLog(project.root)   # what of each source the agent has been shown (kept across runs)
         # messages -> reply text: the independent reviewer of requirement claims (set by the agent runner)
         self.reviewer: Optional[Callable[[List[Dict[str, Any]]], str]] = None
+        # (prompt, png) -> text: reads datasheet figures; None = the configured vision model (agent/vision.py)
+        self.vision: Optional[Callable[[str, bytes], str]] = None
         if not self.reads.path.exists() and (project.root / "conversation.json").exists():
             self.reads.seed(project.load_conversation())   # a project from before read tracking
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
@@ -383,7 +391,7 @@ class ToolBelt:
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
             "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
             "coding_brief": self.coding_brief, "resolve_requirements": self.resolve_requirements,
-            "load_skill": self.load_skill,
+            "load_skill": self.load_skill, "read_figure": self.read_figure,
             "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
@@ -484,6 +492,9 @@ class ToolBelt:
             h.update(n.encode())
             if p.exists():
                 h.update(p.read_bytes())
+        # a stored PDF or a figure read changes what FIGURE_UNREAD says
+        for p in sorted(self.store.dir.glob("*.pdf")) + sorted((self.store.dir / "figures").glob("*.md")):
+            h.update(p.name.encode())
         return h.hexdigest()
 
     # ------------------------------------------------------------ target
@@ -827,6 +838,9 @@ class ToolBelt:
             total += len(text)
             self.reads.add(source_id, a, b)
             item = {"section": s.label, "text": text, "requirements": requirements(text)}
+            figs = [x for x in self._figure_index(source_id) if s.start <= x.start < end]
+            if figs:   # drawings the text extraction cannot carry
+                item["figures"] = [f"{x.label}: {x.caption} — read_figure('{source_id}', '{x.label}')" for x in figs[:8]]
             if b < end:
                 item["more"] = f"read_section('{source_id}', '{s.num}', part={part + 1}) for the rest ({end - b} chars)"
             out.append(item)
@@ -948,6 +962,21 @@ class ToolBelt:
             self.state.setdefault("unread", {})[sid] = [f"{s.num} {s.title[:50]}" for s, _ in unread]
             out += self._open_requirements(sid, [s for s, _ in need if (s, _) not in unread])
             out += self._unbacked_claims(sid)
+            # figures in the sections that limit what the code sets (timing, modes, settings): often the only place a rule is
+            from embedforge.truth.outline import STRICT_TOPICS
+            strict = [s for s, _w, t in self._needed(sid) if t in STRICT_TOPICS]
+            figs = [x for x in self._figure_index(sid) if x.label.startswith("Figure")
+                    and any(s.start <= x.start < s.end for s in strict)
+                    and not (self.store.dir / "figures" / f"{sid}-{re.sub(r'[^a-z0-9]+', '-', x.label.lower())}.md").exists()]
+            if figs:
+                stored = self.store.pdf_path(sid).exists()
+                out.append(Finding("WARNING", "FIGURE_UNREAD", "", 0,
+                                   f"{len(figs)} figure(s) in sections about what this code sets were not read: "
+                                   + "; ".join(f"{x.label}: {x.caption[:50]} (section {x.section})" for x in figs[:6]) + ".",
+                                   suggestion=(f"read_figure('{sid}', '<Figure n>') for each; order and timing rules are often "
+                                               "drawn, not written." if stored else
+                                               f"The original PDF of {sid} is not stored: fetch_document its URL again, or ask "
+                                               "the user to upload the PDF, so its figures can be read.")))
             if unread:
                 listed = "; ".join(f"{s.label[:60]} ({why})" for s, why in unread[:8])
                 out.append(Finding(
@@ -1056,6 +1085,62 @@ class ToolBelt:
                                "checks it, or resolve again with a reason that answers the reviewer.")
         return res
 
+    def _figure_index(self, sid: str):
+        from embedforge.truth.outline import figures
+        src = self.store.get(sid)
+        return figures(src.text, self._outline(sid)) if src is not None else []
+
+    def read_figure(self, source_id: str, figure: str) -> Dict[str, Any]:
+        """A datasheet figure or table, transcribed by a vision model from the stored PDF (cached per figure)."""
+        sid = self._sid(source_id)
+        src = self.store.get(sid)
+        if src is None:
+            return {"error": f"Unknown source_id {sid}."}
+        figs = self._figure_index(sid)
+        key = re.sub(r"^fig(?:ure)?\.?\s*", "figure ", str(figure or "").strip().lower())
+        num = re.match(r"^(?:figure |table )?(\d+)$", key)
+        f = next((x for x in figs if x.label.lower() == key or (num and x.label.split(" ")[1] == num.group(1)
+                                                                 and (key.startswith(("figure", "table")) or x.label.startswith("Figure")))), None) \
+            or next((x for x in figs if key and key in x.caption.lower()), None)
+        if f is None:
+            return {"error": f"No figure {figure!r} in {sid}. Captions: " + "; ".join(f"{x.label}: {x.caption[:40]}" for x in figs[:30])}
+        context = re.sub(r"[ \t]+", " ", src.text[max(0, f.start - 600):f.start + 400]).strip()
+        slug = re.sub(r"\W+", "-", f.label.lower())
+        cache = self.store.dir / "figures" / f"{sid}-{slug}.md"
+        if cache.exists():
+            text, model = cache.read_text(encoding="utf-8"), "cached"
+        else:
+            pdf = self.store.pdf_path(sid)
+            if not pdf.exists():
+                return {"figure": f"{f.label}: {f.caption}", "section": f.section, "text_around_caption": context,
+                        "error": (f"The original PDF of {sid} is not stored (it came in as text), so the figure cannot be "
+                                  "rendered. fetch_document its URL again or ask the user to upload the PDF; until then "
+                                  "the text around the caption is all there is.")}
+            from embedforge.agent import vision
+            reader, model = (self.vision, "custom") if self.vision is not None else vision.default_reader()
+            self.session.emit("status", text=f"Reading {f.label} ({f.caption[:50]}) with {model}…")
+            try:
+                text, page = vision.transcribe(pdf, f.label, f.caption, f.page, reader)
+            except ImportError:
+                return {"error": "Rendering PDF pages needs PyMuPDF (pip install 'embedforge[pdf]'); ask the user to install "
+                                 "it. Until then the text around the caption is all there is.", "text_around_caption": context}
+            except Exception as e:
+                return {"error": f"The vision model could not read {f.label}: {type(e).__name__}: {str(e)[:200]}",
+                        "text_around_caption": context}
+            if not text:
+                return {"error": f"{f.label} was not found on any page of the stored PDF.", "text_around_caption": context}
+            f.page = page
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(text, encoding="utf-8")
+        derived = self.store.add(f"figure://{sid}/{slug}", f"{f.label}: {f.caption} (page {f.page}, transcribed by a vision "
+                                 f"model from {sid})", text, kind="figure")
+        self.reads.add(sid, f.start, f.start + len(f.caption) + 20)
+        return {"figure": f"{f.label}: {f.caption}", "page": f.page, "section": f.section, "source_id": derived.id,
+                "transcription": text,
+                "note": (f"A vision model's transcription of the drawing, not the datasheet's own words: use it to understand "
+                         f"the order and the values, and quote the datasheet text ({sid}) where it says the same. A fact "
+                         f"quoting {derived.id} is accepted with a warning that it comes from a figure.")}
+
     def load_skill(self, name: str) -> Dict[str, Any]:
         from embedforge.skills import list_skills, load_skill
         body = load_skill(name)
@@ -1120,21 +1205,26 @@ class ToolBelt:
                          "(record it, or resolve_requirements) — verify fails while one is open.")
         return brief
 
+    def _needed(self, source_id: str) -> List[Tuple[Any, str, str]]:
+        """(section, why, topic) for the sections this source's code depends on, plus the sections they refer to."""
+        from embedforge.truth.outline import required_topics, with_xrefs
+        uses = self.state.get("uses") or {}
+        src = self.store.get(source_id)
+        if not uses or src is None:
+            return []
+        secs = self._outline(source_id)
+        return with_xrefs(src.text, secs, required_topics(secs, uses))
+
     def _required_for(self, source_id: str):
         """Sections of this source the code depends on (from what the last verify saw the code do)."""
-        from embedforge.truth.outline import required
-        uses = self.state.get("uses") or {}
-        return required(self._outline(source_id), uses) if uses else []
+        return [(s, why) for s, why, _t in self._needed(source_id)]
 
     def _strict_topic(self, sid: str, section_label: str) -> Tuple[str, List[Tuple[int, int]]]:
         """The topic of a requirement's section when it is one whose rules limit what the code sets (timing, the mode it
         uses, the recommended settings), and the spans of every section of that topic: a record quoting any of them
         backs a claim about it. ('', []) otherwise."""
-        from embedforge.truth.outline import STRICT_TOPICS, required_topics
-        uses = self.state.get("uses") or {}
-        if not uses:
-            return "", []
-        tops = required_topics(self._outline(sid), uses)
+        from embedforge.truth.outline import STRICT_TOPICS
+        tops = self._needed(sid)
         topic = next((t for s, _w, t in tops if s.label[:80] == section_label), "")
         if topic not in STRICT_TOPICS:
             return "", []
