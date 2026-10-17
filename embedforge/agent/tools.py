@@ -1097,10 +1097,10 @@ class ToolBelt:
         if src is None:
             return {"error": f"Unknown source_id {sid}."}
         figs = self._figure_index(sid)
-        key = re.sub(r"^fig(?:ure)?\.?\s*", "figure ", str(figure or "").strip().lower())
-        num = re.match(r"^(?:figure |table )?(\d+)$", key)
-        f = next((x for x in figs if x.label.lower() == key or (num and x.label.split(" ")[1] == num.group(1)
-                                                                 and (key.startswith(("figure", "table")) or x.label.startswith("Figure")))), None) \
+        key = re.sub(r"\s+", " ", re.sub(r"^fig(?:ure)?\.?\s*", "figure ", str(figure or "").strip().lower()))
+        if re.fullmatch(r"\d+", key):   # a bare number is a figure; 'Table 3' and 'Figure 3' are different things
+            key = "figure " + key
+        f = next((x for x in figs if x.label.lower() == key), None) \
             or next((x for x in figs if key and key in x.caption.lower()), None)
         if f is None:
             return {"error": f"No figure {figure!r} in {sid}. Captions: " + "; ".join(f"{x.label}: {x.caption[:40]}" for x in figs[:30])}

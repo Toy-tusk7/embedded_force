@@ -12,8 +12,8 @@ FIGURE_PROMPT = (
     "This is a page of a component datasheet. Transcribe the figure or table captioned \"{caption}\" into text, "
     "exactly as drawn: for a timing or sequence diagram, every step in order with its condition, register or field "
     "values and times; for a state or mode diagram, every state and every transition with what triggers it; for a "
-    "table, its rows. Copy labels and numbers exactly. Do not add anything the figure does not show. Plain text or "
-    "Markdown only.")
+    "table, its rows. Copy labels and numbers exactly. Do not add anything the figure does not show. If other figures "
+    "are in the image too, transcribe only that one. Plain text or Markdown only.")
 
 
 def _norm(s: str) -> str:
@@ -39,6 +39,41 @@ def render_page(pdf_path: Path, page: int, dpi: int = 130) -> bytes:
         return doc[page - 1].get_pixmap(dpi=dpi).tobytes("png")
 
 
+_CAPTION_START = re.compile(r"^(?:figure|fig\.|table)\s+\d{1,3}\s*[:.]")
+
+
+def figure_clip(page, label: str):
+    """The part of the page that holds the figure, so a model is not shown the one next to it (the BMP388's forced and
+    normal mode diagrams share a page and differ in one value). A figure's caption is under it: the clip runs up to the
+    paragraph or caption above. A table's caption is over it: down to the next caption. None: use the whole page."""
+    import pymupdf
+    blocks = [b for b in page.get_text("blocks") if b[6] == 0]
+    want = _norm(label)
+    cap = next((b for b in blocks if re.match(re.escape(want) + r"\s*[:.]", _norm(b[4]))), None)
+    if cap is None:
+        return None
+    width, height = page.rect.width, page.rect.height
+    if want.startswith("table"):
+        below = [b[1] for b in blocks if b is not cap and b[1] >= cap[3] and _CAPTION_START.match(_norm(b[4]))]
+        top, bottom = cap[1], min(below, default=height)
+    else:   # body text is wide, labels in a drawing are not
+        above = [b[3] for b in blocks if b is not cap and b[3] <= cap[1] + 1
+                 and (_CAPTION_START.match(_norm(b[4])) or b[2] - b[0] >= 0.6 * width)]
+        top, bottom = max(above, default=0), cap[3]
+    if bottom - top < 60:
+        return None
+    return pymupdf.Rect(0, top, width, min(height, bottom + 4))
+
+
+def render_figure(pdf_path: Path, page: int, label: str) -> bytes:
+    """The figure cut from its page at 170 dpi (subscripts stay legible), or the whole page when it cannot be cut."""
+    import pymupdf
+    with pymupdf.open(str(pdf_path)) as doc:
+        p = doc[page - 1]
+        clip = figure_clip(p, label)
+        return p.get_pixmap(dpi=170 if clip else 130, clip=clip).tobytes("png")
+
+
 def default_reader() -> Tuple[Callable[[str, bytes], str], str]:
     """(prompt, png) -> text with the configured vision model (EMBEDFORGE_VISION_PROVIDER / _MODEL), and its name."""
     from embedforge.agent.llm import AgentLLM
@@ -59,4 +94,4 @@ def transcribe(pdf_path: Path, label: str, caption: str, hint: int = 0,
     if not page:
         return "", 0
     ask = reader or default_reader()[0]
-    return ask(FIGURE_PROMPT.format(caption=f"{label}: {caption}"), render_page(pdf_path, page)).strip(), page
+    return ask(FIGURE_PROMPT.format(caption=f"{label}: {caption}"), render_figure(pdf_path, page, label)).strip(), page

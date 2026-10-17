@@ -425,7 +425,10 @@ class FactLedger:
             return {"ok": False, "error": f"REJECTED: the quote gives {value} {stated_units[0]}, not {value} {unit}."}
         tier = TrustTier(src.tier)
         warnings: List[str] = []
-        if not is_authoritative(tier):
+        if src.kind == "figure":
+            warnings.append(f"Source {source_id} is a vision model's transcription of a datasheet figure, not the datasheet's "
+                            f"words; the fact is recorded but NOT authoritative. Quote the datasheet text where it says the same.")
+        elif not is_authoritative(tier):
             warnings.append(f"Source {source_id} is {tier.value}; fact is recorded but NOT authoritative.")
         if conf == "LOOSE":
             warnings.append(f"Value matched loosely ({form}); double-check the register/number meaning in the quote.")

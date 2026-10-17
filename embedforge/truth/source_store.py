@@ -36,7 +36,7 @@ class Source:
     tier: str
     sha256: str
     chars: int
-    kind: str = "web"  # web | pdf | user
+    kind: str = "web"  # web | pdf | user | figure (a vision model's transcription of a datasheet figure)
     via: str = ""             # how the text was obtained: tavily:search | tavily:extract | download | ...
     tavily_request: str = ""  # Tavily request_id of the call that returned it (provenance, support)
     text: str = field(default="", repr=False)
