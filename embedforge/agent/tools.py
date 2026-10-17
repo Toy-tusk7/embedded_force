@@ -894,6 +894,9 @@ class ToolBelt:
         if modes:
             uses["modes"] = next(iter(modes.values()))
             uses["mode_words"] = ",".join(modes)
+        if any(k in uses for k in ("oversampling", "filter", "timing")):
+            # the datasheet's recommended settings per use case: the choice should fit what the user is building
+            uses["settings_choice"] = "the code chooses oversampling / filter / data rate: match the recommendation for the user's use case"
         book = RegisterBook(self.project.root)
         data = [l.name for l in book.layouts.values() if not re.search(r"nvm|calib|par_|trim|coef|dig_", l.name, re.I)]
         if data or book.bursts:

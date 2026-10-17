@@ -182,6 +182,7 @@ _TOPICS = {   # topic -> section titles about it
     "formulas": r"compensat|calibration|trimming|formula|conversion of|output scaling",
     "oversampling": r"oversampl",
     "filter": r"\bfilter|\biir\b",
+    "settings_choice": r"filter selection|recommended (settings|configuration|modes?)|use cases?|application examples",
     "i2c": r"\bI\s?(2|²)\s?C\b",
     "spi": r"\bSPI\b",
 }
