@@ -11,9 +11,11 @@ from typing import Callable, Optional, Tuple
 FIGURE_PROMPT = (
     "This is a page of a component datasheet. Transcribe the figure or table captioned \"{caption}\" into text, "
     "exactly as drawn: for a timing or sequence diagram, every step in order with its condition, register or field "
-    "values and times; for a state or mode diagram, every state and every transition with what triggers it; for a "
-    "table, its rows. Copy labels and numbers exactly. Do not add anything the figure does not show. If other figures "
-    "are in the image too, transcribe only that one. Plain text or Markdown only.")
+    "values and times, and what each span or arrow marks from where to where; for a state or mode diagram, every state, "
+    "then every transition as FROM -> TO: trigger, following the arrowheads (write 'direction unclear' where an "
+    "arrowhead cannot be seen); for a table, its rows. Copy labels, symbols (Greek letters) and letter case exactly. "
+    "Do not add anything the figure does not show. If other figures are in the image too, transcribe only that one. "
+    "Plain text or Markdown only.")
 
 
 def _norm(s: str) -> str:
@@ -83,7 +85,8 @@ def default_reader() -> Tuple[Callable[[str, bytes], str], str]:
     def ask(prompt: str, png: bytes) -> str:
         url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
         msg = {"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": url}}]}
-        return llm.chat([msg], None, max_tokens=4096, retries=3)["content"]
+        # reasoning models think before they answer: room for both, or the transcription comes back empty
+        return llm.chat([msg], None, max_tokens=16384, retries=3)["content"]
     return ask, llm.model
 
 
