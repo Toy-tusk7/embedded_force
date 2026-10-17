@@ -3,7 +3,7 @@
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from embedforge import eda
 from embedforge.agent.events import RunSession
@@ -89,8 +89,10 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Settle datasheet requirements verify reports as REQUIREMENT_OPEN, several per call: items=[{id:'REQ-004', "
         "status:'implemented', reason:'readRawData() reads 0x04..0x09 in one burst'}, {id:'REQ-002', "
         "status:'not_applicable', reason:'board-level: power ramp is the supply's job'}]. A requirement that one of your "
-        "records quotes (record_fact / record_sequence / record_constraint) is covered by itself.",
-        {"items": _arr({"type": "object", "properties": {"id": S, "status": S, "reason": S}, "required": ["id", "status", "reason"]})},
+        "records quotes (record_fact / record_sequence / record_constraint) is covered by itself. A rule about timing, "
+        "the mode the code uses or the recommended settings needs ref = the id of a record quoting its section "
+        "(e.g. the CON- of the conversion-time rule), and cannot be not_applicable.",
+        {"items": _arr({"type": "object", "properties": {"id": S, "status": S, "reason": S, "ref": S}, "required": ["id", "status", "reason"]})},
         ["items"]),
     _fn("record_fact",
         "Record a hardware fact. REJECTED unless `quote` appears verbatim in the cited source and contains `value`. "
@@ -945,6 +947,7 @@ class ToolBelt:
             unread = [(s, why) for s, why in need if self.reads.seen(sid, s.start, s.end) < 0.5]
             self.state.setdefault("unread", {})[sid] = [f"{s.num} {s.title[:50]}" for s, _ in unread]
             out += self._open_requirements(sid, [s for s, _ in need if (s, _) not in unread])
+            out += self._unbacked_claims(sid)
             if unread:
                 listed = "; ".join(f"{s.label[:60]} ({why})" for s, why in unread[:8])
                 out.append(Finding(
@@ -1003,7 +1006,33 @@ class ToolBelt:
     def resolve_requirements(self, items: Any) -> Dict[str, Any]:
         from embedforge.truth.knowledge import Requirements
         reqs = Requirements(self.project.root)
-        res = reqs.resolve(items if isinstance(items, list) else [items] if isinstance(items, dict) else [])
+        items = items if isinstance(items, list) else [items] if isinstance(items, dict) else []
+        # rules about what the code itself sets need a record behind the claim (see _unbacked_claims)
+        from embedforge.truth.knowledge import truth_spans
+        truth = truth_spans(self.project.root, self.store, self.ledger)
+        early: List[Dict[str, Any]] = []
+        keep = []
+        for it in items:
+            it = it if isinstance(it, dict) else {}
+            rid = re.sub(r"^\s*REQ[-_ ]?0*(\d+)\s*$", lambda m: f"REQ-{int(m.group(1)):03d}", str(it.get("id") or ""), flags=re.I)
+            r = reqs.items.get(rid)
+            topic, spans = self._strict_topic(r.source_id, r.section) if r else ("", [])
+            ref = str(it.get("ref") or "").strip().upper()
+            status = str(it.get("status") or "").strip().lower().replace(" ", "_")
+            if topic and status == "not_applicable":
+                early.append({"id": rid, "error": f"this rule is about {topic.replace('_', ' ')} the code itself sets, so it "
+                                                  "applies: record it (record_constraint / record_fact / record_sequence) "
+                                                  "and resolve it as implemented with ref = that record's id"})
+            elif topic and not self._backed(r.source_id, ref, spans, truth):
+                early.append({"id": rid, "error": f"a claim about {topic.replace('_', ' ')} needs ref = the id of a record "
+                                                  "(CON-/FACT-/SEQ-) quoting this section, so verify checks it"
+                                                  + (f"; {ref} does not quote it" if ref else "")})
+            else:
+                keep.append(dict(it, ref=ref))
+        res = reqs.resolve(keep)
+        if early:
+            res.setdefault("rejected", []).extend(early)
+            res["ok"] = bool(res.get("resolved"))
         res["next"] = "verify again: the requirements are part of what it judges."
         ids = [s.split(" ")[0] for s in res.get("resolved") or []]
         if ids and self.reviewer is not None:
@@ -1096,6 +1125,50 @@ class ToolBelt:
         from embedforge.truth.outline import required
         uses = self.state.get("uses") or {}
         return required(self._outline(source_id), uses) if uses else []
+
+    def _strict_topic(self, sid: str, section_label: str) -> Tuple[str, List[Tuple[int, int]]]:
+        """The topic of a requirement's section when it is one whose rules limit what the code sets (timing, the mode it
+        uses, the recommended settings), and the spans of every section of that topic: a record quoting any of them
+        backs a claim about it. ('', []) otherwise."""
+        from embedforge.truth.outline import STRICT_TOPICS, required_topics
+        uses = self.state.get("uses") or {}
+        if not uses:
+            return "", []
+        tops = required_topics(self._outline(sid), uses)
+        topic = next((t for s, _w, t in tops if s.label[:80] == section_label), "")
+        if topic not in STRICT_TOPICS:
+            return "", []
+        return topic, [(s.start, s.end) for s, _w, t in tops if t == topic]
+
+    def _backed(self, sid: str, ref: str, spans: List[Tuple[int, int]], truth: Dict[str, List[Tuple[int, int, str]]]) -> bool:
+        return bool(ref) and any(r == ref and any(a < e and s < b for s, e in spans) for a, b, r in truth.get(sid, []))
+
+    def _unbacked_claims(self, sid: str) -> List[Any]:
+        """REQUIREMENT_NEEDS_RECORD: a rule about timing, the mode the code uses or the recommended settings settled by
+        a claim alone. The BMP388 rehearsal showed why: the agent called the measurement-time limit 'informational' and
+        the settings-before-mode rule 'implemented', and an LLM reviewer agreed; only a record verify checks holds."""
+        from embedforge.truth.knowledge import Requirements, truth_spans
+        from embedforge.truth.verifier import Finding
+        reqs = Requirements(self.project.root)
+        truth = truth_spans(self.project.root, self.store, self.ledger)
+        bad = []
+        for r in reqs.items.values():
+            if r.source_id != sid or r.status not in ("implemented", "not_applicable"):
+                continue
+            topic, spans = self._strict_topic(sid, r.section)
+            if topic and not self._backed(sid, r.ref, spans, truth):
+                bad.append((r, topic))
+        if not bad:
+            return []
+        listed = "; ".join(f"{r.id} [{r.section.split(' ')[0]}] {r.text[:90]} ({r.status})" for r, _ in bad[:8])
+        return [Finding("ERROR", "REQUIREMENT_NEEDS_RECORD", "", 0,
+                        f"{len(bad)} rule(s) about {', '.join(sorted({t.replace('_', ' ') for _, t in bad}))} — what the code itself "
+                        f"sets — are settled by a claim, which nothing checks: {listed}.",
+                        suggestion=("Record the rule so verify checks it on every build: record_constraint for a limit (e.g. "
+                                    "conversion time <= sampling period while in the mode the code uses), record_fact for "
+                                    "the recommended setting chosen for the user's use case or for a time, record_sequence "
+                                    "for an order. Then resolve_requirements([{id, status: 'implemented', ref: <that "
+                                    "record's id>, reason}]). load_skill('datasheet-rules') explains each kind."))]
 
     def record_fact(self, subject: str, property: str, value: Any, source_id: str, quote: str, unit: str = "") -> Dict[str, Any]:
         # a quote copied from a clipped line may end in an ellipsis; the text before it is still verbatim

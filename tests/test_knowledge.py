@@ -48,14 +48,21 @@ def test_verify_fails_until_every_requirement_is_settled(tmp_path):
     open_ = next(f for f in v["findings"] if f["code"] == "REQUIREMENT_OPEN")
     assert "must be set to normal only after OSR and ODR" in open_["message"] and "Poll drdy" not in open_["message"], open_   # 2.3 is not needed: no data is read
     # a record quoting a requirement covers it
-    assert belt.call("record_fact", {"subject": "DM388", "property": "normal_mode_wait", "value": "2", "unit": "ms",
-                                     "source_id": src.id, "quote": "Wait at least 2 ms after setting normal mode."})["ok"]
+    fact = belt.call("record_fact", {"subject": "DM388", "property": "normal_mode_wait", "value": "2", "unit": "ms",
+                                     "source_id": src.id, "quote": "Wait at least 2 ms after setting normal mode."})
+    assert fact["ok"]
     brief = belt.call("coding_brief", {})
     reqs = brief["datasheet_requirements"]
     assert any("Wait at least 2 ms" in r for r in reqs["covered by records"]), reqs
     assert brief["registers"][0].startswith("REG-001 PWR_CTRL 0x1B") and brief["gates_verify_applies"]
     ids = [r.split(" ")[0] for r in reqs["open"]]
-    assert belt.call("resolve_requirements", {"items": [{"id": i, "status": "implemented", "reason": "setup() writes OSR and ODR before PWR_CTRL"}
-                                                        for i in ids]})["ok"]
+    # the normal-mode rules are about the mode the code uses: a bare claim is refused, not_applicable too
+    claim = {"status": "implemented", "reason": "setup() writes OSR and ODR before PWR_CTRL"}
+    bare = belt.call("resolve_requirements", {"items": [dict(claim, id=i) for i in ids]})
+    assert not bare["ok"] and all("needs ref" in r["error"] for r in bare["rejected"]), bare
+    na = belt.call("resolve_requirements", {"items": [{"id": ids[0], "status": "not_applicable", "reason": "the code never uses it"}]})
+    assert "so it applies" in na["rejected"][0]["error"]
+    # backed by a record that quotes the normal-mode section, the claims stand
+    assert belt.call("resolve_requirements", {"items": [dict(claim, id=i, ref=fact["fact"]["id"]) for i in ids]})["ok"]
     v = belt.call("verify", {})
-    assert not [f for f in v["findings"] if f["code"] == "REQUIREMENT_OPEN"] and not v.get("unchanged"), v["findings"]
+    assert not [f for f in v["findings"] if f["code"].startswith("REQUIREMENT")] and not v.get("unchanged"), v["findings"]

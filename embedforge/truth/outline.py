@@ -198,12 +198,21 @@ _UNLESS_USED = {"fifo": r"\bFIFO\b", "interrupts": r"interrupt|\bINT_|watermark"
 
 
 def required(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Section, str]]:
-    """Sections the code depends on, with why. `uses`: topic -> why (e.g. {'modes': 'the code sets PWR_CTRL.mode =
+    """Sections the code depends on, with why (required_topics also gives the topic)."""
+    return [(s, why) for s, why, _t in required_topics(secs, uses)]
+
+
+# topics whose rules limit what the code itself sets: a claim about them is not enough, a record must back it
+STRICT_TOPICS = ("timing", "modes", "settings_choice")
+
+
+def required_topics(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Section, str, str]]:
+    """Sections the code depends on, with why and topic. `uses`: topic -> why (e.g. {'modes': 'the code sets PWR_CTRL.mode =
     normal'}). Two lists ride along as comma-separated values: uses['mode_words'] narrows mode sections to the modes the
     code uses, uses['register_names'] adds the description of every register the code touches."""
     words = [w for w in (uses.get("mode_words") or "").lower().split(",") if w]
     regs = [r for r in (uses.get("register_names") or "").split(",") if r]
-    out: List[Tuple[Section, str]] = []
+    out: List[Tuple[Section, str, str]] = []
     for s in secs:
         if s.end - s.start < 120:          # a heading over a figure or table only
             continue
@@ -211,7 +220,7 @@ def required(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Section, s
             continue
         hit = next((r for r in regs if re.search(rf"(?<![A-Za-z0-9_]){re.escape(r)}(?![A-Za-z0-9_])", s.title)), None)
         if hit:
-            out.append((s, f"the code uses register {hit}"))
+            out.append((s, f"the code uses register {hit}", "registers"))
             continue
         for topic, why in uses.items():
             if topic not in _TOPICS or not re.search(_TOPICS[topic], s.title, re.I):
@@ -220,6 +229,6 @@ def required(secs: List[Section], uses: Dict[str, str]) -> List[Tuple[Section, s
                 named = [w for w in re.findall(r"([A-Za-z-]+)\s+mode\b", s.title, re.I) if w.lower() not in ("power", "operating", "the")]
                 if named and not any(n.lower() in words for n in named):
                     continue               # 'Forced mode' when the code uses normal mode
-            out.append((s, why))
+            out.append((s, why, topic))
             break
     return out

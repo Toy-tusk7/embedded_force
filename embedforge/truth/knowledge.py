@@ -29,6 +29,7 @@ class Requirement:
     refs: List[str] = field(default_factory=list)   # truth items that quote it (covered)
     reason: str = ""                                # how the code implements it / why it does not apply
     review: Dict[str, str] = field(default_factory=dict)   # the independent reviewer's verdict on the claim
+    ref: str = ""                                   # the record the agent cites for an 'implemented' claim
     disputes: int = 0                               # how often the reviewer disagreed with a claim about it
 
 
@@ -95,6 +96,7 @@ class Requirements:
                                                          "not apply (e.g. 'board-level: pull-ups are on the schematic')"})
                 else:
                     r.status, r.reason, r.review = status, reason[:300], {}   # a new claim needs a new review
+                    r.ref = str(it.get("ref") or "").strip().upper()[:20]
                     done.append(f"{rid} {status}")
             self._save()
         out: Dict[str, Any] = {"ok": bool(done), "resolved": done}
