@@ -28,7 +28,7 @@ desk.
 
 ```mermaid
 flowchart LR
-    U["Request + schematic<br/>(EasyEDA / KiCad)"] --> A["Agent loop<br/>NVIDIA Nemotron 3 Ultra<br/>on Nebius Token Factory"]
+    U["Request + schematic<br/>(EasyEDA / KiCad)"] --> A["Agent loop<br/>NVIDIA Nemotron 3 Ultra<br/>on Nebius Token Factory<br/>or the NVIDIA API"]
     A -->|web_search / find_documents /<br/>fetch_document| T["Tavily search, map & extract<br/>manufacturer domains first"]
     T --> S["Source store<br/>(text + trust tier)"]
     A -->|record_fact / record_registers /<br/>record_layouts / record_formula / record_sequence| G{"Quote gates:<br/>verbatim in the source?<br/>value and unit in the quote?"}
@@ -68,6 +68,11 @@ flowchart LR
 | Burst reads vs. datasheet | Data registers read in two transactions | `REG_BURST_SPLIT` |
 | Code math vs. formula (run on probe register bytes) | 2^30 mistyped, exponent sign flipped, wrong signedness | `FORMULA_MISMATCH`, `FORMULA_MISSING` |
 | Code it cannot follow | A bus call the tracer does not model | `FLOW_OPAQUE_BUS` |
+| Pins in calls vs. schematic and chip | `setSDA(17)` on the SCL pin; `Wire1` on GPIO16 (an I2C0 pin) | `PIN_ROLE_MISMATCH`, `PIN_CAPABILITY` |
+| Settings vs. datasheet rules, after every write | Normal mode entered while the 200 Hz default ODR cannot fit the conversion | `CONSTRAINT_VIOLATED` |
+| Reading vs. what the code depends on | The Normal mode / Data ready sections never read; a rule in them never settled | `DATASHEET_UNREAD`, `REQUIREMENT_OPEN` |
+| Robustness | `while (!Serial)` with no timeout; a bus status ignored; a failure branch returning success | `UNBOUNDED_WAIT`, `RESULT_IGNORED`, `FAILURE_AS_SUCCESS` |
+| Compiler and static analysis | Uninitialised use, shift overflow (GCC `-Wall -Wextra`); cppcheck defects; MISRA C:2012 | `COMPILER_WARNING`, `STATIC_ANALYSIS`, `MISRA_C` |
 
 Code that verify cannot check fails; it never passes silently. The IDE shows the evidence: every constant traced
 to its fact and quote, each datasheet sequence step by step, and each register write decoded into its fields.
@@ -82,15 +87,22 @@ drivers with one planted bug each:
 | Measure | Result |
 |---|---|
 | Correct drivers passing | 30 of 30 |
-| Planted bugs caught (one per run) | 615 of 615 |
+| Planted bugs caught (one per run) | 673 of 673 |
 | Code verify cannot check, blocked instead of passed | 6 of 6 |
 
-With zero misses in 615 runs, the 95% upper bound on the miss rate for bugs of these kinds is about 0.5% (rule of
+With zero misses in 673 runs, the 95% upper bound on the miss rate for bugs of these kinds is about 0.45% (rule of
 three, 3/n). Run it yourself — it is offline and free:
 
 ```bash
 python -m embedforge.verifybench          # add -v to list every planted bug and the error that caught it
 ```
+
+**On every delivered driver too.** When a run finishes verified, a mutation test plants realistic faults in the
+delivered code one at a time (a datasheet constant with a bit flipped, a pin moved, `/` for `*`, a byte in the wrong
+place, the wrong signedness, a required delay deleted, a write to the next register, a check inverted, a failure
+reported as success) and the delivery report gives the score and lists each fault verify did not catch. On the
+BMP388 driver Nemotron 3 Ultra wrote for an RP2350B board: 47 of 49 caught (96%); the two survivors are listed
+(`python -m embedforge.truth.mutate <project dir>`).
 
 ## NVIDIA Nemotron on Nebius Token Factory
 
@@ -108,6 +120,26 @@ python -m embedforge.verifybench          # add -v to list every planted bug and
   AI Cloud GPU VM (`SELFHOSTED_BASE_URL`) and runs the IDE next to it, reachable from any browser with a password.
 - **Provider order:** self-hosted → Nebius Token Factory (Nemotron) → NVIDIA API catalog (Nemotron) → Claude →
   Gemini, whichever is configured first; `EMBEDFORGE_PROVIDER` forces one.
+
+### Where our runs ran
+
+Every run records its provider, model and harness version in the project's `trace.jsonl`, so this table is
+generated, not written (`python -m embedforge.runlog`; `--runs` lists each run):
+
+| Provider | Model | Runs | Dates |
+|---|---|---|---|
+| Nebius Token Factory | `nvidia/Nemotron-3-Ultra-550b-a55b` | 47 | 8 Oct 2026 |
+| Nebius Token Factory | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | 8 | 8–9 Oct 2026 |
+| Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | 8 | 8 Oct 2026 |
+| Nebius Token Factory | `nvidia/Nemotron-3_5-Lightning` | 6 | 8 Oct 2026 |
+| NVIDIA API (NIM) | `nvidia/nemotron-3-ultra-550b-a55b` | 9 | 16–17 Oct 2026 |
+
+EmbedForge was built and evaluated on Nebius Token Factory: 69 runs over four Nemotron models, including verified
+drivers and board configs from Ultra, Super and 3.5 Lightning. Our Token Factory credits ran out on 9 October, so
+the later runs, including the BMP388 rehearsal above, use the **same Nemotron 3 Ultra model through NVIDIA's API**.
+Nothing in the code depends on which of the two serves it: with a `NEBIUS_API_KEY` in `.env` the IDE uses Token
+Factory again (it comes first in the provider order), and `deploy/nebius-vm/` runs Nemotron on a Nebius AI Cloud
+GPU VM instead.
 
 ## Tavily: it finds, the ledger verifies
 
@@ -224,6 +256,7 @@ against the source text, and the code is checked against it before anything runs
 pip install -e ".[dev]"
 pytest                                  # offline: models and Tavily are faked
 python -m embedforge.verifybench        # the verify benchmark
+python -m embedforge.runlog             # which provider and model every recorded run used
 ```
 
 ## License
