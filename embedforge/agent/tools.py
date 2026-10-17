@@ -75,6 +75,10 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
         "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
         {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
+    _fn("load_skill",
+        "Load a skill: a playbook for a kind of work (the SKILLS list in your instructions names them), e.g. "
+        "'sensor-driver' before writing a sensor driver, 'datasheet-rules' before settling datasheet requirements.",
+        {"name": S}, ["name"]),
     _fn("coding_brief",
         "Everything the code must do, compiled from what is on record: the user's request, wiring and IDs, register map "
         "with reset values, init sequences, rules that must hold after every register write, readout (bursts, layouts), "
@@ -360,6 +364,8 @@ class ToolBelt:
         self.state: Dict[str, Any] = {"build_hash": None, "build_ok": False, "verify_hash": None, "verify_ok": False, "verify_inputs": None, "last_build": None}
         from embedforge.truth.outline import ReadLog
         self.reads = ReadLog(project.root)   # what of each source the agent has been shown (kept across runs)
+        # messages -> reply text: the independent reviewer of requirement claims (set by the agent runner)
+        self.reviewer: Optional[Callable[[List[Dict[str, Any]]], str]] = None
         if not self.reads.path.exists() and (project.root / "conversation.json").exists():
             self.reads.seed(project.load_conversation())   # a project from before read tracking
         # carry the last real build/verify across runs; finish() still compares against the CURRENT source hash
@@ -375,6 +381,7 @@ class ToolBelt:
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
             "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
             "coding_brief": self.coding_brief, "resolve_requirements": self.resolve_requirements,
+            "load_skill": self.load_skill,
             "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
@@ -956,7 +963,7 @@ class ToolBelt:
         from embedforge.truth.outline import requirements as rule_sentences
         from embedforge.truth.verifier import Finding
         src = self.store.get(sid)
-        if src is None or not read_sections:
+        if src is None:
             return []
         found = []
         for s in read_sections:
@@ -969,22 +976,63 @@ class ToolBelt:
         mine = reqs.sync(sid, found)
         reqs.cover(truth_spans(self.project.root, self.store, self.ledger))
         mine = [reqs.items[r.id] for r in mine]
+        out = []
+        for r in [x for x in reqs.disputed() if x.source_id == sid]:
+            stuck = r.disputes >= 3   # author and reviewer keep disagreeing: a person decides
+            out.append(Finding("WARNING" if stuck else "ERROR", "REQUIREMENT_DISPUTED", r.review.get("where", "").split(":")[0], 0,
+                               f"{r.id} [{r.section.split(' ')[0]}] \"{r.text[:120]}\": you said {r.status} ({r.reason[:100]}); the "
+                               f"independent reviewer disagrees: {r.review.get('why', '')}"
+                               + (f" ({r.review['where']})" if r.review.get("where") else "")
+                               + (" — disputed 3 times: left for a person to decide." if stuck else ""),
+                               suggestion=("Fix the code where the reviewer points, or record the rule (record_constraint / "
+                                           "record_fact / record_sequence) so verify checks it instead of a claim, or "
+                                           "resolve_requirements again with a reason that answers the reviewer.")))
         open_ = [r for r in mine if r.status == "open"]
         if not open_:
-            return []
+            return out
         listed = "; ".join(f"{r.id} [{r.section.split(' ')[0]}] {r.text[:110]}" for r in open_[:10])
-        return [Finding("ERROR", "REQUIREMENT_OPEN", "", 0,
+        return out + [Finding("ERROR", "REQUIREMENT_OPEN", "", 0,
                         f"{len(open_)} rule(s) the datasheet states in sections this code depends on are not settled: {listed}"
                         + (f" (+{len(open_) - 10} more: coding_brief lists all)" if len(open_) > 10 else "."),
-                        suggestion=("For each: record what it requires (record_fact / record_sequence / record_constraint, "
-                                    "quoting it), or resolve_requirements([{id, status: 'implemented', reason: <where the "
-                                    "code does it>} | {id, status: 'not_applicable', reason: <why>}]) — several per call."))]
+                        suggestion=("load_skill('datasheet-rules') says what to record for each kind of rule. For each: record "
+                                    "what it requires (record_fact / record_sequence / record_constraint, quoting it), or "
+                                    "resolve_requirements([{id, status: 'implemented', reason: <where the code does it>} | "
+                                    "{id, status: 'not_applicable', reason: <why>}]) — several per call; an independent "
+                                    "reviewer checks each claim against the code."))]
 
     def resolve_requirements(self, items: Any) -> Dict[str, Any]:
         from embedforge.truth.knowledge import Requirements
-        res = Requirements(self.project.root).resolve(items if isinstance(items, list) else [items] if isinstance(items, dict) else [])
+        reqs = Requirements(self.project.root)
+        res = reqs.resolve(items if isinstance(items, list) else [items] if isinstance(items, dict) else [])
         res["next"] = "verify again: the requirements are part of what it judges."
+        ids = [s.split(" ")[0] for s in res.get("resolved") or []]
+        if ids and self.reviewer is not None:
+            # an independent reviewer (agent/review.py) checks each claim against the code
+            from embedforge.agent.review import review_claims
+            files = {str(p.relative_to(self.project.root)).replace("\\", "/"): p.read_text(encoding="utf-8", errors="ignore")
+                     for p in collect_sources(self.project.root)}
+            self.session.emit("status", text=f"Reviewer checking {len(ids)} requirement claim(s) against the code…")
+            try:
+                verdicts = review_claims(self.reviewer, [reqs.items[i] for i in ids], files)
+            except Exception as e:   # the reviewer is a second opinion: its failure must not cost the claim
+                verdicts = {}
+                self.session.emit("status", text=f"Reviewer unavailable: {type(e).__name__}: {str(e)[:120]}")
+            reqs.set_reviews(verdicts)
+            dis = [{"id": i, **v} for i, v in verdicts.items() if v["verdict"] == "disagree"]
+            res["review"] = {"agreed": sum(1 for v in verdicts.values() if v["verdict"] == "agree"), "disagreed": dis,
+                             "unreviewed": [i for i in ids if i not in verdicts]}
+            if dis:
+                res["next"] = ("The reviewer disagrees with the claims listed under review.disagreed. Fix the code where it "
+                               "points, or record the rule (record_constraint / record_fact / record_sequence) so verify "
+                               "checks it, or resolve again with a reason that answers the reviewer.")
         return res
+
+    def load_skill(self, name: str) -> Dict[str, Any]:
+        from embedforge.skills import list_skills, load_skill
+        body = load_skill(name)
+        if body is None:
+            return {"error": f"No skill {name!r}. Skills: " + ", ".join(n for n, _ in list_skills())}
+        return {"skill": name, "playbook": body}
 
     def coding_brief(self) -> Dict[str, Any]:
         """Everything the code must do, from what is on record: the user's request, wiring, init order, settings, the

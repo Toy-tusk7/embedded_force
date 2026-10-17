@@ -42,6 +42,10 @@ tracing = [
 [project.scripts]
 embedforge = "embedforge.server:main"
 
+[tool.setuptools.package-data]
+# the IDE, the agent's skills (playbooks) and the benchmark's datasheet ship with the package
+embedforge = ["web/*", "skills/*.md", "verifybench/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]

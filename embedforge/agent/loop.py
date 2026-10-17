@@ -30,7 +30,7 @@ MAX_SDK_WITHOUT_PROGRESS = 10
 MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
 MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments while its result is still visible
 READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_framework", "query_board", "list_facts",
-                   "read_source", "read_section", "datasheet_outline", "coding_brief", "init_betaflight", "init_project", "resolve_target",
+                   "read_source", "read_section", "datasheet_outline", "coding_brief", "load_skill", "init_betaflight", "init_project", "resolve_target",
                    "set_plan"}
 ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
 # failing builds/verifies between edits are the normal fix loop; finish and the record tools have their own truth gates
@@ -336,6 +336,8 @@ class AgentRunner:
         store = SourceStore(project.root)
         ledger = FactLedger(project.root, store)
         belt = ToolBelt(project, s, store, ledger)
+        if config.claim_review:   # a separate call with its own context: a second opinion on the agent's claims
+            belt.reviewer = lambda messages: self.llm.chat(messages, None, retries=3)["content"]
         guard = ProgressGuard()
         span = f"agent-{s.run_id}"
         tracer.start_span(span, "EmbedForge Agent Run", run_type="chain", inputs={"user_message": user_message, "project": project.id})

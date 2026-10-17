@@ -27,3 +27,4 @@ def _temporary_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "selfhosted_base_url", "")   # nor a self-hosted model server be picked or called
     monkeypatch.setattr(config, "mutation_test", False)      # test_mutate.py runs it on purpose
     monkeypatch.setattr(config, "static_analysis", False)    # a test build must not start cppcheck
+    monkeypatch.setattr(config, "claim_review", False)       # nor a review call eat a scripted model turn

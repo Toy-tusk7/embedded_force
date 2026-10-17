@@ -242,14 +242,22 @@ def set_active_prompt(key: str) -> str:
 
 
 def get_active_prompt_text(kind: str = "") -> str:
-    """The system prompt; a Betaflight project gets its own short, single-workflow prompt unless a custom one is set."""
+    """The system prompt; a Betaflight project gets its own short, single-workflow prompt unless a custom one is set.
+    The skills (embedforge/skills/*.md) are listed at the end, one line each; load_skill reads one."""
     if _ACTIVE_PROMPT_KEY == "custom" and _CUSTOM_PROMPT_TEXT.strip():
         return _CUSTOM_PROMPT_TEXT
     if kind == "betaflight":
-        return PROMPT_BETAFLIGHT
-    if _ACTIVE_PROMPT_KEY == "fast":
-        return PROMPT_FAST
-    return PROMPT_STRICT
+        base = PROMPT_BETAFLIGHT
+    elif _ACTIVE_PROMPT_KEY == "fast":
+        base = PROMPT_FAST
+    else:
+        base = PROMPT_STRICT
+    from embedforge.skills import list_skills
+    skills = list_skills()
+    if not skills:
+        return base
+    return (base + "\n\nSKILLS (playbooks; load_skill(name) before the work they cover):\n"
+            + "\n".join(f"- {name}: {desc}" for name, desc in skills))
 
 
 def set_custom_prompt(text: str) -> None:

@@ -28,6 +28,8 @@ class Requirement:
     status: str = "open"
     refs: List[str] = field(default_factory=list)   # truth items that quote it (covered)
     reason: str = ""                                # how the code implements it / why it does not apply
+    review: Dict[str, str] = field(default_factory=dict)   # the independent reviewer's verdict on the claim
+    disputes: int = 0                               # how often the reviewer disagreed with a claim about it
 
 
 class Requirements:
@@ -92,13 +94,28 @@ class Requirements:
                     rejected.append({"id": rid, "error": "reason: say how the code does it (file/function) or why it does "
                                                          "not apply (e.g. 'board-level: pull-ups are on the schematic')"})
                 else:
-                    r.status, r.reason = status, reason[:300]
+                    r.status, r.reason, r.review = status, reason[:300], {}   # a new claim needs a new review
                     done.append(f"{rid} {status}")
             self._save()
         out: Dict[str, Any] = {"ok": bool(done), "resolved": done}
         if rejected:
             out["rejected"] = rejected
         return out
+
+    def set_reviews(self, reviews: Dict[str, Dict[str, str]]) -> None:
+        with self._lock:
+            for rid, rv in reviews.items():
+                r = self.items.get(rid)
+                if r is None or r.status not in ("implemented", "not_applicable"):
+                    continue
+                r.review = rv
+                if rv.get("verdict") == "disagree":
+                    r.disputes += 1
+            self._save()
+
+    def disputed(self) -> List[Requirement]:
+        return [r for r in self.items.values() if r.status in ("implemented", "not_applicable")
+                and r.review.get("verdict") == "disagree"]
 
     def counts(self) -> Dict[str, int]:
         c = {s: 0 for s in STATUSES}

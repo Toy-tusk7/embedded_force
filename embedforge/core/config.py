@@ -71,6 +71,8 @@ class EmbedForgeConfig(BaseModel):
     llm_provider: str = Field(
         default_factory=lambda: os.getenv("EMBEDFORGE_PROVIDER", "").strip().lower()
     )
+    # an independent model call reviews the agent's 'implemented' / 'not applicable' claims about datasheet requirements
+    claim_review: bool = Field(default_factory=lambda: os.getenv("EMBEDFORGE_CLAIM_REVIEW", "1") != "0")
     # cppcheck + MISRA C:2012 after each PlatformIO build (PlatformIO installs tool-cppcheck on first use)
     static_analysis: bool = Field(default_factory=lambda: os.getenv("EMBEDFORGE_STATIC_ANALYSIS", "1") != "0")
     # measure verification strength on each delivered driver (plant faults, count those verify catches)
