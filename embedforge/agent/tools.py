@@ -1252,18 +1252,37 @@ class ToolBelt:
                 continue
             topic, spans = self._strict_topic(sid, r.section)
             if topic and not self._backed(sid, r.ref, spans, truth):
-                bad.append((r, topic))
+                bad.append((r, topic, spans))
         if not bad:
             return []
-        listed = "; ".join(f"{r.id} [{r.section.split(' ')[0]}] {r.text[:90]} ({r.status})" for r, _ in bad[:8])
+        listed = "; ".join(f"{r.id} [{r.section.split(' ')[0]}] {r.text[:90]} ({r.status})" for r, _t, _s in bad[:8])
+        # what to do for each, concretely: in the BMP388 fix-up run Nemotron re-read the sections for 25 steps, not seeing
+        # that FACT-019 already quoted the mode-transition section and could back two of these rules
+        make = {"timing": "record_constraint(when='<MODE_REG>.mode == <the mode the code uses>', require='<conversion time "
+                          "from the formula, REGISTER.field names> <= <sampling period from the ODR table>', quotes=[the "
+                          "formula line, the table row])",
+                "settings_choice": "record_fact for the row of the recommended-settings table that fits the user's use "
+                                   "case (its oversampling, filter, data rate), quoting that row; then use those values",
+                "modes": "record_sequence for the order the section gives (e.g. settings while asleep, then the mode), "
+                         "or record_fact for a time or value it states"}
+        groups: Dict[Tuple[str, Tuple[str, ...]], List[str]] = {}
+        for r, topic, spans in bad[:8]:
+            # records quoting this topic's sections, the ones nearest the rule's own sentence first
+            near = sorted({(max(0, a - r.end, r.start - b), ref) for a, b, ref in truth.get(sid, [])
+                           if any(a < e and s < b for s, e in spans)})
+            have = tuple(dict.fromkeys(ref for _d, ref in near))[:3]
+            groups.setdefault((topic, have), []).append(r.id)
+        steps = []
+        for (topic, have), ids in groups.items():
+            steps.append(f"{', '.join(ids)}: " + (f"{', '.join(have)} already quote the {topic.replace('_', ' ')} sections (nearest "
+                                                  f"first) — where one states the rule, resolve_requirements with status "
+                                                  f"'implemented' and ref '{have[0]}'; otherwise " if have else "")
+                         + make.get(topic, "record the rule") + ", then resolve with ref = the new record's id")
         return [Finding("ERROR", "REQUIREMENT_NEEDS_RECORD", "", 0,
-                        f"{len(bad)} rule(s) about {', '.join(sorted({t.replace('_', ' ') for _, t in bad}))} — what the code itself "
-                        f"sets — are settled by a claim, which nothing checks: {listed}.",
-                        suggestion=("Record the rule so verify checks it on every build: record_constraint for a limit (e.g. "
-                                    "conversion time <= sampling period while in the mode the code uses), record_fact for "
-                                    "the recommended setting chosen for the user's use case or for a time, record_sequence "
-                                    "for an order. Then resolve_requirements([{id, status: 'implemented', ref: <that "
-                                    "record's id>, reason}]). load_skill('datasheet-rules') explains each kind."))]
+                        f"{len(bad)} rule(s) about {', '.join(sorted({t.replace('_', ' ') for _, t, _s in bad}))} — what the code "
+                        f"itself sets — are settled by a claim, which nothing checks: {listed}.",
+                        suggestion=("Record each rule so verify checks it on every build (reading the section again does not "
+                                    "settle it): " + " | ".join(steps) + ". load_skill('datasheet-rules') explains each kind."))]
 
     def record_fact(self, subject: str, property: str, value: Any, source_id: str, quote: str, unit: str = "") -> Dict[str, Any]:
         # a quote copied from a clipped line may end in an ellipsis; the text before it is still verbatim
@@ -2076,7 +2095,10 @@ class ToolBelt:
                 continue
             for f in fs:
                 g = {k: v for k, v in f.items() if k in ("severity", "code", "file", "line", "message", "literal")}
-                g["suggestion"] = str(f.get("suggestion") or "")[:200]
+                # a finding about one line gets a short hint; one about the whole project (what to read, which rules to
+                # record) is few and its steps are the point: cut at 200 characters, the BMP388 runs never saw 'then
+                # resolve_requirements with ref = that record' and re-read the datasheet instead
+                g["suggestion"] = str(f.get("suggestion") or "")[:200 if f.get("file") else 1500]
                 m = re.fullmatch(r"PA?(\d{1,2})|GPIO(\d{1,2})", str(f.get("literal") or ""))
                 if board is not None and m and code in ("UNSOURCED_CONSTANT", "UNTAGGED_CONSTANT", "FACT_VALUE_MISMATCH"):
                     gpio = int(next(x for x in m.groups() if x))

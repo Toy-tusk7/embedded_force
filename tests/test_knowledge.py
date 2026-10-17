@@ -66,3 +66,10 @@ def test_verify_fails_until_every_requirement_is_settled(tmp_path):
     assert belt.call("resolve_requirements", {"items": [dict(claim, id=i, ref=fact["fact"]["id"]) for i in ids]})["ok"]
     v = belt.call("verify", {})
     assert not [f for f in v["findings"] if f["code"].startswith("REQUIREMENT")] and not v.get("unchanged"), v["findings"]
+    # a claim settled before such rules needed a record (requirements.json from an older run): verify names the record
+    # that already quotes the section, and the whole of that advice reaches the model, not its first 200 characters
+    Requirements(p.root).resolve([dict(claim, id=ids[0])])
+    v = belt.call("verify", {})
+    need = next(f for f in v["findings"] if f["code"] == "REQUIREMENT_NEEDS_RECORD")
+    assert f"{ids[0]}: {fact['fact']['id']} already quote" in need["suggestion"], need
+    assert need["suggestion"].endswith("load_skill('datasheet-rules') explains each kind."), need["suggestion"]
