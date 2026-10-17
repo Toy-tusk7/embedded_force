@@ -81,6 +81,11 @@ def find_section(secs: List[Section], key: str) -> Optional[Section]:
     for s in secs:
         if s.num.lower() == k:
             return s
+    lead = re.match(r"(\d{1,2}(?:\.\d{1,2}){0,4})\.?\s+\S", k)   # '6.3 Connection diagram I²C': the number decides
+    if lead:
+        hit = next((s for s in secs if s.num == lead.group(1)), None)
+        if hit:
+            return hit
     hits = [s for s in secs if k and k in s.title.lower()]
     return min(hits, key=lambda s: len(s.title)) if hits else None
 

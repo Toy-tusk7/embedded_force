@@ -30,6 +30,7 @@ def test_sections_follow_the_numbering_and_skip_the_table_of_contents():
     normal = find_section(secs, "2.1.2")
     assert normal.title == "Normal mode" and "must be set to normal only after" in DS[normal.start:normal.end]
     assert find_section(secs, "normal mode") is normal and find_section(secs, "Section 2.1.2.") is normal
+    assert find_section(secs, "2.1.2 Normal mode") is normal and find_section(secs, "2.1.2. Normal Mode (operation)") is normal
     modes = find_section(secs, "2.1")
     assert DS[modes.start:subtree_end(secs, modes)].count("Normal mode") == 1   # 2.1 includes its subsections
     assert any("not allowed" in r for r in requirements(DS[normal.start:normal.end]))
