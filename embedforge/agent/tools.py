@@ -1105,7 +1105,9 @@ class ToolBelt:
         key = re.sub(r"\s+", " ", re.sub(r"^fig(?:ure)?\.?\s*", "figure ", str(figure or "").strip().lower()))
         if re.fullmatch(r"\d+", key):   # a bare number is a figure; 'Table 3' and 'Figure 3' are different things
             key = "figure " + key
+        lead = re.match(r"(figure|table) (\d+)\b", key)   # 'Table 41: Register 0x1C “OSR”' names Table 41
         f = next((x for x in figs if x.label.lower() == key), None) \
+            or next((x for x in figs if lead and x.label.lower() == f"{lead.group(1)} {lead.group(2)}"), None) \
             or next((x for x in figs if key and key in x.caption.lower()), None)
         if f is None:
             return {"error": f"No figure {figure!r} in {sid}. Captions: " + "; ".join(f"{x.label}: {x.caption[:40]}" for x in figs[:30])}

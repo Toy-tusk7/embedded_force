@@ -250,6 +250,10 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     always = book.record_constraint(store, "BMPX", src2.id, "osr_limit", "OSR.osr_p <= 3",   # models write when='true'
                                     ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."], when="true")
     assert always["ok"] and "when" not in always["constraint"], always
+    # when='PWR_CTRL.mode == 3': 3 is normal, a value the register map records for that field (not in the rule's quote)
+    q = ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."]
+    assert book.record_constraint(store, "BMPX", src2.id, "osr_in_normal", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 3")["ok"]
+    assert "constant 7" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 7")["error"]
 
 
 def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):

@@ -150,15 +150,16 @@ def anchor(quote: str, text: str) -> Optional[Tuple[int, int]]:
     return None
 
 
-_ESC_LITERAL = re.compile(r"\\u([0-9a-fA-F]{4})|\\[nrt]")
+_ESC_LITERAL = re.compile(r"\\u([0-9a-fA-F]{4})|\\[nrt]|\\([\"'\\/])")
 GAP = re.compile(r"\s*(?:…|\.{3,}|\[\.\.\.\])\s*")
 GAP_MIN_PIECE = 8      # squashed characters in each piece of a quote with omissions
 GAP_MAX_SKIP = 1500    # squashed characters a '…' may stand for
 
 
 def unescape_literals(q: str) -> str:
-    """Literal '\\u2013' / '\\n' left in a quote by double JSON escaping are the characters they stand for."""
-    return _ESC_LITERAL.sub(lambda m: chr(int(m.group(1), 16)) if m.group(1) else " ", q or "")
+    """Literal '\\u2013' / '\\n' / '\\"' left in a quote by double JSON escaping are the characters they stand for (the
+    BMP388 fix-up run quoted 'Register 0x1C \\"OSR\\"' seven times)."""
+    return _ESC_LITERAL.sub(lambda m: chr(int(m.group(1), 16)) if m.group(1) else m.group(2) or " ", q or "")
 
 
 def anchor_pieces(quote: str, text: str) -> Optional[List[Tuple[int, int]]]:
@@ -296,8 +297,8 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
         except ValueError:
             if re.fullmatch(r"(?i)(gpio|gp|p[a-k])\d+", v):  # pin names: GPIO4 must not match inside GPIO41
                 out.append(("pin", rf"(?<![0-9a-z]){re.escape(v.lower())}(?![0-9])", "STRICT"))
-            else:
-                out.append(("text", re.escape(v.lower()), "STRICT"))
+            else:   # words, with whatever whitespace the PDF put between them ('commands \nare ignored')
+                out.append(("text", r"\s+".join(re.escape(w) for w in v.lower().split()), "STRICT"))
     return out
 
 

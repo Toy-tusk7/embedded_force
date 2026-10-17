@@ -99,6 +99,8 @@ def test_read_figure_transcribes_once_and_marks_its_source(tmp_path):
     assert rec["ok"] and not rec["fact"]["authoritative"] and "vision model" in " ".join(rec["warnings"])
     # Table 3 comes first in the document: asking for Figure 3 must not get it, asking for Table 3 must
     assert belt.call("read_figure", {"source_id": src.id, "figure": "Table 3"})["figure"] == "Table 3: Operating conditions"
+    # named with its caption, as models write it
+    assert belt.call("read_figure", {"source_id": src.id, "figure": "Table 3: Operating conditions (all)"})["figure"] == "Table 3: Operating conditions"
     sec = belt.call("read_section", {"source_id": src.id, "section": "2.1"})
     assert sec["sections"][0]["figures"] == [f"Figure 3: Normal mode timing diagram — read_figure('{src.id}', 'Figure 3')"]
     missing = belt.call("read_figure", {"source_id": src.id, "figure": "Figure 9"})

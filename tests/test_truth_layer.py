@@ -77,6 +77,20 @@ def test_a_table_value_written_with_its_unit_is_the_number(tmp_path):
     assert not ledger.record("BMP388", "t", "7.97 ms", src.id, "Low power ×2 ×1 6.84 7.96 146.00 125.56")["ok"]
 
 
+def test_a_sentence_value_and_double_escaped_quotes(tmp_path):
+    """From the BMP388 fix-up run: a rule recorded with the sentence as its value was refused ten times because the PDF
+    breaks the line inside it, and quotes of 'Register 0x1C \\"OSR\\"' (escaped twice) never matched."""
+    store = SourceStore(tmp_path)
+    text = ("3.3.4. Mode transition diagram \nFurther mode change commands \nare ignored until the last mode change command "
+            "is executed.\nTable 41: Register 0x1C “OSR” controls the oversampling.\n")
+    src = store.add("https://www.bosch-sensortec.com/bmp388.pdf", "BMP388", text, kind="pdf")
+    ledger = FactLedger(tmp_path, store)
+    rule = "Further mode change commands are ignored until the last mode change command is executed"
+    assert ledger.record("BMP388", "mode_change_rule", rule, src.id, rule + ".")["ok"]
+    r = ledger.record("BMP388", "osr_register", "0x1C", src.id, 'Table 41: Register 0x1C \\"OSR\\" controls the oversampling.')
+    assert r["ok"], r
+
+
 def test_pdf_math_letters_are_the_letters(tmp_path):
     """The BMP388's conversion-time equation as its PDF gives it: Unicode mathematical italic letters, garbled."""
     from embedforge.truth.ledger import MATH_FOLD, anchor_pieces
