@@ -106,6 +106,7 @@ def requirements(text: str, limit: int = 12) -> List[str]:
     out = []
     for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z])|\n{2,}|\n(?=[•\-–]\s)", flat):
         s = re.sub(r"\s+", " ", sent).strip(" •-–")
+        s = re.split(r"\s*={3,}\s*PDF PAGE", s)[0].strip()   # a page break's running header is not part of the sentence
         if 25 <= len(s) <= 400 and _NORMATIVE.search(s) and s not in out:
             out.append(s)
         if len(out) >= limit:

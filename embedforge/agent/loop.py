@@ -22,7 +22,7 @@ from embedforge.truth import FactLedger, SourceStore
 # Tools whose success means the run moved forward (resets the research / SDK budgets).
 PROGRESS_TOOLS = {"record_fact", "record_user_fact", "record_board_pins", "init_project", "init_betaflight", "query_board",
                   "write_file", "replace_in_file", "rename_file", "build", "verify", "record_facts", "record_sequence", "record_registers",
-                  "record_layouts", "record_formula", "record_constraint"}
+                  "record_layouts", "record_formula", "record_constraint", "resolve_requirements"}
 RESEARCH_TOOLS = {"web_search", "fetch_document", "find_reference_code", "find_documents"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
@@ -30,12 +30,12 @@ MAX_SDK_WITHOUT_PROGRESS = 10
 MAX_CONSECUTIVE_FAILURES = 3   # the same tool failing in a row (e.g. resolve_target for an unsupported MCU)
 MAX_IDENTICAL_READS = 2        # the same read-only call with identical arguments while its result is still visible
 READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_framework", "query_board", "list_facts",
-                   "read_source", "read_section", "datasheet_outline", "init_betaflight", "init_project", "resolve_target",
+                   "read_source", "read_section", "datasheet_outline", "coding_brief", "init_betaflight", "init_project", "resolve_target",
                    "set_plan"}
 ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
 # failing builds/verifies between edits are the normal fix loop; finish and the record tools have their own truth gates
 NO_FAILURE_STREAK_TOOLS = {"build", "verify", "finish", "record_fact", "record_user_fact", "record_board_pins", "record_facts",
-                           "record_sequence", "record_registers", "record_layouts", "record_formula", "record_constraint"}
+                           "record_sequence", "record_registers", "record_layouts", "record_formula", "record_constraint", "resolve_requirements"}
 MAX_UNBUILT_CODE_NUDGES = 2
 MAX_TRUNCATION_RETRIES = 2
 MAX_CONTINUE_NUDGES = 2
@@ -288,6 +288,16 @@ class AgentRunner:
             hx = b.get("files", {}).get("hex", "—")
             lines.append(f"- v{b['version']}: flash {b.get('flash_used')}/{b.get('flash_total')} B, RAM {b.get('ram_used')}/{b.get('ram_total')} B, "
                          f"hex `{hx}` sha256 `{(b.get('sha256') or {}).get('hex', '—')[:16]}…`, verified: {b.get('verified')}")
+        from embedforge.truth.knowledge import Requirements
+        rq = Requirements(self.project.root)
+        if rq.items:
+            c = rq.counts()
+            lines += ["", "## Datasheet requirements", "",
+                      f"{len(rq.items)} rule sentences from the datasheet sections this code depends on: {c['covered']} covered by "
+                      f"quoted records (checked by verify), {c['implemented']} implemented (the agent's claim, not machine-checked), "
+                      f"{c['not_applicable']} not applicable, {c['open']} open."]
+            lines += [f"- {r.id} ({r.status}{': ' + r.reason if r.reason else ''}) {r.text[:140]}"
+                      for r in rq.items.values() if r.status in ("implemented", "not_applicable", "open")][:30]
         mr = self.project.root / "artifacts" / "mutation_report.json"
         if mr.exists():
             try:

@@ -61,6 +61,13 @@ def digest(name: str, args: Dict[str, Any], result: Any) -> str:
                    f"{str(rej[0].get('error'))[:90]}" if rej else ""))
     if name == "record_formula":
         return f"record_formula -> {str(r.get('formula'))[:150]}" if r.get("ok") else f"record_formula REJECTED: {str(r.get('error'))[:140]}"
+    if name == "coding_brief":
+        reqs = (r.get("datasheet_requirements") or {}).get("counts") or {}
+        return (f"coding_brief: {len(r.get('sequences') or [])} sequence(s), {len(r.get('rules_after_every_write') or [])} rule(s), "
+                f"{len(r.get('conversions') or [])} conversion(s), {reqs.get('open', 0)} open requirement(s)")
+    if name == "resolve_requirements":
+        return (f"resolve_requirements -> {', '.join(r.get('resolved') or []) or 'none'}"
+                + (f"; {len(r['rejected'])} rejected: {str(r['rejected'][0].get('error'))[:80]}" if r.get("rejected") else ""))
     if name == "record_constraint":
         return (f"record_constraint -> {str(r.get('constraint'))[:150]}" if r.get("ok")
                 else f"record_constraint REJECTED: {str(r.get('error'))[:140]}")
@@ -350,6 +357,12 @@ def state_block(project: Any, ledger: Any, belt: Any, history: List[Dict[str, An
     if unread:
         lines.append(f"- Datasheet sections your code depends on, not read yet ({len(unread)}): " + "; ".join(unread[:8])
                      + " — read_section them (several per call) and record the rules they state.")
+    from embedforge.truth.knowledge import Requirements
+    rq = Requirements(project.root)
+    if rq.items:
+        c = rq.counts()
+        lines.append(f"- Datasheet requirements: {len(rq.items)} ({c['covered']} covered by records, {c['implemented']} implemented, "
+                     f"{c['not_applicable']} not applicable, {c['open']} open). coding_brief shows them with everything the code must do.")
     inputs_stale = bool(lv) and lv.get("hash") == current and lv.get("inputs") not in (None, belt.verify_inputs_hash())
     if lv:
         lines.append(f"- Last verify: {lv.get('summary')}"

@@ -75,6 +75,19 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
         "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
         {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
+    _fn("coding_brief",
+        "Everything the code must do, compiled from what is on record: the user's request, wiring and IDs, register map "
+        "with reset values, init sequences, rules that must hold after every register write, readout (bursts, layouts), "
+        "conversions, the datasheet's requirements (open / implemented / covered) and the gates verify applies. Call it "
+        "before writing code and before fixing verify findings.",
+        {}, []),
+    _fn("resolve_requirements",
+        "Settle datasheet requirements verify reports as REQUIREMENT_OPEN, several per call: items=[{id:'REQ-004', "
+        "status:'implemented', reason:'readRawData() reads 0x04..0x09 in one burst'}, {id:'REQ-002', "
+        "status:'not_applicable', reason:'board-level: power ramp is the supply's job'}]. A requirement that one of your "
+        "records quotes (record_fact / record_sequence / record_constraint) is covered by itself.",
+        {"items": _arr({"type": "object", "properties": {"id": S, "status": S, "reason": S}, "required": ["id", "status", "reason"]})},
+        ["items"]),
     _fn("record_fact",
         "Record a hardware fact. REJECTED unless `quote` appears verbatim in the cited source and contains `value`. "
         "value examples: '0x68', '400', '3.3'. Returns FACT-nnn to tag in code comments. On rejection, "
@@ -361,6 +374,7 @@ class ToolBelt:
             "web_search": self.web_search, "find_documents": self.find_documents,
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
             "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
+            "coding_brief": self.coding_brief, "resolve_requirements": self.resolve_requirements,
             "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
@@ -425,7 +439,7 @@ class ToolBelt:
                                                         or (ptype == "integer" and isinstance(val, int) and not isinstance(val, bool))):
             call_args[missing[0]] = args[ignored[0]]
             ignored = [f"{ignored[0]} (used as {missing[0]})"]
-        limit = 14000 if name in ("query_board", "read_section") else 7000
+        limit = 14000 if name in ("query_board", "read_section", "coding_brief") else 7000
         import json as _json
         sig = name + _json.dumps(call_args, sort_keys=True, default=str)
         if name.startswith("record_") and self._failed_calls.get(sig, 0) >= 2:
@@ -456,7 +470,7 @@ class ToolBelt:
         """Build inputs plus what verify judges them against (facts, sequences, schematic, the datasheet sections read): a
         new fact, a section read or a re-imported board after verify makes the old verify stale."""
         h = hashlib.sha256(self.source_hash().encode())
-        for n in ("ledger.json", "sequences.json", "registers.json", "board.json", "sources/reads.json"):
+        for n in ("ledger.json", "sequences.json", "registers.json", "board.json", "sources/reads.json", "requirements.json"):
             p = self.project.root / n
             h.update(n.encode())
             if p.exists():
@@ -917,8 +931,10 @@ class ToolBelt:
             src = self.store.get(sid)
             if src is None or src.url.startswith("user://") or len(self._outline(sid)) < 8:
                 continue
-            unread = [(s, why) for s, why in self._required_for(sid) if self.reads.seen(sid, s.start, s.end) < 0.5]
+            need = self._required_for(sid)
+            unread = [(s, why) for s, why in need if self.reads.seen(sid, s.start, s.end) < 0.5]
             self.state.setdefault("unread", {})[sid] = [f"{s.num} {s.title[:50]}" for s, _ in unread]
+            out += self._open_requirements(sid, [s for s, _ in need if (s, _) not in unread])
             if unread:
                 listed = "; ".join(f"{s.label[:60]} ({why})" for s, why in unread[:8])
                 out.append(Finding(
@@ -928,6 +944,101 @@ class ToolBelt:
                     suggestion=(f"read_section('{sid}', {[s.num for s, _ in unread[:8]]}) and record what they require "
                                 "(record_fact for values and times, record_sequence for orders); then fix the code if it breaks one.")))
         return out
+
+    def _open_requirements(self, sid: str, read_sections: List[Any]) -> List[Any]:
+        """REQUIREMENT_OPEN: rule sentences of the sections read (the ones the code depends on) that no record quotes and
+        the agent has not resolved (truth/knowledge.py)."""
+        from embedforge.truth.knowledge import Requirements, truth_spans
+        from embedforge.truth.ledger import anchor
+        from embedforge.truth.outline import requirements as rule_sentences
+        from embedforge.truth.verifier import Finding
+        src = self.store.get(sid)
+        if src is None or not read_sections:
+            return []
+        found = []
+        for s in read_sections:
+            body = src.text[s.start:s.end]
+            for sent in rule_sentences(body, limit=40):
+                sp = anchor(sent, body)
+                if sp:
+                    found.append((s.label[:80], sent, s.start + sp[0], s.start + sp[1]))
+        reqs = Requirements(self.project.root)
+        mine = reqs.sync(sid, found)
+        reqs.cover(truth_spans(self.project.root, self.store, self.ledger))
+        mine = [reqs.items[r.id] for r in mine]
+        open_ = [r for r in mine if r.status == "open"]
+        if not open_:
+            return []
+        listed = "; ".join(f"{r.id} [{r.section.split(' ')[0]}] {r.text[:110]}" for r in open_[:10])
+        return [Finding("ERROR", "REQUIREMENT_OPEN", "", 0,
+                        f"{len(open_)} rule(s) the datasheet states in sections this code depends on are not settled: {listed}"
+                        + (f" (+{len(open_) - 10} more: coding_brief lists all)" if len(open_) > 10 else "."),
+                        suggestion=("For each: record what it requires (record_fact / record_sequence / record_constraint, "
+                                    "quoting it), or resolve_requirements([{id, status: 'implemented', reason: <where the "
+                                    "code does it>} | {id, status: 'not_applicable', reason: <why>}]) — several per call."))]
+
+    def resolve_requirements(self, items: Any) -> Dict[str, Any]:
+        from embedforge.truth.knowledge import Requirements
+        res = Requirements(self.project.root).resolve(items if isinstance(items, list) else [items] if isinstance(items, dict) else [])
+        res["next"] = "verify again: the requirements are part of what it judges."
+        return res
+
+    def coding_brief(self) -> Dict[str, Any]:
+        """Everything the code must do, from what is on record: the user's request, wiring, init order, settings, the
+        rules that must hold after every write, readout, conversions, the datasheet's requirements and the gates verify
+        applies. Read it before writing or fixing code."""
+        from embedforge.truth.knowledge import Requirements
+        from embedforge.truth.registers import RegisterBook, register_derived
+        from embedforge.truth.sequences import SequenceBook
+        brief: Dict[str, Any] = {}
+        conv = self.store._by_url.get("user://conversation")
+        if conv and self.store.get(conv):
+            brief["user_asked"] = self.store.get(conv).text[-1500:]
+        facts = list(self.ledger.facts.values())
+        brief["wiring_and_ids"] = [f"{f.id} {f.subject}.{f.property} = {f.value}" + (f" {f.unit}" if f.unit else "") for f in facts][:40]
+        book = RegisterBook(self.project.root)
+        brief["registers"] = [f"{r.id} {r.name} 0x{r.addr:02X}" + (f" reset 0x{r.reset:02X}" if r.reset is not None else "") + ": "
+                              + ", ".join(f.label() + (" {" + ", ".join(f"{n}={'|'.join(map(str, vs))}" for n, vs in f.values.items()) + "}" if f.values else "")
+                                          for f in r.fields) for r in book.registers.values()][:30]
+        seqs = SequenceBook(self.project.root).items.values()
+        brief["sequences"] = [f"{s.id} {s.subject}.{s.name} in {s.entry}(): " + " -> ".join(
+            f"{st.op} " + ", ".join(f"{k}={v}" for k, v in st.public().items() if k != "op") for st in s.steps) for s in seqs]
+        if book.constraints:
+            brief["rules_after_every_write"] = [f"{c.id} {c.name}: " + (f"when {c.when}: " if c.when else "") + c.require
+                                                + (f" [{c.unit}]" if c.unit else "") for c in book.constraints.values()]
+        if book.bursts or book.layouts:
+            brief["readout"] = ([f"{b.id} {b.name}: read 0x{b.start:02X}..0x{b.end:02X} in ONE burst" for b in book.bursts.values()]
+                                + [l.describe() for l in book.layouts.values()])[:30]
+        if book.formulas:
+            derived = register_derived(book)
+            brief["conversions"] = [f"{f.id} {f.name}: {f.text()}" for f in book.formulas.values() if f.id in derived][:30]
+            consts = [f"{f.name} = {f.text().split('=', 1)[-1].strip()}" for f in book.formulas.values() if f.id not in derived]
+            if consts:
+                brief["constants"] = consts[:20]
+        reqs = Requirements(self.project.root)
+        if reqs.items:
+            from embedforge.truth.knowledge import truth_spans
+            reqs.cover(truth_spans(self.project.root, self.store, self.ledger))   # records made since the last verify count
+            brief["datasheet_requirements"] = {
+                "open": [f"{r.id} [{r.section.split(' ')[0]}] {r.text}" for r in reqs.items.values() if r.status == "open"][:25],
+                "implemented (claimed)": [f"{r.id} {r.text[:120]} — {r.reason}" for r in reqs.items.values() if r.status == "implemented"][:20],
+                "covered by records": [f"{r.id} {r.text[:100]} ({', '.join(r.refs)})" for r in reqs.items.values() if r.status == "covered"][:20],
+                "counts": reqs.counts()}
+        lv = self.project.meta().get("last_verify") or {}
+        if lv.get("findings"):
+            brief["last_verify"] = {"summary": lv.get("summary"), "first_findings": lv.get("findings")}
+        brief["gates_verify_applies"] = [
+            "every hardware constant and every pin carries /* FACT-nnn */ (pins: the schematic's fact for that role, SDA vs SCL)",
+            "register writes decode to recorded fields and named values; multi-byte values follow their layouts; bursts stay whole",
+            "each conversion computes the recorded formula exactly; sequences happen in order with their delays",
+            "each rule in rules_after_every_write holds after EVERY register write (write settings before the mode)",
+            "no wait on hardware without a timeout or retry limit; check every status a call returns; a failure branch never "
+            "returns success",
+            "compiles warning-free at -Wall -Wextra; cppcheck finds no defect (initialise every member and variable)",
+            "every datasheet requirement above is covered, implemented or not applicable; then a mutation test measures the checks"]
+        brief["next"] = ("Write or fix the code so it does all of this; then build and verify. Resolve each open requirement "
+                         "(record it, or resolve_requirements) — verify fails while one is open.")
+        return brief
 
     def _required_for(self, source_id: str):
         """Sections of this source the code depends on (from what the last verify saw the code do)."""

@@ -92,7 +92,11 @@ hardware problem you debug it and ship a patched build.
    writes, polls or tests, with its fields (bit positions, named values) quoted from the register table, and `bursts`
    for registers that must be read in one transaction. Compose written values from those fields (mode bits 5..4 = 11
    is 0x30, not 0x03).
-6. `search_framework` for the SDK functions/macros you will call, then write modular C (`include/<module>.h`,
+6. `coding_brief()` before you write code and before you fix verify findings: it compiles the user's request, the
+   wiring, register map, sequences, rules, readout, conversions and the datasheet's requirements into one list of
+   what the code must do. Settle each datasheet requirement verify reports as REQUIREMENT_OPEN: record it, or
+   `resolve_requirements` (implemented: where the code does it; not_applicable: why).
+   `search_framework` for the SDK functions/macros you will call, then write modular C (`include/<module>.h`,
    `src/<module>.c`, `src/main.c`). Use named constants (#define/enum) for registers and values. Then `build()`;
    read the diagnostics, fix with `replace_in_file`/`write_file`, rebuild until it succeeds.
 7. `verify()`. It fails on everything the code uses that is not on record yet and names what to record:
