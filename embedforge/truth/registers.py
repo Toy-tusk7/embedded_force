@@ -768,7 +768,14 @@ def _constraint_tree(text: str, regs: Dict[str, "RegisterDef"]) -> _Rule:
         return var
     s = _FIELD_REF.sub(ref, s)
     if not refs:
-        raise ValueError("name the register fields it depends on as REGISTER.field (e.g. OSR.osr_p, ODR.odr_sel)")
+        # Nemotron wrote require='18.69 <= 20' (one setting's measurement time against one data rate's period) again and
+        # again: a rule is the datasheet's relation in the fields, true or false depending on what the code writes
+        raise ValueError("name the register fields it depends on as REGISTER.field (e.g. OSR.osr_p, ODR.odr_sel). A "
+                         "constraint is the datasheet's rule written in the fields, so verify can check any setting the "
+                         "code writes: e.g. <conversion time as a formula of OSR.osr_p, OSR.osr_t, PWR_CTRL.press_en, "
+                         "PWR_CTRL.temp_en> <= <sampling period as a formula of ODR.odr_sel>, with 2 ** field for "
+                         "powers of two and the formula's numbers quoted. A number for one setting (18.69 <= 20) is a "
+                         "fact, not a rule: record_fact it. load_skill('datasheet-rules') has a worked example")
     try:
         tree = ast.parse(s, mode="eval")
     except SyntaxError as e:
