@@ -473,6 +473,34 @@ def test_vendor_style_drivers_keep_their_values(tmp_path):
     assert ("printed by println()", 512.0) in {(v[2], v[0]) for v in pw.values}
 
 
+def test_struct_members_value_initialised_in_the_constructor_keep_their_fields(tmp_path):
+    """The rewritten BMP388 driver: BMP388(...) : _calib{}, _nvm_calib() {} — every _nvm_calib.x = ... was lost, and all
+    16 calibration and compensation formulas were reported as never computed."""
+    src = r'''#include <Arduino.h>
+struct nvm_t { uint16_t t1; };
+struct calib_t { double t1; };
+class Sensor {
+public:
+    Sensor(uint8_t addr) : _addr(addr), _count(), _calib{}, _nvm() {}
+    void load() { _nvm.t1 = 1000; _calib.t1 = (double)_nvm.t1 / 0.5; }
+    double value() { return _calib.t1 + _count; }
+private:
+    uint8_t _addr;
+    int _count;
+    calib_t _calib;
+    nvm_t _nvm;
+};
+Sensor s(0x76);
+void setup() { s.load(); }
+void loop() { double v = s.value(); Serial.println(v); }
+'''
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.cpp").write_text(src, encoding="utf-8")
+    pw = FlowModel.from_dir(tmp_path).run(["setup", "loop"], probe={0: 0})
+    vals = {(v[2], v[0]) for v in pw.values}
+    assert ("s._nvm.t1", 1000) in vals and ("printed by println()", 2000.0) in vals, sorted(vals, key=str)
+
+
 def test_values_changed_on_an_uncertain_path_become_unknown_not_wrong():
     code = """void init(int intf) { uint8_t reg = 0x7E; if (intf == 0) { reg = reg | 0x80; }
   uint8_t b[2] = {reg, 0xB6}; i2c_write_blocking(i2c0, 0x76, b, 2, false); }"""

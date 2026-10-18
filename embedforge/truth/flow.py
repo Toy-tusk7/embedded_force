@@ -1746,6 +1746,14 @@ class Walker:
             key = obj_key(this[0]) if this is not None else None
             for member, expr in fn.init:   # constructor initializer list
                 if key is not None:
+                    if not [t for t in expr if t.text not in ("{", "}")]:
+                        # value-initialised: _nvm_calib() / _calib{}. A struct member stays an object its fields are
+                        # written into (storing 'nothing' as its value lost every later _nvm_calib.x = ... in the BMP388
+                        # driver); a scalar is 0
+                        mtype = self.m.field_types.get(member) or ""
+                        if not self.m.struct_of(mtype) and re.search(r"\b(u?int\d*_t|int|long|short|char|bool|float|double|size_t)\b", mtype):
+                            self.fields[(key, member)] = 0.0 if re.search(r"float|double", mtype) else 0
+                        continue
                     self.fields[(key, member)] = Evaluator(self.m, env, chain + (fn.name,), self, guaranteed, fn.file).eval(expr)
             self.block(fn.body, env, chain + (fn.name,), guaranteed, fn.file)
             value = None
