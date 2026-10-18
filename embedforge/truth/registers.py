@@ -787,6 +787,39 @@ def _constraint_tree(text: str, regs: Dict[str, "RegisterDef"]) -> _Rule:
     return _Rule(tree, refs, names)
 
 
+def _constraint_sanity(when: Optional[_Rule], req: _Rule, regs: Dict[str, "RegisterDef"]) -> str:
+    """'' or why a recorded rule cannot be a datasheet rule. Nemotron 3 Super, pressed for a record verify checks,
+    wrote 'when every setting is the Drone row: OSR.osr_p * 0 + OSR.osr_t * 0 + 18.69 <= 20' (true whatever the
+    registers hold) and 'PWR_CTRL.mode == normal' with no condition (false from the chip's own reset on, so verify
+    flagged the soft reset, and the run chased that for twenty steps)."""
+    used = {reg.addr for reg, _f in req.refs.values()}
+    rnd = random.Random(7)
+    states = [{a: 0 for a in used}, {a: 0xFF for a in used}] + [{a: rnd.randrange(256) for a in used} for _ in range(30)]
+    seen = set()
+    for st in states:
+        try:
+            seen.add(bool(_eval_constraint(req, st)))
+        except (KeyError, ZeroDivisionError, OverflowError, ValueError, TypeError):
+            continue
+        if len(seen) > 1:
+            break
+    if len(seen) == 1:
+        return ("its require gives the same answer whatever the registers hold, so it checks nothing: write the rule "
+                "as the datasheet states it in the register fields (e.g. when PWR_CTRL.mode == normal: <conversion time "
+                "from OSR.osr_p, OSR.osr_t> <= <sampling period from ODR.odr_sel>), not one setting's numbers")
+    if when is None:
+        reset = {r.addr: r.reset for r in regs.values()}
+        if used and all(reset.get(a) is not None for a in used):
+            try:
+                if not _eval_constraint(req, reset):
+                    return ("with no `when`, the registers' reset values already break it, so the chip would violate it "
+                            "on its own: give the condition the datasheet states it for (when=..., e.g. the mode the rule "
+                            "applies in), or record it again from the quote")
+            except (KeyError, ZeroDivisionError, OverflowError, ValueError, TypeError):
+                pass
+    return ""
+
+
 def _eval_constraint(rule: _Rule, state: Dict[int, Optional[int]], regs: Any = None) -> Any:
     """The rule's value on register contents `state` (address -> byte); KeyError when a register it reads is unknown."""
     env: Dict[str, Any] = dict(rule.names)
@@ -998,6 +1031,9 @@ class RegisterBook:
             _eval_constraint(trees[1], state, regs)
         except (ValueError, KeyError, ZeroDivisionError, OverflowError) as e:
             return {"ok": False, "error": f"require cannot be evaluated: {e}"}
+        why = _constraint_sanity(trees[0], trees[1], regs)
+        if why:
+            return {"ok": False, "error": f"constraint {name}: {why}."}
         with self._lock:
             old = next((c for c in self.constraints.values() if c.device.lower() == device.lower() and c.name.lower() == name.lower()), None)
             c = ConstraintDef(old.id if old else self._next(self.constraints, "CON"), device, name, str(require).strip(),
@@ -1915,6 +1951,12 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             except ValueError as ex:   # a register re-recorded without a field the rule names
                 findings.append(RegFinding("ERROR", "CONSTRAINT_INVALID", "", 0, f"{c.id} {c.name}: {ex}",
                                            "record_constraint again with the fields now on record."))
+                continue
+            why = _constraint_sanity(when, req, regs_c)   # records made before this check, or reset values learnt since
+            if why:
+                findings.append(RegFinding("ERROR", "CONSTRAINT_INVALID", "", 0, f"{c.id} {c.name} ({c.require}): {why}.",
+                                           f"record_constraint again under the same name ({c.name}) to replace it, from "
+                                           "the datasheet's own statement of the rule."))
                 continue
             checked, bad = 0, None
             for _, w in walkers:

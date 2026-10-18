@@ -247,13 +247,19 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     summary, codes, found = _codes(p, ledger)
     bad = next(x for x in found if x.code == "CONSTRAINT_VIOLATED")
     assert "OSR.osr_p=5" in bad.message and "mode=3 (normal)" in bad.message and bad.line == swapped.split("\n").index("  wr(REG_PWR, 0x33);") + 1, bad
-    always = book.record_constraint(store, "BMPX", src2.id, "osr_limit", "OSR.osr_p <= 3",   # models write when='true'
+    always = book.record_constraint(store, "BMPX", src2.id, "osr_limit", "OSR.osr_p >= 3",   # models write when='true'
                                     ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."], when="true")
     assert always["ok"] and "when" not in always["constraint"], always
     # when='PWR_CTRL.mode == 3': 3 is normal, a value the register map records for that field (not in the rule's quote)
     q = ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."]
     assert book.record_constraint(store, "BMPX", src2.id, "osr_in_normal", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 3")["ok"]
     assert "constant 7" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 7")["error"]
+    # records that cannot be datasheet rules (the BMP388 fix-up run): fields multiplied by 0, and an unconditional rule
+    # the chip's own reset values break
+    vacuous = book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p * 0 + 1 <= 3", q, when="PWR_CTRL.mode == normal")
+    assert not vacuous["ok"] and "same answer whatever the registers hold" in vacuous["error"], vacuous
+    always_normal = book.record_constraint(store, "BMPX", src2.id, "x", "PWR_CTRL.mode == normal", ["11 normal mode"])
+    assert not always_normal["ok"] and "reset values already break it" in always_normal["error"], always_normal
     # a rule may name a field without the footnote digit its table prints (BMP388: osr_t printed 'osr4_t')
     osr = book.register_at(0x1C)
     printed = osr.field("osr_t")
@@ -261,7 +267,7 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     assert osr.field("osr_t") is printed and osr.field("osr2_t") is None and osr.field("osr4_t") is printed
     printed.name = "osr_t"
     # 3000 for a quoted 3 in another unit (5000 us for '5 ms'), as 3 * 1000 already is; 3001 is not stated
-    assert book.record_constraint(store, "BMPX", src2.id, "scaled", "OSR.osr_p * 1000 <= 3000", q)["ok"]
+    assert book.record_constraint(store, "BMPX", src2.id, "scaled", "OSR.osr_p * 1000 <= 3000", q, when="PWR_CTRL.mode == normal")["ok"]
     assert "constant 3001" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p * 1000 <= 3001", q)["error"]
 
 
