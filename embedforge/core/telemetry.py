@@ -59,9 +59,20 @@ class LangSmithTracer:
                         extra={"metadata": metadata or {}}
                     )
                 except Exception as e:
-                    logger.log_event("LANGSMITH_ERR", f"Failed to post start run to LangSmith: {e}")
+                    self._failed(e, "start")
 
         return span
+
+    def _failed(self, e: Exception, what: str) -> None:
+        """A post that failed. Over quota or unauthorised, LangSmith refuses every later post too, and its client retries
+        each one with back-off, on every agent step and tool call: stop tracing for this process instead (logged once)."""
+        text = str(e)
+        if any(s in text for s in ("429", "usage limit", "Too Many Requests", "401", "403", "Unauthorized", "Forbidden")):
+            self.tracing_enabled = False
+            logger.log_event("LANGSMITH_OFF", f"LangSmith refused a trace ({text[:160]}); tracing is off until the server "
+                                              "restarts. Runs are unaffected; their trace.jsonl is complete.")
+            return
+        logger.log_event("LANGSMITH_ERR", f"Failed to post {what} run to LangSmith: {e}")
 
     def end_span(self, span_id: str, outputs: Dict[str, Any] = None) -> Optional[Span]:
         span = self.active_spans.pop(span_id, None)
@@ -80,7 +91,7 @@ class LangSmithTracer:
                             end_time=datetime.now(timezone.utc)
                         )
                     except Exception as e:
-                        logger.log_event("LANGSMITH_ERR", f"Failed to post end run to LangSmith: {e}")
+                        self._failed(e, "end")
 
         return span
 
