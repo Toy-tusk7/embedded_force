@@ -139,8 +139,10 @@ def test_write_file_returns_lint_and_pin_map(project):
 def test_replace_miss_points_at_the_line(project):
     belt = _belt(project)
     belt.write_file("src/main.c", "int a;\n#define LED_PIN 13\nint b;\n")
-    err = belt.replace_in_file("src/main.c", "#define LED_PIN 13 \n", "x")["error"]
+    err = belt.replace_in_file("src/main.c", "#define LED_PIN 13\nint c;\n", "x")["error"]
     assert "2: #define LED_PIN 13" in err
+    # only whitespace around the lines differs (a trailing space): matched, not refused
+    assert "indentation ignored" in belt.replace_in_file("src/main.c", "#define LED_PIN 13 \n", "#define LED_PIN 12")["note"]
 
 
 # ------------------------------------------------------------------ build feedback
