@@ -26,6 +26,37 @@ def test_sync_cover_and_resolve(tmp_path):
     assert Requirements(tmp_path).counts() == {"open": 0, "covered": 1, "implemented": 0, "not_applicable": 1}   # kept on disk
 
 
+def test_a_timing_rule_needs_a_record_verify_checks_on_the_code(tmp_path):
+    """The BMP388 fix-up run settled 'the minimum achievable frequency is determined by the maximum measurement time'
+    with a fact whose value was the section heading; nothing in the code used it, and verify passed a driver that
+    enters normal mode before its settings."""
+    from test_outline import _project
+    from embedforge.truth.outline import find_section, sections
+    belt, store, src = _project(tmp_path)
+    p = belt.project
+    sec = find_section(sections(src.text), "2.2")
+    # Measurement time (2.2) as a timing section the code depends on (a driver that reads data or sets the ODR)
+    belt._strict_topic = lambda sid, label: ("timing", [(sec.start, sec.end)]) if label.startswith("2.2") else ("", [])
+    reqs = Requirements(p.root)
+    sentence = "Wait at least 9 ms before the first read."
+    start = src.text.index(sentence, sec.start)
+    reqs.sync(src.id, [(sec.label[:80], sentence, start, start + len(sentence))])
+    rid = next(r.id for r in Requirements(p.root).items.values() if r.section.startswith("2.2"))
+    heading = belt.call("record_fact", {"subject": "DM388", "property": "measurement_time_section", "value": "Measurement time",
+                                        "source_id": src.id,
+                                        "quote": "2.2. Measurement time\nThe conversion takes at most 8.9 ms with x2 oversampling."})
+    assert heading["ok"], heading
+    claim = {"id": rid, "status": "implemented", "reason": "the code waits for the conversion before reading"}
+    refused = belt.call("resolve_requirements", {"items": [dict(claim, ref=heading["fact"]["id"])]})
+    assert not refused["ok"] and "nothing in the code uses it" in refused["rejected"][0]["error"], refused
+    # the same fact cited on a constant of the code is checked by verify, so it backs the claim
+    code = (p.root / "src" / "main.cpp").read_text(encoding="utf-8")
+    assert "Wire.write(0x33);" in code
+    (p.root / "src" / "main.cpp").write_text(code.replace("Wire.write(0x33);", f"Wire.write(0x33);  /* {heading['fact']['id']} */"),
+                                             encoding="utf-8")
+    assert belt.call("resolve_requirements", {"items": [dict(claim, ref=heading["fact"]["id"])]})["ok"]
+
+
 def test_verify_fails_until_every_requirement_is_settled(tmp_path):
     p = Project("t", tmp_path / "t")
     store = SourceStore(p.root)

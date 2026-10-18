@@ -104,7 +104,9 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "status:'not_applicable', reason:'board-level: power ramp is the supply's job'}]. A requirement that one of your "
         "records quotes (record_fact / record_sequence / record_constraint) is covered by itself. A rule about timing, "
         "the mode the code uses or the recommended settings needs ref = the id of a record quoting its section "
-        "(e.g. the CON- of the conversion-time rule), and cannot be not_applicable.",
+        "(e.g. the CON- of the conversion-time rule), and cannot be not_applicable. For timing and the recommended "
+        "settings that record must be one verify checks on the code: a constraint, a sequence, or a fact the code cites "
+        "on the constant it sets.",
         {"items": _arr({"type": "object", "properties": {"id": S, "status": S, "reason": S, "ref": S}, "required": ["id", "status", "reason"]})},
         ["items"]),
     _fn("record_fact",
@@ -1064,10 +1066,17 @@ class ToolBelt:
                 early.append({"id": rid, "error": f"this rule is about {topic.replace('_', ' ')} the code itself sets, so it "
                                                   "applies: record it (record_constraint / record_fact / record_sequence) "
                                                   "and resolve it as implemented with ref = that record's id"})
-            elif topic and not self._backed(r.source_id, ref, spans, truth):
-                early.append({"id": rid, "error": f"a claim about {topic.replace('_', ' ')} needs ref = the id of a record "
-                                                  "(CON-/FACT-/SEQ-) quoting this section, so verify checks it"
-                                                  + (f"; {ref} does not quote it" if ref else "")})
+            elif topic and not self._backed(r.source_id, ref, spans, truth, topic):
+                quoted = bool(ref) and self._backed(r.source_id, ref, spans, truth)
+                early.append({"id": rid, "error": (
+                    f"a claim about {topic.replace('_', ' ')} needs ref = the id of a record quoting this section that verify "
+                    "checks against the code" + (
+                        f"; {ref} quotes it, but nothing in the code uses it, so it checks nothing: "
+                        + ("record_constraint the limit (e.g. when <MODE_REG>.mode == normal: conversion time <= sampling "
+                           "period), which verify evaluates after every register write"
+                           if topic == "timing" else
+                           "cite that fact on the constant the code sets (/* FACT-nnn */), or record_constraint the rule")
+                        if quoted else (f"; {ref} does not quote it" if ref else "")))})
             else:
                 keep.append(dict(it, ref=ref))
         res = reqs.resolve(keep)
@@ -1266,8 +1275,32 @@ class ToolBelt:
             return "", []
         return topic, [(s.start, s.end) for s, _w, t in tops if t == topic]
 
-    def _backed(self, sid: str, ref: str, spans: List[Tuple[int, int]], truth: Dict[str, List[Tuple[int, int, str]]]) -> bool:
-        return bool(ref) and any(r == ref and any(a < e and s < b for s, e in spans) for a, b, r in truth.get(sid, []))
+    def _backed(self, sid: str, ref: str, spans: List[Tuple[int, int]], truth: Dict[str, List[Tuple[int, int, str]]],
+                topic: str = "") -> bool:
+        return (bool(ref) and any(r == ref and any(a < e and s < b for s, e in spans) for a, b, r in truth.get(sid, []))
+                and self._checks_code(ref, topic))
+
+    def _cited_facts(self) -> set:
+        """FACT ids the project's own source files cite (/* FACT-012 */): facts verify traces into the code."""
+        out: set = set()
+        for d in ("src", "include", "lib"):
+            for p in (self.project.root / d).rglob("*"):
+                if p.is_file() and p.suffix.lower() in (".c", ".cc", ".cpp", ".h", ".hpp", ".ino"):
+                    out |= set(re.findall(r"FACT-\d+", p.read_text(encoding="utf-8", errors="ignore").upper()))
+        return out
+
+    def _checks_code(self, ref: str, topic: str) -> bool:
+        """For timing and the recommended settings, the record behind a claim must be one verify evaluates on the code:
+        a constraint (checked after every register write), a sequence (order and delays), or a fact the code cites on
+        the constant it sets. The BMP388 fix-up run settled 'the minimum achievable frequency is determined by the
+        maximum measurement time' with a fact whose value was the heading '3.9.1 Measurement time', and verify passed
+        a driver that enters normal mode before its settings. Rules about modes keep any record: many of them only say
+        what the device does by itself."""
+        if topic not in ("timing", "settings_choice"):
+            return True
+        if ref.startswith(("CON-", "SEQ-")):
+            return True
+        return ref.startswith("FACT-") and ref in self._cited_facts()
 
     def _unbacked_claims(self, sid: str) -> List[Any]:
         """REQUIREMENT_NEEDS_RECORD: a rule about timing, the mode the code uses or the recommended settings settled by
@@ -1282,7 +1315,7 @@ class ToolBelt:
             if r.source_id != sid or r.status not in ("implemented", "not_applicable"):
                 continue
             topic, spans = self._strict_topic(sid, r.section)
-            if topic and not self._backed(sid, r.ref, spans, truth):
+            if topic and not self._backed(sid, r.ref, spans, truth, topic):
                 bad.append((r, topic, spans))
         if not bad:
             return []
@@ -1293,14 +1326,15 @@ class ToolBelt:
                           "from the formula, REGISTER.field names> <= <sampling period from the ODR table>', quotes=[the "
                           "formula line, the table row])",
                 "settings_choice": "record_fact for the row of the recommended-settings table that fits the user's use "
-                                   "case (its oversampling, filter, data rate), quoting that row; then use those values",
+                                   "case (its oversampling, filter, data rate), quoting that row; then use those values "
+                                   "and cite the fact on the constants (/* FACT-nnn */)",
                 "modes": "record_sequence for the order the section gives (e.g. settings while asleep, then the mode), "
                          "or record_fact for a time or value it states"}
         groups: Dict[Tuple[str, Tuple[str, ...]], List[str]] = {}
         for r, topic, spans in bad[:8]:
             # records quoting this topic's sections, the ones nearest the rule's own sentence first
             near = sorted({(max(0, a - r.end, r.start - b), ref) for a, b, ref in truth.get(sid, [])
-                           if any(a < e and s < b for s, e in spans)})
+                           if any(a < e and s < b for s, e in spans) and self._checks_code(ref, topic)})
             have = tuple(dict.fromkeys(ref for _d, ref in near))[:3]
             groups.setdefault((topic, have), []).append(r.id)
         steps = []
