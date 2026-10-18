@@ -306,6 +306,13 @@ def test_sequence_fields_compose_the_value_and_catch_sleep_mode(tmp_path):
                                       "Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.", device=f["addr"])
     assert res["ok"], res
     assert res["sequence"]["steps"][2]["fields"] == {"press_en": 1, "temp_en": 1, "mode": 3}
+    # a field value given as the fact that quotes it (the BMP388 fix-up run wrote press_en = 'FACT-028')
+    normal = ledger.record("BMPX", "mode_normal_code", "0b11", src.id, "mode 00 sleep mode 01/10 forced mode 11 normal mode")
+    assert normal["ok"], normal
+    by_fact = [dict(steps[2], fields={"press_en": 1, "temp_en": 1, "mode": normal["fact"]["id"]})]
+    again = SequenceBook(p.root).record(ledger, "BMPX", "mode_only", "sensor_init", by_fact, src.id,
+                                        "Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.", device=f["addr"])
+    assert again["ok"] and again["sequence"]["steps"][0]["fields"]["mode"] == 3, again
     rep = verify_project(p.root, ledger)
     bad = [x for x in rep.findings if x.code == "FLOW_VALUE_MISMATCH"]
     assert bad and "mode=0 (sleep)" in bad[0].message and "0x33" in bad[0].message, [x.message for x in rep.findings]

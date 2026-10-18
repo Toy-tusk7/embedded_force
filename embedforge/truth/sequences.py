@@ -121,6 +121,10 @@ class SequenceBook:
             if f is None:
                 return f"{reg.name} has no field {fname!r} (fields: {', '.join(x.name for x in reg.fields)})"
             v = fv if isinstance(fv, int) and not isinstance(fv, bool) else None
+            if v is None and re.fullmatch(r"FACT-\d+", str(fv).strip(), re.I):
+                v = _fact_int(ledger, str(fv).strip().upper())   # the field value as a recorded fact quotes it
+                if v is None:
+                    return f"{reg.name}.{f.name} = {fv!r}: that fact is unknown or its value is not a number"
             if v is None:
                 key = str(fv).strip().lower()
                 named = next((vs for n, vs in f.values.items() if n.lower() == key), None)
