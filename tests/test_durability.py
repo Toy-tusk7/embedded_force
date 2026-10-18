@@ -54,6 +54,42 @@ def test_the_conversation_is_saved_after_every_step(tmp_path, monkeypatch):
     assert len(tool_msgs) == 1 and "src/main.c" in tool_msgs[0]["content"]
 
 
+def test_a_run_cut_off_by_a_server_stop_is_marked_interrupted(tmp_path, monkeypatch):
+    from embedforge import server
+    from embedforge.agent.workspace import workspace_root
+    p = Project("cut", workspace_root() / "cut")
+    p.trace({"event": "run_start", "model": "m"})
+    p.trace({"step": 0, "results": [{"name": "read_file", "ok": True}]})
+    p.trace({"step": 1, "results": [{"name": "build", "ok": True}]})
+    done = Project("done", workspace_root() / "done")
+    done.trace({"event": "run_start"})
+    done.trace({"event": "run_end", "status": "success"})
+    started = []
+    monkeypatch.setattr(server, "_start_run", lambda pid, msg: started.append((pid, msg)))
+    assert server.resume_interrupted_runs() == ["cut"] and started == []   # recorded, not resumed: credits are not spent unasked
+    end = json.loads((p.root / "trace.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert end["event"] == "run_end" and end["status"] == "interrupted" and end["steps"] == 2
+    assert server.resume_interrupted_runs() == []   # once
+    p.trace({"event": "run_start"})
+    monkeypatch.setenv("EMBEDFORGE_RESUME_INTERRUPTED", "1")
+    assert server.resume_interrupted_runs() == ["cut"] and started == [("cut", "continue")]
+
+
+def test_runlog_keeps_each_run_to_its_own_events(tmp_path):
+    from embedforge import runlog
+    p = Project("r", tmp_path / "r")
+    p.trace({"event": "run_start", "provider": "nebius", "model": "ultra"})
+    p.trace({"step": 0, "usage": {"prompt_tokens": 1000, "completion_tokens": 50}, "llm_seconds": 4.0, "results": []})
+    p.trace({"event": "run_start", "provider": "nvidia", "model": "super"})   # the first run was cut off
+    p.trace({"step": 0, "usage": {"prompt_tokens": 3000, "completion_tokens": 70}, "llm_seconds": 30.0, "results": []})
+    p.trace({"event": "run_end", "status": "completed", "steps": 1, "build_ok": True, "verify_ok": True})
+    first, second = runlog.runs(tmp_path)
+    assert first["status"] == "interrupted" and not first["verified"] and first["prompt_tokens"] == 1000
+    assert second["verified"] and second["model_seconds"] == 30.0
+    rows = {r["model"]: r for r in runlog.by_model([first, second])}
+    assert rows["ultra"]["verified"] == 0 and rows["super"]["verified"] == 1 and rows["super"]["seconds_per_step"] == 30.0
+
+
 def test_a_damaged_read_log_is_rebuilt_from_the_conversation(tmp_path):
     p = Project("t", tmp_path / "t")
     store = SourceStore(p.root)

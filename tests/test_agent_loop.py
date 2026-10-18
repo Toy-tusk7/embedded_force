@@ -182,6 +182,20 @@ def test_identical_read_only_calls_are_stopped(project, monkeypatch):
     assert any(g["kind"] == "identical_call" for g in _events(session, "guard"))
 
 
+def test_rereading_the_same_sections_without_acting_is_stopped(project, monkeypatch):
+    """The BMP388 fix-up runs re-read section 3.3.3 four times in 28 steps, each time with other sections around it."""
+    from test_outline import DS
+    src = SourceStore(project.root).add("https://www.bosch-sensortec.com/dm388.pdf", "DM388", DS, kind="pdf")
+    rs = lambda i, sec: [_call(i, "read_section", {"source_id": src.id, "section": sec})]   # noqa: E731
+    turns = [rs(0, "2.1.2"), rs(1, "2.1.2, 2.2"), rs(2, "2.2, 2.1.2."), rs(3, "Normal mode"),
+             [_call(4, "write_file", {"path": "src/a.c", "content": "int a;\n"})], rs(5, "2.1.2"), "done"]
+    session = _run(project, turns, monkeypatch)
+    results = _events(session, "tool_result")
+    assert [r["ok"] for r in results] == [True, True, False, True, True, True], [r["summary"][:80] for r in results]
+    assert "settles nothing" in results[2]["summary"]   # 2.2 and 2.1.2 again, nothing recorded in between
+    # a title cannot be compared before the call; after an edit the sections may be read again
+
+
 def test_read_file_is_windowed_for_long_files(project):
     store = SourceStore(project.root)
     belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))

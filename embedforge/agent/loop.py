@@ -118,6 +118,18 @@ class ProgressGuard:
         self.code_nudges = 0
         self.seen_queries: set = set()
         self.reads_since_change: List[tuple] = []   # (key, step, digest of its result)
+        # datasheet sections shown since the last record or edit: 'SRC-002 3.3.3 p1' -> step
+        self.sections_since_progress: Dict[str, int] = {}
+
+    @staticmethod
+    def _section_keys(args: Optional[Dict[str, Any]]) -> List[str]:
+        a = args or {}
+        raw = a.get("section")
+        keys = raw if isinstance(raw, list) else re.split(r"\s*[,;]\s*", str(raw or ""))
+        nums = [re.match(r"\s*(?:section\s*)?(\d+(?:\.\d+)*)", str(k), re.I) for k in keys if str(k).strip()]
+        if not nums or not all(nums):   # a title ('Normal mode') cannot be compared before the call
+            return []
+        return [f"{str(a.get('source_id') or '').upper()} {m.group(1).rstrip('.')} p{a.get('part') or 1}" for m in nums]
 
     def before(self, name: str, n_sources: int, args: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         key = name + json.dumps(args or {}, sort_keys=True)
@@ -129,6 +141,18 @@ class ProgressGuard:
                                   f"its result is in your context above ({recent[-1][2]}). Act on it (record facts, edit, "
                                   "build) or read something else."),
                         "guard": "identical_call"}
+            # the same sections again in another combination: the BMP388 fix-up runs re-read 3.3.3 four times in 28 steps
+            # ('3.3.3', then '3.3.3, 3.3.4, 3.4, ...') and recorded nothing; the text is still in the context
+            keys = self._section_keys(args) if name == "read_section" else []
+            seen = [self.sections_since_progress.get(k) for k in keys]
+            if keys and all(s is not None and self.step - s < ctx.VERBATIM_TURNS for s in seen):
+                listed = ", ".join(k.split(" ")[1] for k in keys)
+                return {"error": (f"Section(s) {listed} were shown to you at step(s) {', '.join(str(s) for s in sorted(set(seen)))} "
+                                  "and nothing has been recorded or edited since; the text is in your context above. Reading "
+                                  "them again settles nothing: record what they state (record_fact / record_constraint / "
+                                  "record_sequence), resolve_requirements with ref = that record, or edit the code. Read a "
+                                  "section you have not read if something is missing."),
+                        "guard": "section_reread"}
         else:
             self.reads_since_change.clear()
         lookup = name in READ_ONLY_TOOLS and name != "resolve_target"  # misses with new arguments are cheap information
@@ -165,6 +189,12 @@ class ProgressGuard:
             return
         if name in READ_ONLY_TOOLS:
             self.reads_since_change.append((name + json.dumps(args or {}, sort_keys=True), self.step, digest[:160]))
+        if name == "read_section" and ok and isinstance(result, dict):
+            sid, part = str(result.get("source_id") or (args or {}).get("source_id") or "").upper(), (args or {}).get("part") or 1
+            for item in result.get("sections") or []:
+                num = str(item.get("section") or "").split(" ")[0].rstrip(".") if isinstance(item, dict) else ""
+                if num:
+                    self.sections_since_progress[f"{sid} {num} p{part}"] = self.step
         failed = not ok or (isinstance(result, dict) and result.get("found") is False)
         if failed:
             self.failures[name] += 1
@@ -181,6 +211,7 @@ class ProgressGuard:
         if name in PROGRESS_TOOLS and ok and not _no_op(result):
             self.research = self.sdk = self.steps_since_progress = 0
             self.fail_name, self.fail_streak = "", 0
+            self.sections_since_progress.clear()
         elif name in RESEARCH_TOOLS:
             self.research += 1
         elif name in SDK_TOOLS and not failed:   # a wrong path taught nothing about the SDK; it is not a lookup spent

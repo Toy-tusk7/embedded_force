@@ -152,6 +152,27 @@ class Project:
         with self._lock, open(self.root / "trace.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps({"t": time.time(), **record}, default=str) + "\n")
 
+    def close_interrupted_run(self) -> bool:
+        """A run whose server stopped mid-way (a run_start with no run_end): record it as interrupted, so the history is
+        whole and 'continue' resumes from the conversation saved after its last step. Call only when no run is active.
+        True when there was one."""
+        p = self.root / "trace.jsonl"
+        if not p.exists():
+            return False
+        open_run, steps = False, 0
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                if '"event": "run_start"' in line:
+                    open_run, steps = True, 0
+                elif '"event": "run_end"' in line:
+                    open_run = False
+                elif open_run and '"results"' in line:
+                    steps += 1
+        if open_run:
+            self.trace({"event": "run_end", "status": "interrupted", "steps": steps,
+                        "next_step": "continue: the server stopped during this run; it resumes from its last saved step"})
+        return open_run
+
     # ------------------------------------------------------------ builds
     def builds(self) -> List[Dict[str, Any]]:
         out = []

@@ -617,7 +617,25 @@ def main():
     if host not in ("127.0.0.1", "localhost", "::1") and not config.server_password:
         # reachable from other machines: without a password anyone could run the agent on your API credits
         raise SystemExit(f"EMBEDFORGE_HOST={host} makes the IDE reachable from other machines; set EMBEDFORGE_PASSWORD first.")
+    resume_interrupted_runs()
     uvicorn.run("embedforge.server:app", host=host, port=int(os.getenv("EMBEDFORGE_PORT", "8000")), reload=False)
+
+
+def resume_interrupted_runs() -> List[str]:
+    """Runs cut off by a server stop are recorded as interrupted; with EMBEDFORGE_RESUME_INTERRUPTED=1 they continue at
+    once from their last saved step (off by default: a restart should not spend model credits unasked)."""
+    from embedforge.agent.workspace import Project, workspace_root
+    from embedforge.core.logger import logger
+    cut = []
+    for d in sorted(workspace_root().iterdir()):
+        if d.is_dir() and (d / "trace.jsonl").exists() and Project(d.name, d).close_interrupted_run():
+            cut.append(d.name)
+    if cut:
+        logger.log_event("RUNS_INTERRUPTED", f"{len(cut)} run(s) stopped with the server: {', '.join(cut)}")
+        if os.getenv("EMBEDFORGE_RESUME_INTERRUPTED", "").strip() == "1" and config.has_llm:
+            for pid in cut:
+                _start_run(pid, "continue")
+    return cut
 
 
 if __name__ == "__main__":
