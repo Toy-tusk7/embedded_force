@@ -82,6 +82,19 @@ def _squash(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+_ORDER_WORDS = re.compile(r"\b(before|after|afterwards|then|first|followed\s+by|prior\s+to|until|once|subsequently|next|"
+                          r"wait(?:s|ing)?|delay(?:ed)?|sequence|start[- ]?up|power[- ]?(?:on|up))\b|"
+                          r"\d+(?:\.\d+)?\s*(?:ms|µs|μs|us|ns)\b|→|->", re.I)
+
+
+def states_order(quote: str) -> bool:
+    """Does a passage state an order or a timing? The BMP388 fix-up run ordered its init sequence (normal mode before
+    the settings) on 'In order to select optimal settings, the following use cases are suggested'."""
+    q = re.sub(r"\bin\s+order\s+to\b", " ", quote or "", flags=re.I)
+    numbered = len(re.findall(r"(?m)^\s*\d+\.\s", quote or "")) >= 2   # a figure transcription's numbered steps
+    return bool(_ORDER_WORDS.search(q)) or numbered
+
+
 class SequenceBook:
     """sequences.json next to ledger.json."""
 
@@ -258,6 +271,11 @@ class SequenceBook:
             where = quote_mismatch(order_quote, src.text) if len(_squash(order_quote)) >= 12 else ""
             problems.append("order_quote must be a verbatim passage (12+ chars) of that source stating the order/timing"
                             + (f". {where}" if where else ""))
+        elif not states_order(order_quote):
+            problems.append(f"order_quote must state the order or a timing (before / after / then / first / wait / a time / "
+                            f"numbered steps): {order_quote.strip()[:90]!r} does not ('in order to' is not an order). Quote "
+                            "the sentence, table row or figure transcription (read_figure; source_id = the figure's) that "
+                            "gives the order, and order the steps as it does")
         if problems:
             return {"ok": False, "error": "; ".join(problems[:8])}
         with self._lock:
@@ -546,6 +564,12 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
         r = check_sequence(seq, trace, ledger, regs)
         results.append(r.public())
         where = fn.file if fn else ""
+        if not states_order(seq.order_quote):   # recorded before this was checked
+            findings.append(("ERROR", "SEQUENCE_UNGROUNDED", where, fn.line if fn else 0,
+                             f"{seq.id} {seq.subject}.{seq.name}: its order quote does not state an order or a timing "
+                             f"({seq.order_quote[:90]!r}), so the order of its steps is the agent's, not the datasheet's.",
+                             "record_sequence again under the same name, quoting the sentence, table or figure "
+                             "transcription (read_figure) that gives the order, and order the steps as it does."))
         if not trace.found:
             findings.append(("ERROR", "FLOW_ENTRY_MISSING", where, 0,
                              f"{seq.id} {seq.subject}.{seq.name}: function {seq.entry}() is not in the sources.",

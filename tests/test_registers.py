@@ -312,6 +312,13 @@ def test_sequence_fields_compose_the_value_and_catch_sleep_mode(tmp_path):
                                       "Power-up: write softreset to CMD, wait 2 ms, then set PWR_CTRL.", device=f["addr"])
     assert res["ok"], res
     assert res["sequence"]["steps"][2]["fields"] == {"press_en": 1, "temp_en": 1, "mode": 3}
+    # the order must come from a passage that states one (the BMP388 run ordered its steps on 'In order to select ...')
+    from embedforge.truth.sequences import states_order
+    assert not states_order("In order to select optimal settings, the following use cases are suggested:")
+    assert states_order("Write the settings, then select normal mode.") and states_order("1. POR\n2. Write settings\n3. Mode = 11")
+    no_order = SequenceBook(p.root).record(ledger, "BMPX", "no_order", "sensor_init", steps, src.id,
+                                           "Bit 5..4 mode 00 sleep mode 01/10 forced mode 11 normal mode", device=f["addr"])
+    assert not no_order["ok"] and "must state the order" in no_order["error"], no_order
     # a field value given as the fact that quotes it (the BMP388 fix-up run wrote press_en = 'FACT-028')
     normal = ledger.record("BMPX", "mode_normal_code", "0b11", src.id, "mode 00 sleep mode 01/10 forced mode 11 normal mode")
     assert normal["ok"], normal
