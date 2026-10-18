@@ -82,6 +82,11 @@ class Obj:
         return self.name
 
 
+def _non_null(v: Any) -> bool:
+    """A pointer the walk knows is not NULL: into a buffer, to a named object, or to a function."""
+    return isinstance(v, (Ptr, Arr, Obj)) or (isinstance(v, Sym) and v.text.startswith("fn:"))
+
+
 def obj_key(v: Any) -> Optional[str]:
     if isinstance(v, Obj):
         return v.name
@@ -1247,10 +1252,14 @@ class Evaluator:
             p = _partial(op, a, b)
             if p is not None:
                 return p
-        # a buffer, object or function is a non-null pointer: true in && / || / !
-        if op in ("&&", "||") and (isinstance(a, (Ptr, Arr, Obj)) or isinstance(b, (Ptr, Arr, Obj))):
-            a = 1 if isinstance(a, (Ptr, Arr, Obj)) else a
-            b = 1 if isinstance(b, (Ptr, Arr, Obj)) else b
+        # a buffer, object or function is a non-null pointer: true in && / || / !, and never == NULL. Bosch's
+        # null_ptr_check (dev->read == NULL with dev->read = i2c_read) otherwise left init's failure path open, and the
+        # calibration it read was lost where the paths met
+        if op in ("&&", "||") and (_non_null(a) or _non_null(b)):
+            a = 1 if _non_null(a) else a
+            b = 1 if _non_null(b) else b
+        if op in ("==", "!=") and ((_non_null(a) and is_int(b) and b == 0) or (_non_null(b) and is_int(a) and a == 0)):
+            return int(op == "!=")
         if not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
             if op == "&&" and (a == 0 or b == 0):
                 return 0
@@ -1276,6 +1285,8 @@ class Evaluator:
             v = self._unary()
             if isinstance(v, (int, float)):
                 return {"-": -v, "+": v, "~": ~int(v), "!": int(not v)}[t.text]
+            if t.text == "!" and _non_null(v):   # !dev->read with dev->read = i2c_read
+                return 0
             return Sym(f"{t.text}{v!r}")
         if t.text in ("++", "--"):   # ++i: the variable changes, the value is the new one
             self._next()
@@ -2135,7 +2146,7 @@ class Walker:
             return False
         first = toks[k].text
         is_type = (first in _TYPE_WORDS or bool(_TYPE_RE.match(first)) or first in self.m.types or first.endswith("_t")
-                   or (k >= 1 and toks[k - 1].text == "struct" and first in self.m.struct_fields))
+                   or first in self.m.struct_fields)   # a struct's name is a type, with or without 'struct' (C++)
         if not is_type:
             return False
         rest = toks[k + 1:]
@@ -2148,8 +2159,12 @@ class Walker:
         k = 0
         while k < len(toks) and (toks[k].kind == "id" and (toks[k].text in _TYPE_WORDS or toks[k].text.endswith("_t") or bool(_TYPE_RE.match(toks[k].text))) or toks[k].text in ("*", "&")):
             k += 1
-        # one more type name (typedef'd struct etc.) when followed by another identifier
-        if k + 1 < len(toks) and toks[k].kind == "id" and toks[k + 1].kind == "id":
+        # one more type name (typedef'd struct etc.) when another identifier follows it, directly or after '*' / '&':
+        # 'struct inner *p = &dev->q' declares p (Bosch's parse_calib_data), not 'inner'
+        j = k + 1
+        while j < len(toks) and toks[j].text in ("*", "&"):
+            j += 1
+        if k + 1 < len(toks) and toks[k].kind == "id" and j < len(toks) and toks[j].kind == "id":
             k += 1
         while k < len(toks) and toks[k].text in ("*", "&"):
             k += 1

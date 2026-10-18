@@ -418,6 +418,61 @@ int init(const struct cfg *cfg) { return cfg->bus_io->write(&cfg->bus, 0x7E, 0xB
     assert [e.describe() for e in FlowModel({"a.c": code}).trace("init").events] == ["write 0x7E <- 0xB6"]
 
 
+VENDOR_STYLE = r'''#include <Arduino.h>
+typedef int8_t (*read_fptr_t)(uint8_t reg, uint8_t *data, uint32_t len, void *intf_ptr);
+struct quant { double par_t1; double t_lin; };
+struct calib { struct quant quantized; };
+struct dev_t { read_fptr_t read; void *intf_ptr; struct calib calib_data; };
+static uint8_t addr = 0x76;
+static struct dev_t dev;
+static int8_t rd(uint8_t reg, uint8_t *data, uint32_t len, void *intf_ptr) { return 0; }
+static int8_t null_ptr_check(const struct dev_t *d)
+{
+    if ((d == NULL) || (d->read == NULL) || (d->intf_ptr == NULL) || !d->read) {
+        return -1;
+    }
+    return 0;
+}
+static void parse_calib(struct dev_t *d)
+{
+    struct quant *q = &d->calib_data.quantized;
+    q->par_t1 = 256.0;
+}
+static double compensate(struct calib *c) { return c->quantized.par_t1 * 2; }
+void setup()
+{
+    dev.read = rd;
+    dev.intf_ptr = &addr;
+    if (null_ptr_check(&dev) != 0) {
+        return;
+    }
+    parse_calib(&dev);
+}
+void loop()
+{
+    double t = compensate(&dev.calib_data);
+    Serial.println(t);
+}
+'''
+
+
+def test_vendor_style_drivers_keep_their_values(tmp_path):
+    """Bosch's BMP3 API: a pointer declared to a nested member (struct quant *q = &d->calib_data.quantized) writes into
+    that member, and a callback or an object's address is never NULL, so init's failure path is not taken and the
+    calibration survives into loop()."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.cpp").write_text(VENDOR_STYLE, encoding="utf-8")
+    pw = FlowModel.from_dir(tmp_path).run(["setup", "loop"], probe={0: 0})
+    vals = {(v[2], v[0]) for v in pw.values}
+    assert ("dev.calib_data.quantized.par_t1", 256.0) in vals and ("printed by println()", 512.0) in vals, sorted(vals, key=str)
+    assert not any(v[0] == -1 for v in pw.values)   # the null check is decided: no failure path
+    # C++: a struct's name is a type without 'struct'
+    cpp = VENDOR_STYLE.replace("struct quant *q =", "quant *q =")
+    (tmp_path / "src" / "main.cpp").write_text(cpp, encoding="utf-8")
+    pw = FlowModel.from_dir(tmp_path).run(["setup", "loop"], probe={0: 0})
+    assert ("printed by println()", 512.0) in {(v[2], v[0]) for v in pw.values}
+
+
 def test_values_changed_on_an_uncertain_path_become_unknown_not_wrong():
     code = """void init(int intf) { uint8_t reg = 0x7E; if (intf == 0) { reg = reg | 0x80; }
   uint8_t b[2] = {reg, 0xB6}; i2c_write_blocking(i2c0, 0x76, b, 2, false); }"""
