@@ -91,6 +91,19 @@ def test_a_sentence_value_and_double_escaped_quotes(tmp_path):
     assert r["ok"], r
 
 
+def test_binary_values_match_register_table_rows(tmp_path):
+    """BMP388 Table 44 writes the iir_filter codes as 010 / 011; a model records them as 0b10 / 0b11."""
+    store = SourceStore(tmp_path)
+    src = store.add("https://www.bosch-sensortec.com/bmp388.pdf", "BMP388",
+                    "Bit 3..1 iir_filter Filter coefficient for IIR filter\n000 coef_0 bypass-mode\n001 coef_1\n010 coef_3\n011 coef_7\n", kind="pdf")
+    ledger = FactLedger(tmp_path, store)
+    r = ledger.record("BMP388", "iir_coef_3", "0b10", src.id, "001 coef_1\n010 coef_3")
+    assert r["ok"] and r["fact"]["confidence"] == "STRICT", r
+    assert ledger.record("BMP388", "iir_bypass", "0b0", src.id, "000 coef_0 bypass-mode")["ok"]
+    assert not ledger.record("BMP388", "iir_coef_x", "0b100", src.id, "001 coef_1\n010 coef_3\n011 coef_7")["ok"]
+    assert not ledger.record("BMP388", "iir_x", "0b11", src.id, "000 coef_0 bypass-mode\n001 coef_1\n010 coef_3")["ok"]   # not 'coef_3'
+
+
 def test_pdf_math_letters_are_the_letters(tmp_path):
     """The BMP388's conversion-time equation as its PDF gives it: Unicode mathematical italic letters, garbled."""
     from embedforge.truth.ledger import MATH_FOLD, anchor_pieces

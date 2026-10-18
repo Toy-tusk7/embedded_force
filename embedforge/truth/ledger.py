@@ -288,6 +288,12 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
         if n > 0:
             b = format(n, "b")
             out.append(("binary", rf"(?<![0-9a-z])(?:0b|b)?{b}b?(?![0-9a-z])", "LOOSE"))
+    elif n is not None and v.lower().startswith("0b"):
+        # a field value from a register table: '0b11' is written 011 / 0b011 / 11b there (the BMP388's CONFIG iir_filter)
+        b = format(n, "b")
+        out.append(("binary-prefixed", rf"(?<![0-9a-z])0b0*{b}(?![0-9a-z])", "STRICT"))
+        out.append(("binary-padded", rf"(?<![0-9a-z.])0+{b}b?(?![0-9a-z.])" if n else r"(?<![0-9a-z.])0{2,}b?(?![0-9a-z.])", "STRICT"))
+        out.append(("binary-bare", rf"(?<![0-9a-z._]){b}b?(?![0-9a-z._])", "LOOSE"))
     elif n is not None:
         out.append(("number", rf"(?<![0-9a-z.]){n}(?![0-9]|\.\d)", "STRICT"))
     else:
