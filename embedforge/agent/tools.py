@@ -16,6 +16,21 @@ from embedforge.truth.ledger import MATH_FOLD
 from embedforge.truth.verifier import build_inputs_hash, collect_sources
 
 
+_FINGERPRINT: List[str] = []
+
+
+def verifier_fingerprint() -> str:
+    """The verify rules themselves (the truth package and this file): a PASS under older rules is not a PASS under
+    these. A BMP388 run 'finished' in two steps on the PASS its previous run got from a loophole closed since."""
+    if not _FINGERPRINT:
+        root = Path(__file__).resolve().parents[1]
+        h = hashlib.sha256()
+        for p in sorted((root / "truth").glob("*.py")) + [Path(__file__).resolve()]:
+            h.update(p.read_bytes())
+        _FINGERPRINT.append(h.hexdigest()[:16])
+    return _FINGERPRINT[0]
+
+
 def _fn(name: str, desc: str, props: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
     return {"type": "function", "function": {
         "name": name, "description": desc,
@@ -507,6 +522,7 @@ class ToolBelt:
         # a stored PDF or a figure read changes what FIGURE_UNREAD says
         for p in sorted(self.store.dir.glob("*.pdf")) + sorted((self.store.dir / "figures").glob("*.md")):
             h.update(p.name.encode())
+        h.update(verifier_fingerprint().encode())
         return h.hexdigest()
 
     # ------------------------------------------------------------ target
@@ -2198,7 +2214,8 @@ class ToolBelt:
             if not (self.state["verify_ok"] and self.state["verify_hash"] == h):
                 problems.append("current sources have no passing verify (call verify)")
             elif self.state.get("verify_inputs") != self.verify_inputs_hash():
-                problems.append("facts, sequences or the schematic changed after the last verify (call verify again)")
+                problems.append("facts, sequences, the schematic or the verify rules changed after the last verify (call "
+                                "verify again)")
             if problems:
                 return {"error": "Cannot finish with success: " + "; ".join(problems) + "."}
         false = self._unsupported_claims(summary or "", h)

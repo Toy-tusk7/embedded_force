@@ -75,6 +75,21 @@ def test_a_run_cut_off_by_a_server_stop_is_marked_interrupted(tmp_path, monkeypa
     assert server.resume_interrupted_runs() == ["cut"] and started == [("cut", "continue")]
 
 
+def test_a_pass_under_older_verify_rules_does_not_finish_a_run(tmp_path, monkeypatch):
+    """A carried-over PASS (project.json last_verify) counts only for the same sources, records and verify rules."""
+    from embedforge.agent import tools
+    p = Project("t", tmp_path / "t")
+    store = SourceStore(p.root)
+    belt = ToolBelt(p, RunSession("r", p.id), store, FactLedger(p.root, store))
+    p.update_meta(last_build={"hash": belt.source_hash(), "ok": True},
+                  last_verify={"hash": belt.source_hash(), "passed": True, "inputs": belt.verify_inputs_hash()})
+    again = ToolBelt(p, RunSession("r2", p.id), store, FactLedger(p.root, store))
+    assert again.finish("success", "built and verified")["ok"]
+    monkeypatch.setattr(tools, "_FINGERPRINT", ["rules-changed"])
+    later = ToolBelt(p, RunSession("r3", p.id), store, FactLedger(p.root, store))
+    assert "verify rules changed" in later.finish("success", "built and verified")["error"]
+
+
 def test_runlog_keeps_each_run_to_its_own_events(tmp_path):
     from embedforge import runlog
     p = Project("r", tmp_path / "r")
