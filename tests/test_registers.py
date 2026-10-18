@@ -254,6 +254,12 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     q = ["In normal mode the pressure oversampling osr_p must not exceed 3 (x8)."]
     assert book.record_constraint(store, "BMPX", src2.id, "osr_in_normal", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 3")["ok"]
     assert "constant 7" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == 7")["error"]
+    # a rule may name a field without the footnote digit its table prints (BMP388: osr_t printed 'osr4_t')
+    osr = book.register_at(0x1C)
+    printed = osr.field("osr_t")
+    printed.name = "osr4_t"
+    assert osr.field("osr_t") is printed and osr.field("osr2_t") is None and osr.field("osr4_t") is printed
+    printed.name = "osr_t"
     # 3000 for a quoted 3 in another unit (5000 us for '5 ms'), as 3 * 1000 already is; 3001 is not stated
     assert book.record_constraint(store, "BMPX", src2.id, "scaled", "OSR.osr_p * 1000 <= 3000", q)["ok"]
     assert "constant 3001" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p * 1000 <= 3001", q)["error"]

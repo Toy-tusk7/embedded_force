@@ -330,7 +330,15 @@ class RegisterDef:
 
     def field(self, name: str) -> Optional[FieldDef]:
         key = _alnum(name)
-        return next((f for f in self.fields if _alnum(f.name) == key), None)
+        hit = next((f for f in self.fields if _alnum(f.name) == key), None)
+        if hit is None and key and not re.search(r"\d", key):
+            # the BMP388's OSR table prints osr_t as 'osr4_t' (a footnote mark in the name): a name without digits finds
+            # the one field that is it with a single digit added; 'int2_lvl' never matches 'int1_lvl'
+            def one_digit_more(n: str) -> bool:
+                return len(n) == len(key) + 1 and any(n[i].isdigit() and n[:i] + n[i + 1:] == key for i in range(len(n)))
+            near = [f for f in self.fields if one_digit_more(_alnum(f.name))]
+            hit = near[0] if len(near) == 1 else None
+        return hit
 
     def decode(self, v: int) -> str:
         parts = []
@@ -1172,7 +1180,13 @@ class RegisterBook:
                     return (f"field {fname}: the datasheet gives it bit {stated[1]}" if stated[0] == stated[1] else
                             f"field {fname}: the datasheet gives it bits {stated[0]}..{stated[1]}, not the whole register")
             if not whole and not any(_name_spans(q, fname) for q in quotes):
-                return f"field {fname}: its name is not in the quote(s)"
+                key = _alnum(fname)
+                printed = sorted({w for q in quotes for w in re.findall(r"[A-Za-z][\w]*", q)
+                                  if len(_alnum(w)) == len(key) + 1 and any(_alnum(w)[i].isdigit() and _alnum(w)[:i] + _alnum(w)[i + 1:] == key
+                                                                            for i in range(len(_alnum(w))))})
+                return (f"field {fname}: its name is not in the quote(s)" +
+                        (f"; the table prints it as {printed[0]} (a footnote mark in the name): record it as {printed[0]} — "
+                         f"rules may still write {name}.{fname}, it finds {printed[0]}" if printed else ""))
             if not whole and not any(_bits_in_quote(q, hi, lo, fname) for q in quotes):
                 return (f"field {fname}: bit {lo} is not stated in the quote(s)" if hi == lo else
                         f"field {fname}: bits {hi}..{lo} are not stated in the quote(s)")
