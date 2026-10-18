@@ -105,11 +105,31 @@ reported as success) and the delivery report gives the score and lists each faul
 BMP388 driver Nemotron 3 Ultra wrote for an RP2350B board: 47 of 49 caught (96%); the two survivors are listed
 (`python -m embedforge.truth.mutate <project dir>`).
 
+**On a vendor's own driver.** The benchmark is ours; a correct driver someone else wrote is a harder test. We ran
+verify on Bosch's official BMP3 driver (`bmp3.c` from [BMP3_SensorAPI](https://github.com/boschsensortec/BMP3_SensorAPI),
+with a small Arduino glue file in the style of Bosch's examples) against the datasheet truth Nemotron recorded for
+the BMP388:
+
+- The tracer follows Bosch's function-pointer interface (`dev->read`, `dev->write`) and its calibration parsing,
+  and Bosch's temperature compensation matches the datasheet formula on probe input.
+- It flags a real defect in Bosch's code: `bmp3_soft_reset()` tests the error register with `BMP3_REG_CMD`
+  (`0x7E`, the command register's *address*) as the bit mask, where the `cmd_err` bit (bit 1) was meant; the mask
+  also catches `conf_err` and four reserved bits (`REG_MASK_UNDEFINED`).
+- 72 findings are traceability, by design: Bosch's constants carry no quote, so verify reports them as untagged or
+  unsourced. That is the rule for code EmbedForge delivers, not a claim that the values are wrong.
+- One false positive remains: the probe's random calibration bytes put the temperature at 165 °C; Bosch clamps it
+  to 85 °C (correctly) before compensating pressure, so the pressure formula is not matched on that input.
+- The check also found three tracer bugs, now fixed (a pointer declared to a nested struct member, a callback
+  compared with `NULL`, struct members value-initialised in a constructor).
+
+This is one vendor driver, not a false-positive rate; more are needed before quoting one.
+
 ## NVIDIA Nemotron on Nebius Token Factory
 
 - **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
   runs the larger Nemotron models (Super, Ultra, 3.5 Lightning) reached verified Betaflight board configs, while
-  Nano (3B active) looped in research. The model picker lists every chat model the provider offers, Nemotron first.
+  Nano (3B active) mostly looped in research (1 of its 8 runs ended verified; see the table below). The model picker
+  lists every chat model the provider offers, Nemotron first.
 - **Sampling and chat template** follow the Nemotron 3 model card: temperature 1.0, top_p 0.95, and
   `chat_template_kwargs = {enable_thinking: true, force_nonempty_content: true}`, NVIDIA's setting for coding agents
   and tool calling (`EMBEDFORGE_NEMOTRON_EFFORT=medium` adds `medium_effort` for shorter reasoning; a provider that
@@ -124,16 +144,25 @@ BMP388 driver Nemotron 3 Ultra wrote for an RP2350B board: 47 of 49 caught (96%)
 
 ### Where our runs ran
 
-Every run records its provider, model and harness version in the project's `trace.jsonl`, so this table is
-generated, not written (`python -m embedforge.runlog`; `--runs` lists each run):
+Every run records its provider, model, harness version, and each step's tokens and model time in the project's
+`trace.jsonl`, so this table is generated, not written (`python -m embedforge.runlog --markdown`; `--runs` lists each
+run). Snapshot of 18 October 2026:
 
-| Provider | Model | Runs | Dates |
-|---|---|---|---|
-| Nebius Token Factory | `nvidia/Nemotron-3-Ultra-550b-a55b` | 47 | 8 Oct 2026 |
-| Nebius Token Factory | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | 8 | 8–9 Oct 2026 |
-| Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | 8 | 8 Oct 2026 |
-| Nebius Token Factory | `nvidia/Nemotron-3_5-Lightning` | 6 | 8 Oct 2026 |
-| NVIDIA API (NIM) | `nvidia/nemotron-3-ultra-550b-a55b` | 9 | 16–17 Oct 2026 |
+| Provider | Model | Runs | Ended built + verified | Steps (median per run) | Prompt + completion tokens | Model time per step |
+|---|---|---|---|---|---|---|
+| Nebius Token Factory | `nvidia/Nemotron-3-Ultra-550b-a55b` | 47 | 3 | 1611 (36) | 59.7M + 735k | 5 s |
+| Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | 8 | 1 | 412 (60) | 8.8M + 294k | 6 s |
+| Nebius Token Factory | `nvidia/Nemotron-3_5-Lightning` | 6 | 2 | 313 (58) | 8.5M + 124k | 4 s |
+| Nebius Token Factory | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | 8 | 1 | 150 (7.5) | 1.8M + 230k | 12 s |
+| NVIDIA API | `nvidia/nemotron-3-ultra-550b-a55b` | 9 | 4 | 197 (15) | 7.9M + 83k | 19 s |
+| NVIDIA API | `nvidia/nemotron-3-super-120b-a12b` | 10 | 1 | 507 (56) | 28.5M + 610k | 35 s |
+
+Read it with care: the runs are not a controlled comparison. Most of the 47 Token Factory Ultra runs were
+development runs on one day while the harness changed between them, the tasks differ (Betaflight board configs,
+sensor drivers), and "ended built + verified" counts a run's own end state, not task difficulty. Two things hold
+across them: the agent prompt is about 20–55k tokens per step, so context size drives cost; and Token Factory served
+Nemotron 3 Ultra at about 5 s of model time per agent step, against about 19 s on NVIDIA's API with prompts of the
+same size.
 
 EmbedForge was built and evaluated on Nebius Token Factory: 69 runs over four Nemotron models, including verified
 drivers and board configs from Ultra, Super and 3.5 Lightning. Our Token Factory credits ran out on 9 October, so
@@ -220,6 +249,10 @@ connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`).
 - **Budgets that follow progress.** 6 searches or 10 SDK lookups without a new fact or code change block further
   searching with a concrete next step; a run gets 60 steps, extended by 30 (up to 3 times) while it is still making
   progress, and pauses after 28 steps without progress.
+- **Runs survive a stopped server.** Records are written to a temporary file and swapped in, so a crash leaves the old
+  file or the new one, never half; a file that does not parse is kept aside (`.corrupt`), not overwritten. The
+  conversation is saved after every step; a run cut off by a stop is marked interrupted at the next start and
+  `continue` resumes it (`EMBEDFORGE_RESUME_INTERRUPTED=1` resumes it automatically).
 - **Build sandbox.** The agent cannot write `extra_scripts`, `platform_packages`, `!command` flags, URL `lib_deps`,
   `*.py` or `library.json` — the ways a PlatformIO build can run code on your machine.
 
@@ -235,13 +268,30 @@ connectivity line (e.g. `U1 pin 29 (PA8) -> net HIN_A -> U2.3 (HIN1)`).
 | `embedforge/server.py`, `embedforge/web/` | FastAPI server and the browser IDE |
 | `tests/` | `pytest` (offline: models and Tavily are faked) |
 
-## Limits
+## Limits: what verify checks, and what it does not
 
-Verify replaces neither a first power-on test nor a logic analyser. It cannot see electrical faults (wiring,
-pull-ups, power, noise, a dead chip), bus-level timing (clock stretching, signal integrity), or chip behaviour the
-datasheet does not describe (errata). It is only as good as the recorded facts — which is why every fact must be
-quoted verbatim, and why a missing fact makes verify fail instead of guess. The static tracer follows the SDK calls
-listed above; other bus calls are reported, not trusted.
+Verify is a static comparison of the code's bus traffic and arithmetic with the recorded datasheet truth. A PASS
+means no difference was found for the kinds of bug in the table above; it is not a formal proof that the firmware
+is correct. Specifically:
+
+- **Not on the board.** It replaces neither a first power-on test nor a logic analyser. It cannot see electrical
+  faults (wiring, pull-ups, power, noise, a dead chip), bus-level timing (clock stretching, signal integrity), runtime
+  behaviour such as interrupts and concurrency, or chip behaviour the datasheet does not describe (errata).
+- **Only as good as the records.** Every fact must be quoted verbatim, and a missing fact makes verify fail instead of
+  guess. But a choice the datasheet leaves open (which IIR coefficient Table 10's "2" means, which use-case row fits
+  the user) is settled by a record the agent cites, not proven.
+- **Formulas on synthetic input.** Conversion formulas are checked by running the code on generated register bytes.
+  A driver that clamps an intermediate value to the sensor's physical range can be reported as a mismatch when
+  those bytes are out of range (seen on Bosch's pressure compensation).
+- **Rules found by wording.** Requirements are the rule sentences of the sections the code depends on, found by
+  wording (must, before, wait, at least, ...); a rule phrased otherwise can be missed. Figure transcriptions come
+  from a vision model and are not authoritative.
+- **Claims are reviewed, not proven.** "Implemented" / "not applicable" claims are checked by a second model call,
+  which can be wrong; for timing, the mode in use and the recommended settings a checkable record is required instead.
+- **MISRA is partial.** cppcheck's MISRA addon checks a subset of MISRA C:2012, and neither tool is qualified for
+  certification. MISRA findings are warnings (advisory for C++ code).
+- **Code it cannot follow fails.** The static tracer follows the SDK calls listed above; other bus calls are
+  reported, not trusted.
 
 ## Related work
 
