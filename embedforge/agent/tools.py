@@ -16,6 +16,34 @@ from embedforge.truth.ledger import MATH_FOLD
 from embedforge.truth.verifier import build_inputs_hash, collect_sources
 
 
+def _replace_ignoring_indent(text: str, old: str, new: str) -> Optional[str]:
+    """`text` with `old` replaced by `new`, matching `old` line by line with each line's leading and trailing whitespace
+    ignored, when that finds exactly one place; `new` is shifted by the indentation difference found. In a BMP388
+    fix-up run Nemotron copied lines from read_file's numbered output ('29:     // Quantize ...') with the separator's
+    space as one more indent, and five edits in a row failed on an exact match."""
+    t_lines = text.split("\n")
+    o_lines = old.strip("\n").split("\n")
+    key = [ln.strip() for ln in o_lines]
+    if not any(key):
+        return None
+    hits = [i for i in range(len(t_lines) - len(key) + 1) if all(t_lines[i + k].strip() == key[k] for k in range(len(key)))]
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    first = next(k for k, v in enumerate(key) if v)
+
+    def indent(s: str) -> int:
+        return len(s) - len(s.lstrip(" "))
+    delta = indent(t_lines[i + first]) - indent(o_lines[first])
+
+    def shift(s: str) -> str:
+        if not s.strip():
+            return s
+        return " " * delta + s if delta >= 0 else s[min(-delta, indent(s)):]
+    body = new.strip("\n")
+    return "\n".join(t_lines[:i] + ([shift(s) for s in body.split("\n")] if body else []) + t_lines[i + len(key):])
+
+
 _FINGERPRINT: List[str] = []
 
 
@@ -1944,6 +1972,15 @@ class ToolBelt:
             return {"error": "'old' and 'new' are identical, so nothing would change. Write the corrected text in 'new'."}
         text = self.project.read_file(path)
         n = text.count(old)
+        loose = _replace_ignoring_indent(text, old, new) if n == 0 else None
+        if loose is not None:
+            problem = check_agent_write(path, loose)
+            if problem:
+                return {"error": problem}
+            res = self.project.write_file(path, loose)
+            self.session.emit("file", path=res["path"], content=loose)
+            return {**res, "note": "matched with the indentation ignored (read_file's 'N: ' prefix is not part of the line); "
+                                   "'new' was indented like the lines it replaced", **self._config_feedback(path, loose)}
         if n != 1:
             hint = ""
             if n == 0:  # show where the text probably is, so the model can retry without re-reading the whole file

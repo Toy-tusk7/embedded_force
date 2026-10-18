@@ -196,6 +196,21 @@ def test_rereading_the_same_sections_without_acting_is_stopped(project, monkeypa
     # a title cannot be compared before the call; after an edit the sections may be read again
 
 
+def test_replace_matches_lines_copied_with_one_space_too_many(project):
+    """read_file prints '29:     // x'; a model copying from it takes the separator's space as indentation."""
+    store = SourceStore(project.root)
+    belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
+    code = "void f() {\n    // configure\n    write(1);\n    write(2);\n}\n"
+    belt.call("write_file", {"path": "src/a.c", "content": code})
+    r = belt.call("replace_in_file", {"path": "src/a.c", "old": "     // configure\n     write(1);",
+                                      "new": "     // configure\n     write(2);\n     write(1);"})
+    assert "indentation ignored" in r.get("note", ""), r
+    assert project.read_file("src/a.c") == "void f() {\n    // configure\n    write(2);\n    write(1);\n    write(2);\n}\n"
+    # two places that look alike when indentation is ignored: no guessing
+    belt.call("write_file", {"path": "src/b.c", "content": "  x = 1;\n    x = 1;\n"})
+    assert "found 0 occurrences" in belt.call("replace_in_file", {"path": "src/b.c", "old": "      x = 1;", "new": "x = 2;"})["error"]
+
+
 def test_read_file_is_windowed_for_long_files(project):
     store = SourceStore(project.root)
     belt = ToolBelt(project, RunSession("r", project.id), store, FactLedger(project.root, store))
