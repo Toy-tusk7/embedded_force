@@ -30,7 +30,8 @@ def runs(projects_dir: Path) -> List[Dict[str, Any]]:
         starts = [i for i, e in enumerate(events) if e.get("event") == "run_start"] + [len(events)]
         for i, nxt in zip(starts, starts[1:]):
             e, body = events[i], events[i + 1:nxt]   # a run's events end where the next run starts
-            end = next((x for x in body if x.get("event") == "run_end"), {})
+            # the last end: a second server started on a busy port once wrote a false 'interrupted' end mid-run
+            end = next((x for x in reversed(body) if x.get("event") == "run_end"), {})
             steps = [x for x in body if "step" in x and "usage" in x]
             usage = [x.get("usage") or {} for x in steps]
             out.append({"t": e.get("t", 0), "project": tr.parent.name, "provider": e.get("provider") or "?",

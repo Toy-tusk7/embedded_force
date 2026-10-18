@@ -617,8 +617,23 @@ def main():
     if host not in ("127.0.0.1", "localhost", "::1") and not config.server_password:
         # reachable from other machines: without a password anyone could run the agent on your API credits
         raise SystemExit(f"EMBEDFORGE_HOST={host} makes the IDE reachable from other machines; set EMBEDFORGE_PASSWORD first.")
+    port = int(os.getenv("EMBEDFORGE_PORT", "8000"))
+    if not port_free(host, port):
+        # another server owns the port and may be running agents: marking its runs interrupted would be false
+        raise SystemExit(f"Port {port} is already in use: an EmbedForge server is probably running already "
+                         f"(open http://{host}:{port}). This one did not start and left every run as it is.")
     resume_interrupted_runs()
-    uvicorn.run("embedforge.server:app", host=host, port=int(os.getenv("EMBEDFORGE_PORT", "8000")), reload=False)
+    uvicorn.run("embedforge.server:app", host=host, port=port, reload=False)
+
+
+def port_free(host: str, port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+            return True
+        except OSError:
+            return False
 
 
 def resume_interrupted_runs() -> List[str]:

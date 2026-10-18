@@ -105,6 +105,22 @@ def test_runlog_keeps_each_run_to_its_own_events(tmp_path):
     assert rows["ultra"]["verified"] == 0 and rows["super"]["verified"] == 1 and rows["super"]["seconds_per_step"] == 30.0
 
 
+def test_a_second_server_on_a_busy_port_touches_no_run(monkeypatch):
+    """A second `python -m embedforge.server` while one is running marked the live run interrupted, then failed to bind."""
+    import socket
+    import pytest
+    from embedforge import server
+    called = []
+    monkeypatch.setattr(server, "resume_interrupted_runs", lambda: called.append(1))
+    with socket.socket() as busy:
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        monkeypatch.setenv("EMBEDFORGE_PORT", str(busy.getsockname()[1]))
+        with pytest.raises(SystemExit, match="already in use"):
+            server.main()
+    assert called == []
+
+
 def test_a_damaged_read_log_is_rebuilt_from_the_conversation(tmp_path):
     p = Project("t", tmp_path / "t")
     store = SourceStore(p.root)
