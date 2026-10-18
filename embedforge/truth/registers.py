@@ -976,6 +976,10 @@ class RegisterBook:
                 unit_factor = exp is None and value > 0 and abs(math.log10(value) - round(math.log10(value))) < 1e-9
                 if exp is None and value in recorded and label == "when":
                     continue
+                # 5000 (us) for a quoted '5 ms': a quoted number in another unit, as 5 * 1000 already is
+                if exp is None and value and any(_const_in_quote(q, value / 10.0 ** k, None) for k in (3, 6, 9, -3, -6, -9)
+                                                 for q in quotes):
+                    continue
                 if not any(_const_in_quote(q, value, exp) for q in quotes) and not (value in (0, 1) and exp is None) \
                         and not unit_factor:   # 1000, 1e-6: a unit conversion (5 ms = 5 * 1000 us), not a datasheet claim
                     return {"ok": False, "error": f"{label}: the constant {t} is not in the quotes. Every number must come from the "

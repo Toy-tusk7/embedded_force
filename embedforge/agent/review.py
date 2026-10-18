@@ -17,6 +17,10 @@ REVIEW_SYSTEM = (
     "interrupt the code never enables, the FIFO, a board-level or electrical matter). A rule that limits values or "
     "timing the code does set (a conversion time against the sampling period, a recommended setting for the use "
     "case, waiting for data to be ready before reading) applies.\n"
+    "- A requirement that only says what the device does by itself (it delays a command until a measurement ends, "
+    "ignores a command, clears a flag after a read) asks nothing of the code but not to work against it: 'implemented' "
+    "is right when the code does nothing that relies on the opposite (e.g. it does not send a second mode change and "
+    "expect the first to take effect at once). Do not ask the code to show or re-implement the device's behaviour.\n"
     "Answer with JSON only: a list of {\"id\": \"REQ-nnn\", \"verdict\": \"agree\" | \"disagree\", "
     "\"where\": \"file:line or ''\", \"why\": \"one sentence\"}. Disagree only for a concrete reason you can point to.")
 
