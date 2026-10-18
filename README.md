@@ -135,6 +135,13 @@ This is one vendor driver, not a false-positive rate; more are needed before quo
   and tool calling (`EMBEDFORGE_NEMOTRON_EFFORT=medium` adds `medium_effort` for shorter reasoning; a provider that
   rejects the options is used without them). Replies get up to 16k output tokens; reasoning arrives in
   `reasoning_content` (or inline `<think>`) and is shown live in the IDE.
+- **Datasheet search** (`search_datasheet`): a long datasheet is split along its sections, embedded once with
+  NVIDIA's Nemotron Embed (`nvidia/nemotron-3-embed-1b`) and cached with the project; a question returns the passages
+  that answer it. On the BMP388 datasheet, "conversion time for x8 pressure oversampling" ranks 3.9.1 Measurement
+  time first and "settings recommended for a drone" 3.5 Filter selection (Table 10); indexing took 8 s, each search
+  under 1 s.
+- **Figures** (`read_figure`): timing diagrams and mode transitions are drawn, so text extraction loses them; the
+  figure is cut from its PDF page and transcribed by Nemotron 3.5 Super VL (`nvidia/nemotron-3.5-super-vl-120b-a12b`).
 - **Tool calling** uses the OpenAI `tools` schema. Calls the model writes as text (Qwen-coder XML, Hermes JSON or
   bare JSON) are recovered and run; replies cut off at the token limit are retried instead of shown.
 - **Your own GPUs:** [`deploy/nebius-vm/`](deploy/nebius-vm/README.md) serves Nemotron 3 Super with vLLM on a Nebius

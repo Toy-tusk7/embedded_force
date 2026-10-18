@@ -90,6 +90,8 @@ hardware problem you debug it and ship a patched build.
      hold the only statement of an order rule: `read_figure(source_id, 'Figure n')` has a vision model transcribe it from
      the stored PDF (once per figure; verify warns FIGURE_UNREAD for unread figures in the sections on modes, timing and
      settings). Record the rule it shows with the datasheet text that says the same, where there is one.
+   - On a long datasheet, `search_datasheet(source_id, question)` finds the passages that answer a question (NVIDIA
+     Nemotron embeddings); then read_section the sections they come from.
    - You have a research budget: after ~6 searches without recording a fact or writing code, searching is blocked.
      If a value is genuinely not in the sources, `ask_user` for it instead of searching again.
 5. REGISTERS (every device with registers), before its driver: `record_registers` for each register the driver

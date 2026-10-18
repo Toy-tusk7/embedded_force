@@ -77,6 +77,11 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
         "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
         {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
+    _fn("search_datasheet",
+        "Find the passages of a long datasheet that answer a question (NVIDIA Nemotron embeddings over the stored "
+        "source): question='conversion time for x8 pressure oversampling'. Returns up to k passages with their section "
+        "and offset; then read_section the sections you need. It does not replace reading the sections verify requires.",
+        {"source_id": S, "question": S, "k": {"type": "integer"}}, ["source_id", "question"]),
     _fn("read_figure",
         "Read a datasheet FIGURE or TABLE drawn as an image (timing diagrams, mode transitions, state machines): "
         "figure='Figure 3' or a caption word. A vision model transcribes it from the stored PDF (order of steps, "
@@ -378,6 +383,8 @@ class ToolBelt:
         self.reviewer: Optional[Callable[[List[Dict[str, Any]]], str]] = None
         # (prompt, png) -> text: reads datasheet figures; None = the configured vision model (agent/vision.py)
         self.vision: Optional[Callable[[str, bytes], str]] = None
+        # (texts, 'passage' | 'query') -> vectors for search_datasheet; None = the configured embedding model
+        self.embedder: Optional[Callable[..., List[List[float]]]] = None
         if not self.reads.path.exists() and (project.root / "conversation.json").exists():
             # a project from before read tracking, or a damaged log (kept aside as reads.json.corrupt)
             self.reads.seed(project.load_conversation())
@@ -394,7 +401,7 @@ class ToolBelt:
             "fetch_document": self.fetch_document, "find_reference_code": self.find_reference_code,
             "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
             "coding_brief": self.coding_brief, "resolve_requirements": self.resolve_requirements,
-            "load_skill": self.load_skill, "read_figure": self.read_figure,
+            "load_skill": self.load_skill, "read_figure": self.read_figure, "search_datasheet": self.search_datasheet,
             "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
@@ -459,7 +466,7 @@ class ToolBelt:
                                                         or (ptype == "integer" and isinstance(val, int) and not isinstance(val, bool))):
             call_args[missing[0]] = args[ignored[0]]
             ignored = [f"{ignored[0]} (used as {missing[0]})"]
-        limit = 14000 if name in ("query_board", "read_section", "coding_brief") else 7000
+        limit = 14000 if name in ("query_board", "read_section", "coding_brief", "search_datasheet") else 7000
         import json as _json
         sig = name + _json.dumps(call_args, sort_keys=True, default=str)
         if name.startswith("record_") and self._failed_calls.get(sig, 0) >= 2:
@@ -1089,6 +1096,28 @@ class ToolBelt:
                                "points, or record the rule (record_constraint / record_fact / record_sequence) so verify "
                                "checks it, or resolve again with a reason that answers the reviewer.")
         return res
+
+    def search_datasheet(self, source_id: str, question: str, k: int = 5) -> Dict[str, Any]:
+        """The passages of a stored source that best answer a question (Nemotron embeddings, cached per source)."""
+        from embedforge.agent import retrieval
+        sid = self._sid(source_id)
+        src = self.store.get(sid)
+        if src is None:
+            return {"error": f"Unknown source_id {sid}."}
+        if not str(question or "").strip():
+            return {"error": "question: what you want to find, in words (e.g. 'measurement time for x8 oversampling')."}
+        k = max(1, min(int(k or 5), 8))
+        try:
+            hits = retrieval.search(self.store.dir, sid, src.text, self._outline(sid), str(question), k, self.embedder)
+        except Exception as e:   # no key, provider down: the agent still has read_section / read_source
+            return {"error": f"Datasheet search is unavailable ({type(e).__name__}: {str(e)[:200]}). Use datasheet_outline "
+                             "and read_section, or read_source with a query."}
+        for h in hits:
+            self.reads.add(sid, h["start"], h["end"])
+            h["text"] = h["text"].translate(MATH_FOLD)
+        return {"source_id": sid, "passages": hits,
+                "next": "Quote from these passages (record_fact / record_constraint); read_section the sections they come "
+                        "from when you need the whole rule."}
 
     def _figure_index(self, sid: str):
         from embedforge.truth.outline import figures
