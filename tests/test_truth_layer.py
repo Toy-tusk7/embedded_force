@@ -91,6 +91,16 @@ def test_a_sentence_value_and_double_escaped_quotes(tmp_path):
     assert r["ok"], r
 
 
+def test_ti_hex_notation(tmp_path):
+    """TI datasheets write register addresses and values as 0Fh / 00h / 0117h; the TMP117 cold run could not record
+    0x0F or 0x00 from them, recorded '00h' as a value instead, and the code's 0x00 then mismatched it."""
+    for v, t in (("0x0F", "Device ID register 0Fh"), ("0x00", "Temp_Result 00h"), ("0x0117", "DID 0117h"), ("0x48", "48h")):
+        assert value_in_text(v, t) == ("hex-suffix", "STRICT"), (v, t)
+    assert value_in_text("0x0F", "register 10Fh") is None and value_in_text("0x01", "Configuration 10h") is None
+    assert parse_int("0Fh") == 15 and parse_int("0117h") == 0x117 and parse_int("00h") == 0
+    assert parse_int("each") is None and parse_int("1001000") == 1001000   # binary digits are not guessed
+
+
 def test_binary_values_match_register_table_rows(tmp_path):
     """BMP388 Table 44 writes the iir_filter codes as 010 / 011; a model records them as 0b10 / 0b11."""
     store = SourceStore(tmp_path)

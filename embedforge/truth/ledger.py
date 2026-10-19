@@ -268,6 +268,8 @@ def parse_int(value: str) -> Optional[int]:
             return int(v, 2)
         if re.fullmatch(r"-?\d+", v):
             return int(v, 10)
+        if re.fullmatch(r"[0-9][0-9a-f]*h", v):   # 0Fh / 0117h, the TI datasheet notation
+            return int(v[:-1], 16)
     except ValueError:
         return None
     return None
@@ -281,7 +283,8 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
     if n is not None and v.lower().startswith("0x"):
         h = format(n, "x")
         out.append(("hex-prefixed", rf"(?<![0-9a-z])0x0*{h}(?![0-9a-z])", "STRICT"))
-        out.append(("hex-suffix", rf"(?<![0-9a-z]){h}h(?![0-9a-z])", "STRICT"))
+        # TI writes register addresses and values as 0Fh / 00h / 0117h (Bosch writes 0x0F): leading zeros allowed
+        out.append(("hex-suffix", rf"(?<![0-9a-z])0*{h}h(?![0-9a-z])", "STRICT"))
         out.append(("hex-quoted", rf"h'0*{h}'", "STRICT"))
         out.append(("hex-bare", rf"(?<![0-9a-z.]){h.zfill(2)}(?![0-9a-z.])", "LOOSE"))
         out.append(("decimal", rf"(?<![0-9a-z.]){n}(?![0-9a-z.])", "LOOSE"))

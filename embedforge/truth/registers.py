@@ -1232,7 +1232,8 @@ class RegisterBook:
                 return f"field {fname or '?'}: give name and bits ('0', '5:4')"
             hi, lo = bits
             if hi > 7 and raw.get("width") not in (16, 32):
-                return f"field {fname}: bit {hi} is beyond an 8-bit register"
+                return (f"field {fname}: bit {hi} is beyond an 8-bit register; for a 16-bit register (TI's TMP117 has "
+                        "them) give width: 16 in the register, or 32")
             fq = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(fr.get("quote") or ""))
             quotes = [own_section(quote, addr)]
             if fq:
