@@ -134,6 +134,14 @@ the BMP388:
 
 This is one vendor driver, not a false-positive rate; more are needed before quoting one.
 
+**A second part, run cold.** To check that EmbedForge is not tuned to one datasheet, Nemotron 3 Ultra wrote a TI
+TMP117 driver from the task alone (no schematic, no stored datasheet, no harness changes during the run): it found
+TI's datasheet with Tavily (search, map, extract: 10 credits), recorded the pins, address, IDs and conversion, and
+built the driver. It did not pass verify, and the run showed two gaps, both general: TI writes hex as `0Fh` / `00h`,
+which the fact gate did not match (fixed since), and the TMP117 has 16-bit registers, which verify does not model
+yet. Verify now reports that once (`REGISTER_WIDTH_UNSUPPORTED`) and fails, instead of misreading the two-byte
+register writes as two 8-bit registers.
+
 ## NVIDIA Nemotron on Nebius Token Factory
 
 - **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
@@ -307,6 +315,9 @@ is correct. Specifically:
   which can be wrong; for timing, the mode in use and the recommended settings a checkable record is required instead.
 - **MISRA is partial.** cppcheck's MISRA addon checks a subset of MISRA C:2012, and neither tool is qualified for
   certification. MISRA findings are warnings (advisory for C++ code).
+- **8-bit registers only.** Register-level checks (fields, reserved bits, rules after each write, formulas on probe
+  input) model registers of one byte at auto-incrementing addresses. Parts with 16-bit registers (TI's TMP117) are
+  reported as not checkable at that level; their constants, pins, order and timing are still checked.
 - **Code it cannot follow fails.** The static tracer follows the SDK calls listed above; other bus calls are
   reported, not trusted.
 
