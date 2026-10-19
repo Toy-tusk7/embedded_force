@@ -102,8 +102,18 @@ python -m embedforge.verifybench          # add -v to list every planted bug and
 delivered code one at a time (a datasheet constant with a bit flipped, a pin moved, `/` for `*`, a byte in the wrong
 place, the wrong signedness, a required delay deleted, a write to the next register, a check inverted, a failure
 reported as success) and the delivery report gives the score and lists each fault verify did not catch. On the
-BMP388 driver Nemotron 3 Ultra wrote for an RP2350B board: 47 of 49 caught (96%); the two survivors are listed
+BMP388 driver Nemotron wrote for an RP2350B board: 48 of 49 caught (98%); the survivor is listed
 (`python -m embedforge.truth.mutate <project dir>`).
+
+**A bug verify caught in Nemotron's own driver.** The first BMP388 driver set normal mode before its oversampling
+and data rate. It compiled, and its register values were right; only the order was wrong. Once the datasheet's
+conversion-time rule was on record (a constraint over the register fields: conversion time from `OSR.osr_p`,
+`OSR.osr_t` against the sampling period from `ODR.odr_sel`, checked after every register write), verify reported
+`CONSTRAINT_VIOLATED` at the `PWR_CTRL` write: normal mode entered while the oversampling was still at its reset
+x4 and the data rate at 200 Hz, so a measurement (10.9 ms) cannot fit the 5 ms period. Nemotron moved the mode write
+last; the rule now holds after each of the driver's 5 writes and verify passes. Getting there also showed where
+Nemotron 3 Super satisfied the letter of the gates without the substance (a constraint with the fields multiplied by
+0, an order quoted from "in order to"); each of those is now refused.
 
 **On a vendor's own driver.** The benchmark is ours; a correct driver someone else wrote is a harder test. We ran
 verify on Bosch's official BMP3 driver (`bmp3.c` from [BMP3_SensorAPI](https://github.com/boschsensortec/BMP3_SensorAPI),
