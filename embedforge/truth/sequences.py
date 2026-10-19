@@ -113,6 +113,25 @@ class SequenceBook:
     def _save(self) -> None:
         write_atomic(self.path, json.dumps([r.public() for r in self.items.values()], indent=2))
 
+    def retire(self, sid: str, reason: str) -> Dict[str, Any]:
+        """Take out a sequence whose order quote states no order (SEQUENCE_UNGROUNDED); it stays on file in
+        records_retired.json. A grounded sequence cannot be retired: code that breaks it is fixed in the code."""
+        rec = self.items.get(sid)
+        if rec is None:
+            return {"ok": False, "error": f"no sequence {sid} on record"}
+        if states_order(rec.order_quote):
+            return {"ok": False, "error": (f"{sid} {rec.name} is grounded in a passage that states its order, so verify keeps "
+                                           "checking it; if the code breaks it, fix the code; if the order is wrong, "
+                                           f"record_sequence again under its name ({rec.name}) from the passage that gives it.")}
+        with self._lock:
+            self.items.pop(sid)
+            self._save()
+            path = self.path.with_name("records_retired.json")
+            gone = load_json(path, [])
+            write_atomic(path, json.dumps((gone if isinstance(gone, list) else []) +
+                                          [{**rec.public(), "retired_reason": reason}], indent=1))
+        return {"ok": True, "retired": f"{sid} {rec.name}"}
+
     def _resolve_fields(self, st: Step, raw: Any, ledger: FactLedger, subject: str) -> str:
         """fields {'mode': 'normal', 'press_en': 1} -> {'mode': 3, 'press_en': 1}, checked against the register map; a value
         fact given too must agree with them."""
@@ -569,7 +588,8 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
                              f"{seq.id} {seq.subject}.{seq.name}: its order quote does not state an order or a timing "
                              f"({seq.order_quote[:90]!r}), so the order of its steps is the agent's, not the datasheet's.",
                              "record_sequence again under the same name, quoting the sentence, table or figure "
-                             "transcription (read_figure) that gives the order, and order the steps as it does."))
+                             f"transcription (read_figure) that gives the order, and order the steps as it does; if no "
+                             f"passage gives one, retire_record('{seq.id}', why)."))
         if not trace.found:
             findings.append(("ERROR", "FLOW_ENTRY_MISSING", where, 0,
                              f"{seq.id} {seq.subject}.{seq.name}: function {seq.entry}() is not in the sources.",

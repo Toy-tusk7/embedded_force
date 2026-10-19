@@ -22,7 +22,7 @@ from embedforge.truth import FactLedger, SourceStore
 # Tools whose success means the run moved forward (resets the research / SDK budgets).
 PROGRESS_TOOLS = {"record_fact", "record_user_fact", "record_board_pins", "init_project", "init_betaflight", "query_board",
                   "write_file", "replace_in_file", "rename_file", "build", "verify", "record_facts", "record_sequence", "record_registers",
-                  "record_layouts", "record_formula", "record_constraint", "resolve_requirements"}
+                  "record_layouts", "record_formula", "record_constraint", "resolve_requirements", "retire_record"}
 RESEARCH_TOOLS = {"web_search", "fetch_document", "find_reference_code", "find_documents"}
 SDK_TOOLS = {"search_framework", "read_framework_file"}
 MAX_RESEARCH_WITHOUT_PROGRESS = 6
@@ -35,7 +35,8 @@ READ_ONLY_TOOLS = {"read_file", "list_files", "read_framework_file", "search_fra
 ONCE_PROGRESS_TOOLS = {"query_board", "init_betaflight", "init_project"}  # progress only the first time per arguments
 # failing builds/verifies between edits are the normal fix loop; finish and the record tools have their own truth gates
 NO_FAILURE_STREAK_TOOLS = {"build", "verify", "finish", "record_fact", "record_user_fact", "record_board_pins", "record_facts",
-                           "record_sequence", "record_registers", "record_layouts", "record_formula", "record_constraint", "resolve_requirements"}
+                           "record_sequence", "record_registers", "record_layouts", "record_formula", "record_constraint", "resolve_requirements",
+                           "retire_record"}
 MAX_UNBUILT_CODE_NUDGES = 2
 MAX_TRUNCATION_RETRIES = 2
 MAX_CONTINUE_NUDGES = 2

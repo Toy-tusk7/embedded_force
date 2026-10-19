@@ -260,6 +260,15 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     assert not vacuous["ok"] and "same answer whatever the registers hold" in vacuous["error"], vacuous
     always_normal = book.record_constraint(store, "BMPX", src2.id, "x", "PWR_CTRL.mode == normal", ["11 normal mode"])
     assert not always_normal["ok"] and "reset values already break it" in always_normal["error"], always_normal
+    # only a record verify reports as invalid can be retired; a valid rule that flags the code stays
+    from embedforge.truth.registers import ConstraintDef
+    book.constraints["CON-099"] = ConstraintDef("CON-099", "BMPX", "always_normal", "PWR_CTRL.mode == normal", "", src2.id, ["11 normal mode"], "")
+    book._save()
+    assert RegisterBook(p.root).retire_constraint("CON-099", "the datasheet states no such rule")["ok"]
+    assert "CON-099" not in RegisterBook(p.root).constraints
+    assert (p.root / "records_retired.json").exists()
+    valid = book.record_constraint(store, "BMPX", src2.id, "osr_in_normal_mode", "OSR.osr_p <= 3", q, when="PWR_CTRL.mode == normal")
+    assert "cannot be retired" in RegisterBook(p.root).retire_constraint(valid["constraint"].split()[0], "it flags my code")["error"]
     # a rule may name a field without the footnote digit its table prints (BMP388: osr_t printed 'osr4_t')
     osr = book.register_at(0x1C)
     printed = osr.field("osr_t")

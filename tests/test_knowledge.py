@@ -54,7 +54,11 @@ def test_a_timing_rule_needs_a_record_verify_checks_on_the_code(tmp_path):
     assert "Wire.write(0x33);" in code
     (p.root / "src" / "main.cpp").write_text(code.replace("Wire.write(0x33);", f"Wire.write(0x33);  /* {heading['fact']['id']} */"),
                                              encoding="utf-8")
+    asked = []
+    belt.reviewer = lambda messages: asked.append(messages) or "[]"
     assert belt.call("resolve_requirements", {"items": [dict(claim, ref=heading["fact"]["id"])]})["ok"]
+    # verify checks that record on the code, so the reviewer (who sees only the code) is not asked
+    assert asked == [] and Requirements(p.root).items[rid].review["verdict"] == "agree"
 
 
 def test_verify_fails_until_every_requirement_is_settled(tmp_path):

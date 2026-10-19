@@ -120,6 +120,11 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "ready'. Each comes with `requirements`: its sentences that state a rule (must, should, before, wait, at least). "
         "Modes, timing, valid settings and readout rules live in such sections, not in the register table.",
         {"source_id": S, "section": S, "part": {"type": "integer"}}, ["source_id", "section"]),
+    _fn("retire_record",
+        "Take out a constraint (CON-) or sequence (SEQ-) that verify reports as invalid (CONSTRAINT_INVALID / "
+        "SEQUENCE_UNGROUNDED) when the datasheet states no such rule; reason = why it is wrong. A valid record cannot be "
+        "retired: a rule that flags your code is fixed in the code.",
+        {"id": S, "reason": S}, ["id", "reason"]),
     _fn("search_datasheet",
         "Find the passages of a long datasheet that answer a question (NVIDIA Nemotron embeddings over the stored "
         "source): question='conversion time for x8 pressure oversampling'. Returns up to k passages with their section "
@@ -447,6 +452,7 @@ class ToolBelt:
             "read_source": self.read_source, "datasheet_outline": self.datasheet_outline, "read_section": self.read_section,
             "coding_brief": self.coding_brief, "resolve_requirements": self.resolve_requirements,
             "load_skill": self.load_skill, "read_figure": self.read_figure, "search_datasheet": self.search_datasheet,
+            "retire_record": self.retire_record,
             "record_fact": self.record_fact,
             "record_user_fact": self.record_user_fact, "record_board_pins": self.record_board_pins,
             "record_sequence": self.record_sequence, "record_facts": self.record_facts, "record_registers": self.record_registers,
@@ -1129,6 +1135,18 @@ class ToolBelt:
             res["ok"] = bool(res.get("resolved"))
         res["next"] = "verify again: the requirements are part of what it judges."
         ids = [s.split(" ")[0] for s in res.get("resolved") or []]
+        # a claim backed by a record verify checks on the code (a constraint after every write, a sequence, a cited fact)
+        # is settled by that check: the reviewer sees only the code and called CON-002 'a non-existent constraint'
+        by_record = {}
+        for i in ids:
+            r = reqs.items[i]
+            topic, spans = self._strict_topic(r.source_id, r.section)
+            if topic and r.ref and self._backed(r.source_id, r.ref, spans, truth, topic) and \
+                    (r.ref.startswith(("CON-", "SEQ-")) or r.ref in self._cited_facts()):
+                by_record[i] = {"verdict": "agree", "where": "", "why": f"backed by {r.ref}, which verify checks on the code"}
+        if by_record:
+            reqs.set_reviews(by_record)
+            ids = [i for i in ids if i not in by_record]
         if ids and self.reviewer is not None:
             # an independent reviewer (agent/review.py) checks each claim against the code
             from embedforge.agent.review import review_claims
@@ -1149,6 +1167,19 @@ class ToolBelt:
                                "points, or record the rule (record_constraint / record_fact / record_sequence) so verify "
                                "checks it, or resolve again with a reason that answers the reviewer.")
         return res
+
+    def retire_record(self, id: str, reason: str) -> Dict[str, Any]:
+        rid = str(id or "").strip().upper()
+        if len(str(reason or "").strip()) < 12:
+            return {"error": "reason: why the record is wrong, in a sentence (12+ characters)."}
+        if rid.startswith("CON-"):
+            from embedforge.truth.registers import RegisterBook
+            return RegisterBook(self.project.root).retire_constraint(rid, str(reason))
+        if rid.startswith("SEQ-"):
+            from embedforge.truth.sequences import SequenceBook
+            return SequenceBook(self.project.root).retire(rid, str(reason))
+        return {"error": "only constraints (CON-) and sequences (SEQ-) are retired here; a wrong fact is replaced by "
+                         "recording it again."}
 
     def search_datasheet(self, source_id: str, question: str, k: int = 5) -> Dict[str, Any]:
         """The passages of a stored source that best answer a question (Nemotron embeddings, cached per source)."""

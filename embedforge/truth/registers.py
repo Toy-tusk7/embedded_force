@@ -990,6 +990,30 @@ class RegisterBook:
             "constraints": [asdict(c) for c in self.constraints.values()]}, indent=1))
 
     # ---------------------------------------------------------- constraints
+    def retire_constraint(self, cid: str, reason: str) -> Dict[str, Any]:
+        """Take out a constraint verify reports as invalid (it stays on file in records_retired.json). A valid rule
+        cannot be retired: one that flags the code is fixed in the code, not removed."""
+        c = self.constraints.get(cid)
+        if c is None:
+            return {"ok": False, "error": f"no constraint {cid} on record"}
+        regs_c = {r.name.lower(): r for r in self.registers.values() if r.device.lower() == c.device.lower()}
+        try:
+            why = _constraint_sanity(_constraint_tree(c.when, regs_c) if c.when else None, _constraint_tree(c.require, regs_c), regs_c)
+        except ValueError as ex:
+            why = str(ex)
+        if not why:
+            return {"ok": False, "error": (f"{cid} {c.name} is a valid rule that verify checks on the code, so it cannot be "
+                                           "retired; if the code breaks it, fix the code; if the rule is mis-recorded, "
+                                           f"record_constraint again under its name ({c.name}) from the datasheet's statement.")}
+        with self._lock:
+            self.constraints.pop(cid)
+            self._save()
+            path = self.path.with_name("records_retired.json")
+            gone = load_json(path, [])
+            write_atomic(path, json.dumps((gone if isinstance(gone, list) else []) +
+                                          [{**asdict(c), "retired_reason": reason, "invalid_because": why}], indent=1))
+        return {"ok": True, "retired": f"{cid} {c.name}", "invalid_because": why}
+
     def record_constraint(self, store: SourceStore, device: str, source_id: str, name: str, require: str, quotes: Any,
                           when: str = "", unit: str = "") -> Dict[str, Any]:
         """A datasheet rule over register settings (see ConstraintDef). Every REGISTER.field must be on record for the
@@ -1963,7 +1987,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             if why:
                 findings.append(RegFinding("ERROR", "CONSTRAINT_INVALID", "", 0, f"{c.id} {c.name} ({c.require}): {why}.",
                                            f"record_constraint again under the same name ({c.name}) to replace it, from "
-                                           "the datasheet's own statement of the rule."))
+                                           "the datasheet's own statement of the rule; if the datasheet states no such "
+                                           f"rule, retire_record('{c.id}', why)."))
                 continue
             checked, bad = 0, None
             for _, w in walkers:
