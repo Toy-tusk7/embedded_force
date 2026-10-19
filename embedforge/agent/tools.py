@@ -1073,7 +1073,12 @@ class ToolBelt:
         reqs.cover(truth_spans(self.project.root, self.store, self.ledger))
         mine = [reqs.items[r.id] for r in mine]
         out = []
+        truth = truth_spans(self.project.root, self.store, self.ledger)
         for r in [x for x in reqs.disputed() if x.source_id == sid]:
+            topic, spans = self._strict_topic(sid, r.section)
+            if topic and r.ref and self._backed(sid, r.ref, spans, truth, topic) and \
+                    (r.ref.startswith(("CON-", "SEQ-")) or r.ref in self._cited_facts()):
+                continue   # a record verify checks on the code settles it; a review from before that counts no more
             stuck = r.disputes >= 3   # author and reviewer keep disagreeing: a person decides
             out.append(Finding("WARNING" if stuck else "ERROR", "REQUIREMENT_DISPUTED", r.review.get("where", "").split(":")[0], 0,
                                f"{r.id} [{r.section.split(' ')[0]}] \"{r.text[:120]}\": you said {r.status} ({r.reason[:100]}); the "
