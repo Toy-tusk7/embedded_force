@@ -320,6 +320,7 @@ class RegisterDef:
     id_value: Optional[int] = None
     reset: Optional[int] = None        # the value after power-on / soft reset (the memory map's default column)
     reset_quote: str = ""
+    width: int = 8                     # bits; 16 / 32 for parts whose registers are wider than a byte (TI's TMP117)
 
     @property
     def defined_mask(self) -> int:
@@ -1298,7 +1299,8 @@ class RegisterBook:
                     f.subject.lower() == device.lower() and _num(str(f.value)) == id_value for f in ledger.facts.values())
                 if id_value is None or not (value_in_text(_hex(id_value), quote) or backed):
                     return f"id_value {iv} must be a FACT id, a value already recorded as a fact for {device}, or appear in the register quote"
-        return RegisterDef("", device, name, addr, fields, source_id, quote.strip(), id_value)
+        width = int(raw.get("width")) if str(raw.get("width") or "").strip() in ("16", "32") else 8
+        return RegisterDef("", device, name, addr, fields, source_id, quote.strip(), id_value, width=width)
 
     def _one_burst(self, store: SourceStore, device: str, source_id: str, raw: Dict[str, Any]) -> Any:
         name = str(raw.get("name") or "data").strip()
@@ -1794,13 +1796,38 @@ def evaluate_formulas(book: RegisterBook, vec: Dict[int, int]) -> Dict[str, floa
     return out
 
 
+_WIDE_ROW = re.compile(r"(?<![0-9A-Fa-fx])[0-9A-Fa-f]{4}h\b|\b0x[0-9A-Fa-f]{4}\b")
+
+
+def _wide(r: "RegisterDef") -> bool:
+    """A register wider than a byte: recorded so, a field above bit 7, a reset or ID value above 0xFF, or a memory-map
+    row that gives a 16-bit value ('00h R 8000h Temp_Result'; the TMP117 cold run recorded its registers without fields)."""
+    return (r.width > 8 or any(f.hi > 7 for f in r.fields) or (r.reset or 0) > 0xFF or (r.id_value or 0) > 0xFF
+            or bool(_WIDE_ROW.search(r.quote or "")))
+
+
 def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Optional[FlowModel] = None) -> Tuple[Dict[str, Any], List[RegFinding]]:
     """Returns (summary for the verify report, findings)."""
     book = RegisterBook(project_dir)
     if book.empty():
         return {}, []
+    # registers wider than a byte (TI's TMP117: 16-bit registers at consecutive pointers, two bytes per register) are
+    # not modelled: the checks below read each byte of a transfer as the next register, which turned the TMP117's
+    # configuration write into 'register 0x02 is not in the map'. Said once, plainly, instead of misleading errors.
+    wide = sorted({r.device for r in book.registers.values() if _wide(r)}, key=str.lower)
+    if wide:
+        narrow = {r.device.lower() for r in book.registers.values()} - {d.lower() for d in wide}
+        msg = (f"{', '.join(wide)} has registers wider than 8 bits; verify models 8-bit registers only, so the meaning of "
+               "its register writes, reads and fields is not checked (constants, pins, order and timing still are).")
+        out = [RegFinding("ERROR", "REGISTER_WIDTH_UNSUPPORTED", "", 0, msg,
+                          "Nothing to change in the code for this: report to the user that this part's register-level "
+                          "checks need 16-bit register support in EmbedForge.")]
+        if not narrow:
+            return {"registers_skipped": msg}, out
     model = model or FlowModel.from_dir(Path(project_dir))
     findings: List[RegFinding] = []
+    if wide:
+        findings.extend(out)
     devices = sorted({x.device for x in list(book.registers.values()) + list(book.layouts.values())}, key=str.lower)
     dev_addrs = {d: _device_addrs(ledger, d) for d in devices}
     all_addrs = set().union(*dev_addrs.values()) if dev_addrs else set()
@@ -2146,6 +2173,9 @@ def coverage_findings(project_dir: Path, ledger: Optional[FactLedger], model: Fl
     book = RegisterBook(project_dir)
     if book.empty():
         return []
+    devices = {r.device.lower() for r in book.registers.values()}
+    if devices and devices <= {r.device.lower() for r in book.registers.values() if _wide(r)}:
+        return []   # parts with registers wider than a byte: check_registers reports REGISTER_WIDTH_UNSUPPORTED once
     out, seen = [], set()
     known = book.known_addresses() | {a for b in book.bursts.values() for a in range(b.start, b.end + 1)}
     per_dev: Dict[str, set] = {}   # a register of one part does not map the same address on another part
