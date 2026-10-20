@@ -282,7 +282,7 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .\.venv\Scripts\activate
 pip install -e .
 pip install -e ".[pdf]"            # optional: better PDF -> Markdown (PyMuPDF, AGPL-3.0)
-cp .env.example .env               # then add NEBIUS_API_KEY and TAVILY_API_KEY
+cp .env.example .env               # then add NEBIUS_API_KEY (or NVIDIA_API_KEY) and TAVILY_API_KEY
 embedforge                         # or: python -m embedforge.server
 ```
 
