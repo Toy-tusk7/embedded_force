@@ -27,6 +27,15 @@ read_figure(source_id, 'Figure n') transcribes one from the stored PDF. A transc
 not the datasheet's words: record the rule it shows (record_sequence for an order, record_constraint for a limit)
 quoting the datasheet text that says the same.
 
+## Registers wider than a byte
+Some parts (TI's temperature sensors, current monitors) have 16-bit registers: the register map gives 4-hex-digit
+values ('00h R 8000h Temp_Result', '01h R/W 0220h Configuration') and the field tables number bits up to 15. Record
+them with width '16' and, once per part, byte_order_quote: the bus section's sentence on which byte of a register is
+sent first ('most significant byte first, followed by the least significant byte'). verify then reads each two-byte
+write as one 16-bit value, catches bytes put together in the wrong order and transfers of half a register, and asks
+for a layout (signed or not) for every 16-bit measurement register the code converts. A conversion stated as
+'One LSB equals 7.8125 m°C' is a formula on that layout: T = LSB * 7.8125 / 1000, with inputs={'LSB': '<layout>'}.
+
 ## Formulas in PDF text
 PDF extraction loses exponents and fraction bars: "2osr_p" is 2^osr_p, "230" next to a coefficient is 2^30.
 Write the rule with REGISTER.field names and the quoted numbers; unit factors (1000 for ms to us) are allowed.

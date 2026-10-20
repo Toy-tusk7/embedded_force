@@ -280,20 +280,23 @@ def test_a_rule_over_settings_is_checked_after_every_write(tmp_path):
     assert "constant 3001" in book.record_constraint(store, "BMPX", src2.id, "x", "OSR.osr_p * 1000 <= 3001", q)["error"]
 
 
-def test_registers_wider_than_a_byte_are_reported_not_misread(tmp_path):
-    """The TMP117 (16-bit registers at consecutive pointers): its 2-byte configuration write read as registers 0x01 and
-    0x02 gave 'register 0x02 is not in the map'. Verify says once that it does not model wide registers."""
-    from embedforge.truth.registers import RegisterDef, coverage_findings, _wide
+def test_wide_registers_recorded_as_bytes_are_reported_not_misread(tmp_path):
+    """The TMP117 cold run recorded its 16-bit registers as bytes (no width, no byte order): read byte by byte, the 2-byte
+    configuration write became 'register 0x02 is not in the map'. Verify asks for them to be recorded again instead."""
+    from embedforge.truth.registers import RegisterDef, _unmodelled
     p, store, ledger, src, f = _setup(tmp_path, driver())
     book = RegisterBook(p.root)
-    assert not any(_wide(r) for r in book.registers.values())
+    assert not any(_unmodelled(r) for r in book.registers.values())
     for r in book.registers.values():
-        r.quote = r.quote + " 8000h"   # as TI's memory map gives a 16-bit reset value
+        r.quote = r.quote + " 00h R 8000h"   # a TI memory-map row: a 16-bit value
     book._save()
     summary, codes, found = _codes(p, ledger)
-    assert "REGISTER_WIDTH_UNSUPPORTED" in codes and not {"REG_UNMAPPED", "REG_FIELDS_MISSING"} & set(codes), codes
+    assert "REGISTER_WIDTH_UNRECORDED" in codes and not {"REG_UNMAPPED", "REG_FIELDS_MISSING"} & set(codes), codes
     assert coverage_findings(p.root, ledger, FlowModel.from_dir(p.root)) == []
-    assert _wide(RegisterDef("x", "d", "R", 1, [], "s", "q", width=16)) and not _wide(RegisterDef("x", "d", "R", 1, [], "s", "0x1B PWR_CTRL 0x00"))
+    assert _unmodelled(RegisterDef("x", "d", "R", 1, [], "s", "q", width=16))   # wide, but no byte order
+    assert not _unmodelled(RegisterDef("x", "d", "R", 1, [], "s", "q", width=16, byte_order="msb_first"))
+    assert not _unmodelled(RegisterDef("x", "d", "R", 1, [], "s", "0x1B PWR_CTRL 0x00"))
+    assert not _unmodelled(RegisterDef("x", "d", "R", 1, [], "s", "0x0010 SOFT_RESET 0x01"))   # a 16-bit address, 8-bit register
 
 
 def test_probe_uses_the_id_the_code_expects_when_none_is_recorded(tmp_path):

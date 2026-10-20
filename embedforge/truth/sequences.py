@@ -197,10 +197,10 @@ class SequenceBook:
             reg = _register(book, addr, subject)
             if v is None or reg is None:
                 return f"value {st.value!r} must be a FACT id (or the register must be in the register map)"
-            if reg.fields and v & ~reg.defined_mask & 0xFF:
-                return f"value {st.value} sets bits {v & ~reg.defined_mask & 0xFF:#04x} that no field of {reg.name} defines"
+            if reg.fields and v & ~reg.defined_mask & reg.full:
+                return f"value {st.value} sets bits {reg.hexv(v & ~reg.defined_mask & reg.full)} that no field of {reg.name} defines"
             named = [f for f in reg.fields if f.values]
-            whole = [f for f in reg.fields if (f.hi, f.lo) == (7, 0)]
+            whole = [f for f in reg.fields if (f.hi, f.lo) == (reg.width - 1, 0)]
             if whole and whole[0].values and not whole[0].value_name(v):
                 return f"value {st.value} is none of {reg.name}'s named values ({', '.join(f'{n}={vs[0]:#04x}' for n, vs in whole[0].values.items())})"
             st.fields = {f.name: f.get(v) for f in reg.fields} if reg.fields else {}
@@ -414,11 +414,12 @@ def _matches(step: Step, e: Event, ledger: FactLedger, book: Any = None, subject
             if want is None:
                 return "yes"
             if isinstance(v, Part):   # a read-modify-write: judge the bits it decides
-                m = (mask if mask is not None else 0xFF) & 0xFF
+                reg_def = _register(book, r, subject)
+                full = reg_def.full if reg_def is not None else 0xFF   # 0xFFFF for a 16-bit register
+                m = (mask if mask is not None else full) & full
                 if (v.value ^ want) & v.mask & m:
                     continue   # a decided bit is wrong
-                reg_def = _register(book, r, subject)
-                fields = reg_def.defined_mask if reg_def is not None and reg_def.fields else 0xFF
+                fields = reg_def.defined_mask if reg_def is not None and reg_def.fields else full
                 if m & fields & ~v.mask == 0:   # every field bit the step sets is decided (reserved bits may be kept)
                     return "yes"
                 unresolved = True
@@ -569,9 +570,10 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
     book = SequenceBook(project_dir)
     if not book.items:
         return [], []
-    from embedforge.truth.registers import RegisterBook, entry_points
+    from embedforge.truth.registers import RegisterBook, bus_words, entry_points
     model = model or FlowModel.from_dir(Path(project_dir))
     regs = RegisterBook(project_dir)
+    model.words = bus_words(regs, ledger)   # 16-bit registers: a write's two bytes are one value
     results, findings = [], []
     entries = None
     for seq in book.items.values():

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -207,6 +207,9 @@ class Event:
     note: str = ""
     sites: Tuple[int, ...] = ()    # call-site lines from the entry function down to the primitive
     assumed: str = ""              # a delay whose length rests on an assumption the project does not state (tick rate)
+    word: int = 1                  # bytes per register (2 for TI's 16-bit registers): a write's data are then register
+                                   # values, one per register, and a read's length is still in bytes
+    extra: int = 0                 # bytes of a write left over after its whole registers (a register written in part)
 
     @property
     def entry_line(self) -> int:
@@ -222,7 +225,9 @@ class Event:
         else:
             d.update(addr=fmt(self.addr), reg=fmt(self.reg), bus=self.bus)
             if self.kind == "write":
-                d["data"] = [fmt(x) for x in self.data]
+                d["data"] = [f"0x{x:0{2 * self.word}X}" if is_int(x) else fmt(x) for x in self.data]
+                if self.extra:
+                    d["partial_bytes"] = self.extra
             else:
                 d["length"] = self.length if is_int(self.length) else repr(self.length)
         if self.note:
@@ -511,6 +516,52 @@ class FlowModel:
                             ("portTICK_PERIOD_MS", f"( 1000 / {self.tick_hz} )"), ("portTICK_RATE_MS", f"( 1000 / {self.tick_hz} )")):
             if name not in self.macros:
                 self.macros[name] = Macro(None, tokenize(value))
+        # registers wider than a byte, from the register map (registers.apply_words): bus address (None: a device whose
+        # address the walk cannot tell) -> register -> (bytes, most significant byte first)
+        self.words: Dict[Any, Dict[int, Tuple[int, bool]]] = {}
+
+    def word_at(self, addr: Any, reg: Any) -> Tuple[int, bool]:
+        """(bytes per register, MSB first) of register `reg` of the device at bus address `addr`; (1, True) for a byte."""
+        if not self.words or not is_int(reg):
+            return 1, True
+        table = self.words.get(addr) if is_int(addr) and addr in self.words else self.words.get(None)
+        return (table or {}).get(reg, (1, True))
+
+    def byte_slot(self, addr: Any, reg: int, k: int) -> Tuple[int, int, int, bool]:
+        """Byte k of a transfer that starts at register `reg`: (its register, its byte index there, that register's
+        bytes, MSB first). Registers follow one another (the pointer moves on after each whole register)."""
+        r = reg
+        while True:
+            n, msb = self.word_at(addr, r)
+            if k < n or n <= 0:
+                return r, k, n, msb
+            k -= n
+            r += 1
+
+    def to_words(self, addr: Any, reg: Any, data: List[Any]) -> Tuple[List[Tuple[Any, Any]], int]:
+        """A write's data bytes as (register, value) pairs, one per register, and the bytes left over (a register only
+        partly written). Bytes of one register combine into its value; a byte known only in part (a read-modify-write)
+        keeps the bits it knows."""
+        if not is_int(reg) or self.word_at(addr, reg)[0] == 1:
+            return [((reg + k) if is_int(reg) else reg, v) for k, v in enumerate(data)], 0
+        out: List[Tuple[Any, Any]] = []
+        k, r = 0, reg
+        while k < len(data):
+            n, msb = self.word_at(addr, r)
+            chunk = data[k:k + n]
+            if len(chunk) < n:
+                return out, len(chunk)
+            mask = value = 0
+            for j, b in enumerate(chunk):
+                shift = 8 * (n - 1 - j) if msb else 8 * j
+                if is_int(b):
+                    mask, value = mask | (0xFF << shift), value | ((b & 0xFF) << shift)
+                elif isinstance(b, Part):
+                    mask, value = mask | ((b.mask & 0xFF) << shift), value | ((b.value & b.mask & 0xFF) << shift)
+            full = (1 << (8 * n)) - 1
+            out.append((r, value if mask == full else Part(mask | (~full & _WORD), value) if mask else Sym(f"word@{r}")))
+            k, r = k + n, r + 1
+        return out, 0
 
     @classmethod
     def from_dir(cls, root: Path, dirs: Iterable[str] = ("src", "include", "lib")) -> "FlowModel":
@@ -747,10 +798,11 @@ class FlowModel:
                     i = semi + 1
                     continue
             prev_text = toks[i - 1].text if i else ";"
-            # declaration with default arguments:  BMP388(uint8_t addr = BMP388_ADDR);  /  void f(int x = 5);
+            # declaration with default arguments:  BMP388(uint8_t addr = BMP388_ADDR);  /  void f(int x = 5);  and a
+            # definition in the class body, which is the first declaration:  T(uint8_t a = ADDR) : _a(a) {}
             if t.kind == "id" and t.text not in _KEYWORDS and i + 1 < n and toks[i + 1].text == "(":
                 close = _match(toks, i + 1)
-                if close + 1 < n and toks[close + 1].text == ";" and any(x.text == "=" for x in toks[i + 2:close]):
+                if close + 1 < n and toks[close + 1].text in (";", "{", ":") and any(x.text == "=" for x in toks[i + 2:close]):
                     defaults = {}
                     for idx, part in enumerate(_split_args(toks[i + 2:close])):
                         texts_p = [x.text for x in part]
@@ -809,8 +861,10 @@ class FlowModel:
                 rb = _match(toks, i, "[", "]")
                 if rb + 1 < n and toks[rb + 1].text in (";", "="):
                     self.global_sizes.setdefault(toks[i - 1].text, toks[i + 1:rb])
-            # const globals: [static] const <type> NAME = expr ;  and arrays NAME[] = { ... };  (only at statement start)
-            if t.kind == "id" and t.text in ("const", "constexpr", "static") and prev_text in (";", "}", "{"):
+            # const globals: [static] const <type> NAME = expr ;  and arrays NAME[] = { ... };  (only at statement start,
+            # which includes right after `public:`: the TMP117 driver's first class member, its I2C address, was lost)
+            after_access = prev_text == ":" and i >= 2 and toks[i - 2].text in ("public", "private", "protected")
+            if t.kind == "id" and t.text in ("const", "constexpr", "static") and (prev_text in (";", "}", "{") or after_access):
                 semi = self._find_semicolon(toks, i)
                 seg = toks[i:semi]
                 texts_seg = [x.text for x in seg]
@@ -1072,7 +1126,7 @@ class FlowModel:
                 call_args[fn.params.index(key)] = value
         w.call(fn, call_args, (), guaranteed=True, this=this)
         w.spi_flush()
-        return Trace(entry, normalize(w.events), w.notes, found=True, opaque=sorted(w.opaque))
+        return Trace(entry, normalize(w.events, self), w.notes, found=True, opaque=sorted(w.opaque))
 
     def run(self, entries: List[str], probe: Optional[Dict[int, int]] = None, spi_dummy: int = 0) -> "Walker":
         """Walk several entry functions in order on one shared state (setup() then loop(), as the Arduino core does).
@@ -1090,7 +1144,7 @@ class FlowModel:
             if fn is not None and len(w.events) < MAX_EVENTS:
                 w.call(fn, [Sym(p) for p in fn.params], (), guaranteed=True)
         w.spi_flush()
-        w.events = normalize(w.events)
+        w.events = normalize(w.events, self)
         return w
 
 
@@ -1110,18 +1164,47 @@ class Trace:
 
 
 MAX_ITER = 256   # iterations of one loop with known bounds
-_SHIFTED_RX = re.compile(r"^\(?<?rx@0x[0-9A-F]+<<\d+")   # (msb << 8) ...: the other half of `(msb << 8) | lsb`
+_SHIFTED_RX = re.compile(r"^\(?<?rx@0x[0-9A-F]+(\[\d+:\d+\])?<<\d+")   # (msb << 8) ...: the other half of `(msb << 8) | lsb`
 
 
 @dataclass(frozen=True)
 class RxByte:
     """A byte read from a device register (unknown value, known origin): lets the analysis see how the code assembles
-    multi-byte values and which status bits it tests."""
+    multi-byte values and which status bits it tests. In a register wider than a byte (TI's 16-bit registers) it is
+    the byte holding bits pos+7..pos."""
     reg: int
     dev: Optional[int] = None   # bus address of the device, when known
+    pos: int = 0                # the register bit this byte's bit 0 is (8: the high byte of a 16-bit register)
+    width: int = 8              # the register's width in bits
 
     def __repr__(self) -> str:
-        return f"rx@0x{self.reg:02X}"
+        return f"rx@0x{self.reg:02X}" + (f"[{self.pos + 7}:{self.pos}]" if self.width > 8 else "")
+
+
+@dataclass(frozen=True, repr=False)
+class RxWord(Sym):
+    """Bytes of one wide register put together by the code ((hi << 8) | lo): which byte went where. `whole` when every
+    byte is in and sits at its own bit position, i.e. the value is the register's value."""
+    reg: int = 0
+    dev: Optional[int] = None
+    width: int = 16
+    pieces: Tuple[Tuple[int, int], ...] = ()   # (bit position of the byte in the register, bit position the code put it at)
+
+    def __repr__(self) -> str:
+        return f"<{self.text}>"
+
+    @property
+    def whole(self) -> bool:
+        return sorted(p for p, _ in self.pieces) == list(range(0, self.width, 8)) and all(p == s for p, s in self.pieces)
+
+
+def _rx_pieces(v: Any) -> Optional[Tuple[int, Optional[int], int, Tuple[Tuple[int, int], ...]]]:
+    """(register, device, width, pieces) of a byte or bytes read from one wide register; None for anything else."""
+    if isinstance(v, RxByte) and v.width > 8:
+        return v.reg, v.dev, v.width, ((v.pos, 0),)
+    if isinstance(v, RxWord):
+        return v.reg, v.dev, v.width, v.pieces
+    return None
 
 
 class _Break(Exception):
@@ -1248,6 +1331,18 @@ class Evaluator:
         if op == "+" and is_int(a) and isinstance(b, (Ptr, Arr)):
             arr, off = (b.arr, b.offset) if isinstance(b, Ptr) else (b, 0)
             return Ptr(arr, off + a)
+        # bytes of a wide register put together: (rx[15:8] << 8) | rx[7:0] is the register's value, other placements
+        # are recorded as they are (registers.py reports a swapped byte order)
+        if op == "<<" and is_int(b) and 0 <= b < 32 and _rx_pieces(a) is not None:
+            reg, dev, width, pieces = _rx_pieces(a)
+            return RxWord(f"{a!r}<<{b}", reg, dev, width, tuple((p, s + b) for p, s in pieces))
+        if op in ("|", "+") and _rx_pieces(a) is not None and _rx_pieces(b) is not None and _rx_pieces(a)[:3] == _rx_pieces(b)[:3]:
+            reg, dev, width, pieces = _rx_pieces(a)
+            return RxWord(f"{a!r}{op}{b!r}", reg, dev, width, pieces + _rx_pieces(b)[3])
+        if op in ("<<", ">>") and isinstance(a, Part) and is_int(b) and 0 <= b < 32:   # (cfg >> 8) of a read-modify-write
+            if op == "<<":
+                return Part(((a.mask << b) | ((1 << b) - 1)) & _WORD, (a.value << b) & _WORD)
+            return Part((a.mask >> b) | (~(_WORD >> b) & _WORD), a.value >> b)
         if op in ("&", "|"):   # read-modify-write: the bits a constant decides stay known
             p = _partial(op, a, b)
             if p is not None:
@@ -1616,10 +1711,12 @@ class Walker:
         the probe does not set, the last value the code wrote there), otherwise a byte that remembers its register."""
         if not is_int(reg):
             return Sym("rx")
-        if self.probe is not None:
-            r = reg + k
-            return self.probe[r] if r in self.probe else self.regs_written.get(repr(dev), {}).get(r, 0)
-        return RxByte(reg + k, dev if is_int(dev) else None)
+        r, j, n, msb = self.m.byte_slot(dev, reg, k)
+        pos = (8 * (n - 1 - j) if msb else 8 * j) if n > 1 else 0
+        if self.probe is not None:   # a wide register's probe value is the whole register: this byte is part of it
+            v = self.probe[r] if r in self.probe else self.regs_written.get(repr(dev), {}).get(r, 0)
+            return (v >> pos) & 0xFF if n > 1 else v
+        return RxByte(r, dev if is_int(dev) else None, pos, 8 * n)
 
     def global_value(self, name: str) -> Any:
         """A file-scope variable: zero-initialised (as C does) or from its initializer, created on first use."""
@@ -2298,24 +2395,28 @@ class Walker:
                 reg, data = (data[0] & 0x7F if kw.get("bus") == "spi" else data[0]), data[1:]
             if is_int(reg):
                 mem = self.regs_written.setdefault(repr(kw.get("addr")), {})
-                for k, v in enumerate(data[:64]):
-                    if is_int(v):
-                        mem[reg + k] = v & 0xFF
+                for r, v in self.m.to_words(kw.get("addr"), reg, data[:64])[0]:   # whole values of wide registers
+                    if is_int(r) and is_int(v):
+                        mem[r] = v & ((1 << (8 * self.m.word_at(kw.get("addr"), r)[0])) - 1)
         if len(self.events) < MAX_EVENTS:
             self.events.append(Event(file=ev.file, line=line, chain=ev.chain, guaranteed=ev.guaranteed, sites=tuple(self._sites), **kw))
 
     def observe(self, op: str, a: Any, b: Any, file: str, line: int) -> None:
-        """How the code uses bytes read from registers: shifts (assembling multi-byte values) and masks (testing bits)."""
-        if op in ("==", "!=") and (isinstance(a, RxByte) and is_int(b) or isinstance(b, RxByte) and is_int(a)):
-            rx_, c = (a, b) if isinstance(a, RxByte) else (b, a)
+        """How the code uses bytes read from registers: shifts (assembling multi-byte values) and masks (testing bits).
+        A wide register's value, once its bytes are put together in place (RxWord.whole), counts as the register."""
+        def reg_value(v: Any) -> bool:
+            return isinstance(v, RxByte) or isinstance(v, RxWord) and v.whole
+        if op in ("==", "!=") and (reg_value(a) and is_int(b) or reg_value(b) and is_int(a)):
+            rx_, c = (a, b) if reg_value(a) else (b, a)
             self.obs_compares.append((rx_, c, file, line))   # e.g. chip_id != 0x50: the value the code expects
         if op == "<<" and isinstance(a, RxByte) and is_int(b):
             self.obs_shifts.append((a, b, file, line))
-        elif op == "&" and (isinstance(a, RxByte) and is_int(b) or isinstance(b, RxByte) and is_int(a)):
-            rx_, m = (a, b) if isinstance(a, RxByte) else (b, a)
+        elif op == "&" and (reg_value(a) and is_int(b) or reg_value(b) and is_int(a)):
+            rx_, m = (a, b) if reg_value(a) else (b, a)
+            full = (1 << rx_.width) - 1 if isinstance(rx_, RxWord) else 0xFF
             # a mask that tests bits; not a complement that keeps the other bits in a read-modify-write (v & ~0x07)
             # nor an all-bits mask (id & 0xFF)
-            if m > 0 and (m & 0xFF) != 0xFF:
+            if m > 0 and (m & full) != full:
                 self.obs_masks.append((rx_, m, file, line))
         elif op in ("|", "+"):
             for x, other in ((a, b), (b, a)):
@@ -2848,13 +2949,30 @@ def _BUSIO_STYLE(w: Walker, name: str, a: List[Any], ev: Evaluator, line: int) -
 # ------------------------------------------------------------------ normalisation
 
 
-def normalize(events: List[Event]) -> List[Event]:
+def normalize(events: List[Event], model: Optional["FlowModel"] = None) -> List[Event]:
     """Raw bus transfers -> register operations.
 
     * a write of [reg, data...] is a register write;
     * a write of [reg] immediately followed by a read of the same device is a register read;
-    * on SPI, bit 7 of the first byte marks a read (Bosch convention) and the register is the low 7 bits.
+    * on SPI, bit 7 of the first byte marks a read (Bosch convention) and the register is the low 7 bits;
+    * on a device with registers wider than a byte (model.words), a write's data become register values, one per
+      register, in the byte order on record.
     """
+    out = _normalize(events)
+    if model is None or not model.words:
+        return out
+    for k, e in enumerate(out):
+        if e.kind in ("write", "read") and is_int(e.reg) and e.word == 1 and model.word_at(e.addr, e.reg)[0] > 1:
+            n = model.word_at(e.addr, e.reg)[0]
+            if e.kind == "write":
+                pairs, extra = model.to_words(e.addr, e.reg, e.data)
+                out[k] = replace(e, data=[v for _, v in pairs], word=n, extra=extra)
+            else:
+                out[k] = replace(e, word=n)
+    return out
+
+
+def _normalize(events: List[Event]) -> List[Event]:
     out: List[Event] = []
     i = 0
     while i < len(events):
@@ -2891,11 +3009,12 @@ def normalize(events: List[Event]) -> List[Event]:
 
 def _write_readings(e: Event) -> List[List[Tuple[Any, Any]]]:
     """The ways a write event can be read as (register, value) pairs: consecutive registers (auto-increment), and with an
-    odd number of data bytes >= 3 also register/value pairs (reg0 v0 reg1 v1 ..., Bosch multi-register writes)."""
+    odd number of data bytes >= 3 also register/value pairs (reg0 v0 reg1 v1 ..., Bosch multi-register writes). Data of
+    wide registers (e.word > 1) are register values already: one reading."""
     if e.kind != "write":
         return []
     consecutive = [((e.reg + k) if is_int(e.reg) else e.reg, v) for k, v in enumerate(e.data)]
-    if len(e.data) >= 3 and len(e.data) % 2 == 1:
+    if len(e.data) >= 3 and len(e.data) % 2 == 1 and e.word == 1:
         return [consecutive, [(e.reg, e.data[0])] + [(e.data[k], e.data[k + 1]) for k in range(1, len(e.data) - 1, 2)]]
     return [consecutive]
 

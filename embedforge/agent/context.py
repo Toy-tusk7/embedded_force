@@ -448,6 +448,8 @@ def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], u
         # what the code uses but nothing records yet: record it (no rebuild needed), every kind in one go
         record = {"REG_MAP_MISSING": "record_registers (+ record_layouts, record_formula)", "REG_FIELDS_MISSING": "record_registers with fields",
                   "REG_UNMAPPED": "record_registers / record_layouts for the unmapped addresses",
+                  "REGISTER_WIDTH_UNRECORDED": "record_registers again with width '16', fields and byte_order_quote",
+                  "REG_LAYOUT_MISSING": "record_layouts for the 16-bit measurement registers (+ record_formula)",
                   "FORMULA_MISSING": "record_formula for the conversions", "FLOW_UNSPECIFIED": "record_sequence for the init order"}
         todo = [t for c, t in record.items() if c in codes]
         if todo:

@@ -138,9 +138,12 @@ This is one vendor driver, not a false-positive rate; more are needed before quo
 TMP117 driver from the task alone (no schematic, no stored datasheet, no harness changes during the run): it found
 TI's datasheet with Tavily (search, map, extract: 10 credits), recorded the pins, address, IDs and conversion, and
 built the driver. It did not pass verify, and the run showed two gaps, both general: TI writes hex as `0Fh` / `00h`,
-which the fact gate did not match (fixed since), and the TMP117 has 16-bit registers, which verify does not model
-yet. Verify now reports that once (`REGISTER_WIDTH_UNSUPPORTED`) and fails, instead of misreading the two-byte
-register writes as two 8-bit registers.
+which the fact gate did not match (fixed since), and the TMP117 has 16-bit registers, which verify did not model.
+It does now: a register is recorded with its width and the datasheet's sentence on byte order ("Register bytes are
+sent with the most significant byte first"), and verify reads the code's two-byte writes and reads as 16-bit values.
+On top of the 8-bit checks this catches bytes put together swapped, a register written or read in half, and a
+16-bit measurement read with the wrong sign. The cold run's records predate this, so verify now asks for them again
+(`REGISTER_WIDTH_UNRECORDED`) rather than misreading the two-byte writes as two 8-bit registers.
 
 ## NVIDIA Nemotron on Nebius Token Factory
 
@@ -315,9 +318,10 @@ is correct. Specifically:
   which can be wrong; for timing, the mode in use and the recommended settings a checkable record is required instead.
 - **MISRA is partial.** cppcheck's MISRA addon checks a subset of MISRA C:2012, and neither tool is qualified for
   certification. MISRA findings are warnings (advisory for C++ code).
-- **8-bit registers only.** Register-level checks (fields, reserved bits, rules after each write, formulas on probe
-  input) model registers of one byte at auto-incrementing addresses. Parts with 16-bit registers (TI's TMP117) are
-  reported as not checkable at that level; their constants, pins, order and timing are still checked.
+- **Registers at one-byte addresses.** Register-level checks (fields, reserved bits, rules after each write, formulas
+  on probe input) model registers of 8, 16, 24 or 32 bits behind a one-byte register pointer, the pointer moving on
+  register by register; a wide register needs its byte order quoted. Parts with 16-bit register addresses, or that
+  pack several registers into one word, are not modelled at that level.
 - **Code it cannot follow fails.** The static tracer follows the SDK calls listed above; other bus calls are
   reported, not trusted.
 

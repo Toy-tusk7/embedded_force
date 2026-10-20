@@ -534,3 +534,15 @@ def test_finish_rejects_claims_the_state_does_not_support(tmp_path):
     assert belt.finish("blocked", "Tested on the hardware, works fine.").get("error")
     ok = belt.finish("blocked", "Not built yet: the compensation formulas are missing; nothing was verified.")
     assert ok.get("ok"), ok
+
+
+def test_first_class_member_after_public_is_a_constant():
+    """TI TMP117 cold run: `public: static constexpr uint8_t DEFAULT_ADDRESS = 0b1001000;` was the class's first member,
+    lost as a constant, so the I2C address the constructor's default argument names stayed unknown."""
+    m = FlowModel({"include/t.h": "class T { public:\n static constexpr uint8_t ADDR = 0b1001000;\n"
+                                  " T(uint8_t a = ADDR) : _a(a) {}\n void go();\n private: uint8_t _a; };",
+                   "src/t.cpp": '#include "t.h"\n#include <Wire.h>\nvoid T::go() { Wire.beginTransmission(_a); Wire.write(1); '
+                                "Wire.endTransmission(); }\nT t;\nvoid setup() { t.go(); }"})
+    assert "ADDR" in m.consts
+    w = m.run(["setup"])
+    assert [e.addr for e in w.events if e.kind == "write"] == [0x48]

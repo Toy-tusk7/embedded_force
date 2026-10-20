@@ -189,10 +189,13 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "start:'0x04', end:'0x09', quote:<text requiring one burst read>}]. Field names, bit numbers and each named value must "
         "be in the quote. verify then decodes every register write into its fields, rejects bit masks on undefined bits and "
         "reads that split a burst range; reset values let it check record_constraint rules before the code writes a register. "
-        "Record every register the code writes, polls or tests.",
+        "Record every register the code writes, polls or tests. Registers wider than a byte (the memory map gives 4-hex-digit "
+        "values, e.g. '00h R 8000h'): width:'16', bits up to 15, and byte_order_quote: the datasheet sentence that says which "
+        "byte of a register goes first on the bus (once per part); verify then reads the code's bytes as 16-bit values.",
         {"device": S, "source_id": S,
          "registers": _arr({"type": "object", "properties": {"name": S, "addr": S, "quote": S, "id_value": S, "source_id": S,
-                                                              "reset": S, "reset_quote": S,
+                                                              "reset": S, "reset_quote": S, "width": S, "byte_order": S,
+                                                              "byte_order_quote": S,
                                                               "fields": _arr({"type": "object", "properties": {"name": S, "bits": S, "values": {"type": "object"}, "quote": S},
                                                                               "required": ["name", "bits"]})},
                             "required": ["name", "addr", "quote"]}),
@@ -1690,6 +1693,21 @@ class ToolBelt:
         res = self._register_book().record_registers(self.store, self.ledger, device, sid, regs, bursts if isinstance(bursts, list) else [])
         for rej in res.get("rejected") or []:
             raw = next((r for r in regs if isinstance(r, dict) and r.get("name") == rej.get("register")), None)
+            if raw and re.search(r"byte_order", str(rej.get("error"))):
+                src = self.store.get(str(raw.get("source_id") or sid))
+                if src is not None:   # sentences of the datasheet that say which byte goes first
+                    from embedforge.truth.registers import stated_byte_order
+                    cands = []
+                    for piece in re.split(r"(?<=[.!?])\s+", src.text):
+                        # the shortest tail that still says it: not the section heading on the line above
+                        tails = [piece[m.end():] for m in re.finditer(r"\n", piece)][::-1] + [piece]
+                        hit = next((t for t in tails if stated_byte_order(t)), None)
+                        if hit and len(hit) < 400:
+                            cands.append(re.sub(r"\s+", " ", hit).strip())
+                    cands = list(dict.fromkeys(cands))
+                    if cands:
+                        rej["candidate_quotes"] = cands[:3]
+                continue
             if raw and re.search(r"quote|not stated|not in the quote|mentions neither", str(rej.get("error"))):
                 cands = self._table_passages(str(raw.get("source_id") or sid), [str(raw.get("name") or ""), str(raw.get("addr") or "")])
                 if cands:

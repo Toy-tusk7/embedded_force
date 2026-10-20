@@ -29,13 +29,14 @@ import math
 import random
 import re
 import threading
+import unicodedata
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from embedforge.core.files import load_json, write_atomic
-from embedforge.truth.flow import FlowModel, Part, RxByte, Walker, is_int, writes_of
+from embedforge.truth.flow import FlowModel, Part, RxByte, RxWord, Walker, is_int, writes_of
 from embedforge.truth.ledger import (GAP, FactLedger, _index, _squash, bounded, parse_int, quote_mismatch, unescape_literals,
                                      value_in_text)
 from embedforge.truth.source_store import SourceStore
@@ -283,6 +284,42 @@ def _value_near(quote: str, name: str, v: int, width: int, reach: int = 16) -> b
 # ------------------------------------------------------------------ records
 
 
+# which byte of a wide register goes first on the bus. A byte, not a bit: 'MSB first' alone is usually the bit order
+_MSB_BYTE = r"(?:most[\s-]+significant|msb|high(?:er)?|upper)[\s-]*(?:data[\s-]+)?(?:bytes?|8[\s-]*bits|octets?)"
+_LSB_BYTE = r"(?:least[\s-]+significant|lsb|low(?:er)?)[\s-]*(?:data[\s-]+)?(?:bytes?|8[\s-]*bits|octets?)"
+
+
+def stated_byte_order(quote: str) -> str:
+    """'msb_first' / 'lsb_first' when the quote says which byte of a register is sent first ('Register bytes are sent
+    with the most significant byte first, followed by the least significant byte'), else ''."""
+    q = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", quote or "")).lower()
+    found = set()
+    for first, second, order in ((_MSB_BYTE, _LSB_BYTE, "msb_first"), (_LSB_BYTE, _MSB_BYTE, "lsb_first")):
+        pats = (rf"\b{first}\b[^.;]{{0,40}}\bfirst\b",                                        # ... MSB byte (is sent) first
+                rf"\bfirst\b[^.;]{{0,50}}\b(?:is|are)\b[^.;]{{0,25}}\b{first}",              # the first byte is the MSB
+                rf"\b{first}\b[^.;]{{0,60}}\b(?:followed by|then|before)\b[^.;]{{0,30}}\b{second}",
+                rf"\b{second}\b[^.;]{{0,60}}\b(?:after|follows)\b[^.;]{{0,30}}\b{first}")
+        if any(re.search(p, q) for p in pats):
+            found.add(order)
+    return found.pop() if len(found) == 1 else ""
+
+
+def _order_word(s: str) -> str:
+    """byte_order as models write it ('MSB first', 'big-endian') -> 'msb_first' / 'lsb_first' / ''."""
+    s = str(s or "").strip().lower()
+    if re.search(r"msb|most|big|high", s):
+        return "msb_first"
+    if re.search(r"lsb|least|little|low", s):
+        return "lsb_first"
+    return ""
+
+
+def _width_of(raw: Dict[str, Any]) -> int:
+    """A register item's width in bits: 8 unless it says 16 / 24 / 32 ('16', 16, '16-bit')."""
+    m = re.fullmatch(r"\s*(8|16|24|32)\s*(?:-?\s*bits?)?\s*", str(raw.get("width") if raw.get("width") is not None else ""), re.I)
+    return int(m.group(1)) if m else 8
+
+
 @dataclass
 class FieldDef:
     name: str
@@ -321,6 +358,8 @@ class RegisterDef:
     reset: Optional[int] = None        # the value after power-on / soft reset (the memory map's default column)
     reset_quote: str = ""
     width: int = 8                     # bits; 16 / 32 for parts whose registers are wider than a byte (TI's TMP117)
+    byte_order: str = ""               # wide registers: 'msb_first' / 'lsb_first', the order of its bytes on the bus
+    byte_order_quote: str = ""         # the datasheet sentence that says so
 
     @property
     def defined_mask(self) -> int:
@@ -328,6 +367,23 @@ class RegisterDef:
         for f in self.fields:
             m |= f.mask
         return m
+
+    @property
+    def full(self) -> int:
+        """Every bit of the register: 0xFF, 0xFFFF for a 16-bit register."""
+        return (1 << self.width) - 1
+
+    @property
+    def nbytes(self) -> int:
+        return max(1, self.width // 8)
+
+    @property
+    def modelled(self) -> bool:
+        """verify can read its bytes: a byte, or a wide register with its byte order on record."""
+        return self.width <= 8 or self.byte_order in ("msb_first", "lsb_first")
+
+    def hexv(self, v: int) -> str:
+        return f"0x{v:0{2 * self.nbytes}X}"
 
     def field(self, name: str) -> Optional[FieldDef]:
         key = _alnum(name)
@@ -347,9 +403,9 @@ class RegisterDef:
             fv = f.get(v)
             nm = f.value_name(fv)
             parts.append(f"{f.name}={fv}" + (f" ({nm})" if nm else ""))
-        extra = v & ~self.defined_mask & 0xFF
+        extra = v & ~self.defined_mask & self.full
         if extra:
-            parts.append(f"undefined bits {_hex(extra)}")
+            parts.append(f"undefined bits {self.hexv(extra)}")
         return ", ".join(parts)
 
 
@@ -529,6 +585,20 @@ def _const_in_quote(quote: str, value: float, exp: Optional[int]) -> bool:
 _STMT_LHS = re.compile(r"(?<![\w>.])((?:[A-Za-z_]\w*\s*(?:->|\.)\s*)*[A-Za-z_]\w*)\s*=(?!=)")
 _PROSE_CUT = re.compile(r"\s(?:and|or|where|with|for|when|if|which|is|are|the|to|as|in|of|then|while|respectively)\b|[,;]\s")
 _AMBIGUOUS_POW = re.compile(r"(?<![\w.^*])2(-?\d{1,2})(?![\w.])")   # '214' / '2-8': 2^14 / 2^-8 with the superscript lost
+
+
+_SI_PREFIX = {"k": 1e3, "m": 1e-3, "μ": 1e-6, "u": 1e-6, "n": 1e-9}
+_PREFIXED_UNIT = re.compile(r"\d\s*([kmμun])\s*(?:°\s*[CF]|(?:s|V|A|W|Hz|Pa|g|bar|m|K|G)\b|Ω)")
+
+
+def _prefix_factors(quote: str) -> set:
+    """Unit conversions the quote itself implies: TI's 'One LSB equals 7.8125 m°C' makes / 1000 (to °C) part of the
+    formula; '5 µs' gives 1e6 and 1e-6. Only prefixes the quote puts on a number."""
+    out = set()
+    for m in _PREFIXED_UNIT.finditer(unicodedata.normalize("NFKC", quote or "")):
+        f = _SI_PREFIX[m.group(1)]
+        out |= {f, 1 / f}
+    return out
 
 
 def _quote_statements(quote: str) -> List[Tuple[str, str]]:
@@ -921,23 +991,27 @@ def _quote_names(quote: str, limit: int = 12) -> List[str]:
     return out[:limit]
 
 
-def _parse_part(raw: Any) -> Optional[LayoutPart]:
+def _parse_part(raw: Any, width_of: Optional[Callable[[int], int]] = None) -> Optional[LayoutPart]:
+    """A layout byte: '0x31', '0xE5[3:0]', {reg, bits}. `width_of(addr)`: the register's width (a part of a 16-bit
+    register may use bits up to 15, and without bits it is the whole register)."""
     if isinstance(raw, dict):
         a = _num(raw.get("reg") or raw.get("addr") or raw.get("register"))
-        bits = str(raw.get("bits") or "7:0")
+        bits = str(raw.get("bits") or "")
     else:
-        m = re.fullmatch(r"\s*(0x[0-9A-Fa-f]+|\d+)\s*(?:\[\s*(\d+)\s*(?::|\.\.)\s*(\d+)\s*\])?\s*", str(raw or ""))
+        m = re.fullmatch(r"\s*(0x[0-9A-Fa-f]+|[0-9A-Fa-f]+h|\d+)\s*(?:\[\s*(\d+)\s*(?::|\.\.)\s*(\d+)\s*\])?\s*", str(raw or ""))
         if not m:
             return None
         a = _num(m.group(1))
-        bits = f"{m.group(2)}:{m.group(3)}" if m.group(2) else "7:0"
+        bits = f"{m.group(2)}:{m.group(3)}" if m.group(2) else ""
+    width = width_of(a) if width_of is not None and a is not None else 8
+    bits = bits or f"{width - 1}:0"
     mb = re.fullmatch(r"\s*(\d+)\s*(?::|\.\.)\s*(\d+)\s*|\s*(\d+)\s*", bits)
     if a is None or not mb:
         return None
     hi, lo = (int(mb.group(1)), int(mb.group(2))) if mb.group(1) else (int(mb.group(3)), int(mb.group(3)))
     if hi < lo:
         hi, lo = lo, hi
-    if hi > 7:
+    if hi >= width:
         return None
     return LayoutPart(a, hi, lo)
 
@@ -1102,6 +1176,13 @@ class RegisterBook:
     def known_addresses(self) -> set:
         return {r.addr for r in self.registers.values()} | {p.addr for l in self.layouts.values() for p in l.parts}
 
+    def _width_fn(self, device: str) -> Callable[[int], int]:
+        """addr -> the width of the device's register there (8 when not on record as wider)."""
+        def width(addr: int) -> int:
+            r = self.register_at(addr, device)
+            return r.width if r is not None else 8
+        return width
+
     # ---------------------------------------------------------- recording
     def record_registers(self, store: SourceStore, ledger: Optional[FactLedger], device: str, source_id: str,
                          registers: List[Dict[str, Any]], bursts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -1128,6 +1209,20 @@ class RegisterBook:
                 if "@located" in dropped:
                     notes.append(f"{res.name}: your quote was not verbatim; the fields were checked against the datasheet's own "
                                  f"text for it instead: {res.quote[:120]!r}…")
+        # the byte order of a part's wide registers is one statement in its datasheet: a register without its own quote
+        # takes it from another register of the part (this call's or one on record); with none, verify could not read
+        # the bytes the code sends and receives, so the register is not recorded
+        for r in [r for r in recorded if r.width > 8 and not r.byte_order]:
+            donor = next((x for x in recorded + list(self.registers.values()) if x.device.lower() == device.lower()
+                          and x.width > 8 and x.byte_order), None)
+            if donor is not None:
+                r.byte_order, r.byte_order_quote = donor.byte_order, donor.byte_order_quote
+                continue
+            recorded.remove(r)
+            rejected.append({"register": r.name, "error": (
+                f"{r.name} is a {r.width}-bit register: give byte_order_quote, the datasheet sentence that says which of its "
+                "bytes goes first on the bus (e.g. 'most significant byte first'). verify reads the bytes the code sends and "
+                f"receives in that order; once one register of {device} has it, the others take it.")})
         out_b, rej_b = [], []
         for k, raw in enumerate((bursts or [])[:10], start=1):
             raw = raw if isinstance(raw, dict) else {}
@@ -1165,16 +1260,18 @@ class RegisterBook:
         if raw.get("reset") in (None, ""):
             return None
         v = parse_int(str(raw.get("reset")))
-        if v is None or not 0 <= v <= 0xFF:
-            return "reset must be the register's byte value, e.g. '0x00'"
+        if v is None or not 0 <= v <= reg.full:
+            return ("reset must be the register's byte value, e.g. '0x00'" if reg.width == 8 else
+                    f"reset must be the register's {reg.width}-bit value, e.g. '{reg.hexv(0)}'")
         q = str(raw.get("reset_quote") or reg.quote)
         err = _quote_ok(store, source_id, q, "reset_quote")
         if err:
             return err
-        if reg.name.lower() not in q.lower().replace("\n", "") and not re.search(rf"\b0x{reg.addr:02x}\b", q, re.I):
+        named = (value_in_text(_hex(reg.addr), q) or ("", ""))[1] == "STRICT"   # 0x1D, or TI's 1Dh
+        if reg.name.lower() not in q.lower().replace("\n", "") and not named:
             return "the reset quote names neither the register nor its address"
-        if not value_in_text(f"0x{v:02X}", q):
-            return f"0x{v:02X} is not in the reset quote"
+        if not value_in_text(reg.hexv(v), q):
+            return f"{reg.hexv(v)} is not in the reset quote"
         reg.reset, reg.reset_quote = v, q
         return None
 
@@ -1189,7 +1286,8 @@ class RegisterBook:
         src = store.get(source_id)
         name = str(raw.get("name") or "").strip()
         addr = _num(raw.get("addr") if raw.get("addr") is not None else raw.get("address"))
-        if src is None or not name or addr is None or re.search(r"required|overlap|does not fit|beyond|give name|must be a number", res):
+        if src is None or not name or addr is None or re.search(r"required|overlap|does not fit|beyond|give name|must be a "
+                                                                r"number|wider than a byte|byte_order", res):
             return res
         fields = []
         for f in raw.get("fields") or []:
@@ -1224,17 +1322,19 @@ class RegisterBook:
         stated = _stated_addrs(quote, name) or (_stated_addrs(src.text, name) if src is not None else set())
         if stated and addr not in stated:
             return f"the datasheet gives {name} at {', '.join(_hex(a) for a in sorted(stated))}, not {_hex(addr)}"
+        reg_width = _width_of(raw)
         fields: List[FieldDef] = []
-        for fr in (raw.get("fields") or [])[:16]:
+        for fr in (raw.get("fields") or [])[:24]:
             fr = fr if isinstance(fr, dict) else {}
             fname = str(fr.get("name") or "").strip()
             bits = _parse_bits(fr.get("bits"))
             if not fname or bits is None:
                 return f"field {fname or '?'}: give name and bits ('0', '5:4')"
             hi, lo = bits
-            if hi > 7 and raw.get("width") not in (16, 32):
-                return (f"field {fname}: bit {hi} is beyond an 8-bit register; for a 16-bit register (TI's TMP117 has "
-                        "them) give width: 16 in the register, or 32")
+            if hi >= reg_width:
+                return (f"field {fname}: bit {hi} is beyond an 8-bit register; for a 16-bit register (its memory map gives "
+                        "4-hex-digit values, e.g. 8000h) give width: 16 in the register, or 32" if reg_width == 8 else
+                        f"field {fname}: bit {hi} is beyond a {reg_width}-bit register")
             fq = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(fr.get("quote") or ""))
             quotes = [own_section(quote, addr)]
             if fq:
@@ -1242,10 +1342,10 @@ class RegisterBook:
                 if err:
                     return err
                 quotes.append(fq)
-            whole = (hi, lo) == (7, 0) and raw.get("width") in (None, 8, "8")   # the whole register: no position to check
+            whole = (hi, lo) == (reg_width - 1, 0)   # the whole register: no position to check
             if whole:
                 stated = _stated_bits(quotes, fname)
-                if stated and stated != (7, 0):
+                if stated and stated != (reg_width - 1, 0):
                     return (f"field {fname}: the datasheet gives it bit {stated[1]}" if stated[0] == stated[1] else
                             f"field {fname}: the datasheet gives it bits {stated[0]}..{stated[1]}, not the whole register")
             if not whole and not any(_name_spans(q, fname) for q in quotes):
@@ -1299,8 +1399,26 @@ class RegisterBook:
                     f.subject.lower() == device.lower() and _num(str(f.value)) == id_value for f in ledger.facts.values())
                 if id_value is None or not (value_in_text(_hex(id_value), quote) or backed):
                     return f"id_value {iv} must be a FACT id, a value already recorded as a fact for {device}, or appear in the register quote"
-        width = int(raw.get("width")) if str(raw.get("width") or "").strip() in ("16", "32") else 8
-        return RegisterDef("", device, name, addr, fields, source_id, quote.strip(), id_value, width=width)
+        if reg_width == 8 and ((id_value or 0) > 0xFF or _WIDE_ROW.search(quote)):
+            return (f"{name} is wider than a byte (" + (f"its ID is {_hex(id_value)}" if (id_value or 0) > 0xFF else
+                    f"its row gives the value {_WIDE_ROW.search(quote).group(0).split()[-1]}") +
+                    "): record it with width: 16 (or 32) and byte_order_quote")
+        byte_order, bo_quote = "", ""
+        if reg_width > 8:
+            bo_quote = re.sub(r"\s*(…|\.\.\.)\s*$", "", str(raw.get("byte_order_quote") or "")).strip()
+            if bo_quote:
+                err = _quote_ok(store, str(raw.get("byte_order_source_id") or source_id), bo_quote, "byte_order_quote")
+                if err:
+                    return err
+                byte_order = stated_byte_order(bo_quote)
+                if not byte_order:
+                    return ("byte_order_quote must say which byte of a register goes first on the bus (e.g. '... most "
+                            "significant byte first ...'); this one does not")
+                said = _order_word(str(raw.get("byte_order") or ""))
+                if said and said != byte_order:
+                    return f"byte_order {raw.get('byte_order')!r} contradicts byte_order_quote, which says {byte_order.replace('_', ' ')}"
+        return RegisterDef("", device, name, addr, fields, source_id, quote.strip(), id_value, width=reg_width,
+                           byte_order=byte_order, byte_order_quote=bo_quote)
 
     def _one_burst(self, store: SourceStore, device: str, source_id: str, raw: Dict[str, Any]) -> Any:
         name = str(raw.get("name") or "data").strip()
@@ -1361,7 +1479,7 @@ class RegisterBook:
         src = store.get(source_id)
         if isinstance(res, LayoutDef) or src is None or not re.search(r"not verbatim|not in the quote|too short|longer than", str(res)):
             return res
-        parts = [_parse_part(p) for p in self._layout_bytes(raw)]
+        parts = [_parse_part(p, self._width_fn(device)) for p in self._layout_bytes(raw)]
         if not parts or any(p is None for p in parts):
             return res
         for passage in layout_passages(src.text, [p.addr for p in parts]):
@@ -1387,9 +1505,10 @@ class RegisterBook:
         parts_raw = self._layout_bytes(raw)
         if not name or not parts_raw:
             return "give name and bytes (register addresses, least significant first)"
-        parts = [_parse_part(p) for p in parts_raw]
+        parts = [_parse_part(p, self._width_fn(device)) for p in parts_raw]
         if any(p is None for p in parts):
-            return "each byte is a register address ('0x31') or a partial byte ('0xE5[3:0]')"
+            return ("each byte is a register address ('0x31') or a partial byte ('0xE5[3:0]'); a register of 16 bits "
+                    "(recorded with width 16) is one part, '0x00' or '0x00[15:0]'")
         if len(parts) > 8:
             return "at most 8 bytes"
         err = _quote_ok(store, source_id, quote, name)
@@ -1530,7 +1649,7 @@ class RegisterBook:
                                               "': '<recorded name>'}; a coefficient the code scales (par_t1 = NVM_PAR_T1 / 2^-8) "
                                               "is its own record_formula first."}
             for text, value, exp in _constants(tree):
-                if not _const_in_quote(quote, value, exp):
+                if not _const_in_quote(quote, value, exp) and not any(math.isclose(value, f) for f in _prefix_factors(quote)):
                     missing_consts.append(text)
             uses_known = uses_known or any(n in known for n in _names(tree))
             defined.add(var.lower())
@@ -1716,13 +1835,14 @@ def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int
     """Register bytes for a probe run: random layout bytes, ID registers at their ID (recorded, or the constant the code
     compares them with), status flags 'ready', error flags clear."""
     rnd = random.Random(seed)
-    vec: Dict[int, int] = {}
+    vec: Dict[int, int] = {}   # register -> its value (16 bits for a 16-bit register: the walk splits it into bytes)
     for r in book.registers.values():
         if r.id_value is None and re.search(r"id|who_?am_?i", r.name, re.I) and (expects or {}).get(r.addr) is not None:
-            vec[r.addr] = expects[r.addr] & 0xFF
+            vec[r.addr] = expects[r.addr] & r.full
     for l in book.layouts.values():
         for p in l.parts:
-            vec.setdefault(p.addr, rnd.randrange(256))
+            reg = book.register_at(p.addr, l.device)
+            vec.setdefault(p.addr, rnd.randrange(1 << (reg.width if reg is not None else 8)))
     for l in book.layouts.values():   # input 1: every value's top bit set (a signedness error shows); input 2: clear
         top = l.parts[-1]
         bit = 1 << top.hi
@@ -1731,7 +1851,7 @@ def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int
         if r.addr in vec:
             continue
         if r.id_value is not None:
-            vec[r.addr] = r.id_value & 0xFF
+            vec[r.addr] = r.id_value & r.full
             continue
         v = 0
         for f in r.fields:
@@ -1796,14 +1916,53 @@ def evaluate_formulas(book: RegisterBook, vec: Dict[int, int]) -> Dict[str, floa
     return out
 
 
-_WIDE_ROW = re.compile(r"(?<![0-9A-Fa-fx])[0-9A-Fa-f]{4}h\b|\b0x[0-9A-Fa-f]{4}\b")
+# a memory-map row that gives a register a 16-bit value: TI's '00h R 8000h Temp_Result', '0x01 R/W 0x0220'
+_WIDE_ROW = re.compile(r"(?<![0-9A-Za-z])(?:0x)?[0-9A-Fa-f]{1,2}h?\s+(?:R/W|RW|R|W)\s+(?:0x[0-9A-Fa-f]{4}|[0-9A-Fa-f]{4}h)(?![0-9A-Za-z])")
 
 
-def _wide(r: "RegisterDef") -> bool:
-    """A register wider than a byte: recorded so, a field above bit 7, a reset or ID value above 0xFF, or a memory-map
-    row that gives a 16-bit value ('00h R 8000h Temp_Result'; the TMP117 cold run recorded its registers without fields)."""
-    return (r.width > 8 or any(f.hi > 7 for f in r.fields) or (r.reset or 0) > 0xFF or (r.id_value or 0) > 0xFF
+def _unmodelled(r: "RegisterDef") -> bool:
+    """A register verify cannot read byte by byte: wider than a byte (recorded so, a field above bit 7, a reset or ID
+    value above 0xFF, a memory-map row with a 16-bit value) without the byte order that says how its bytes travel. The
+    TMP117 cold run recorded its 16-bit registers as bytes, before width and byte order could be recorded."""
+    if r.width > 8:
+        return not r.modelled
+    return (any(f.hi > 7 for f in r.fields) or (r.reset or 0) > 0xFF or (r.id_value or 0) > 0xFF
             or bool(_WIDE_ROW.search(r.quote or "")))
+
+
+def bus_words(book: "RegisterBook", ledger: Optional[FactLedger]) -> Dict[Any, Dict[int, Tuple[int, bool]]]:
+    """FlowModel.words for this register map: each part's wide registers under its bus address(es), and under None
+    when that part is the only one with a register map (the walk may not resolve the address the code uses)."""
+    per_dev: Dict[str, Dict[int, Tuple[int, bool]]] = {}
+    for r in book.registers.values():
+        if r.width > 8 and r.modelled:
+            per_dev.setdefault(r.device.lower(), {})[r.addr] = (r.nbytes, r.byte_order == "msb_first")
+    out: Dict[Any, Dict[int, Tuple[int, bool]]] = {}
+    for dev, table in per_dev.items():
+        for a in _device_addrs(ledger, dev):
+            out.setdefault(a, {}).update(table)
+    devices = {r.device.lower() for r in book.registers.values()} | {l.device.lower() for l in book.layouts.values()}
+    if len(per_dev) == 1 and devices <= set(per_dev):
+        out[None] = next(iter(per_dev.values()))
+    return out
+
+
+def apply_words(model: FlowModel, project_dir: Path, ledger: Optional[FactLedger]) -> "RegisterBook":
+    """Tell the walk which registers are wider than a byte (and their byte order), from the register map."""
+    book = RegisterBook(project_dir)
+    model.words = bus_words(book, ledger)
+    return book
+
+
+def _without_unmodelled(book: "RegisterBook") -> Tuple[List["RegisterDef"], set]:
+    """Take the parts with unmodelled wide registers out of the book (in memory): read byte by byte, their 16-bit
+    configuration write became 'register 0x02 is not in the map'. Returns (those registers, their parts)."""
+    bad = [r for r in book.registers.values() if _unmodelled(r)]
+    skip = {r.device.lower() for r in bad}
+    for coll in (book.registers, book.layouts, book.bursts, book.formulas, book.constraints):
+        for k in [k for k, x in coll.items() if x.device.lower() in skip]:
+            coll.pop(k)
+    return bad, skip
 
 
 def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Optional[FlowModel] = None) -> Tuple[Dict[str, Any], List[RegFinding]]:
@@ -1811,23 +1970,22 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     book = RegisterBook(project_dir)
     if book.empty():
         return {}, []
-    # registers wider than a byte (TI's TMP117: 16-bit registers at consecutive pointers, two bytes per register) are
-    # not modelled: the checks below read each byte of a transfer as the next register, which turned the TMP117's
-    # configuration write into 'register 0x02 is not in the map'. Said once, plainly, instead of misleading errors.
-    wide = sorted({r.device for r in book.registers.values() if _wide(r)}, key=str.lower)
-    if wide:
-        narrow = {r.device.lower() for r in book.registers.values()} - {d.lower() for d in wide}
-        msg = (f"{', '.join(wide)} has registers wider than 8 bits; verify models 8-bit registers only, so the meaning of "
-               "its register writes, reads and fields is not checked (constants, pins, order and timing still are).")
-        out = [RegFinding("ERROR", "REGISTER_WIDTH_UNSUPPORTED", "", 0, msg,
-                          "Nothing to change in the code for this: report to the user that this part's register-level "
-                          "checks need 16-bit register support in EmbedForge.")]
-        if not narrow:
-            return {"registers_skipped": msg}, out
     model = model or FlowModel.from_dir(Path(project_dir))
+    model.words = bus_words(book, ledger)
     findings: List[RegFinding] = []
-    if wide:
-        findings.extend(out)
+    bad, skip = _without_unmodelled(book)
+    if bad:
+        for dev in sorted({r.device for r in bad}, key=str.lower):
+            regs = [r for r in bad if r.device == dev]
+            msg = (f"{dev}: {', '.join(f'{r.id} {r.name}' for r in regs)} {'is' if len(regs) == 1 else 'are'} wider than 8 bits "
+                   "(the register map gives 16-bit values) but recorded without width and byte order, so verify cannot read "
+                   f"{dev}'s register writes, reads and fields (constants, pins, order and timing are still checked).")
+            findings.append(RegFinding("ERROR", "REGISTER_WIDTH_UNRECORDED", "", 0, msg,
+                                       "record_registers again for these registers with width: 16 (or 32), their fields, and "
+                                       "byte_order_quote: the datasheet sentence that says which byte of a register goes first "
+                                       "on the bus."))
+        if book.empty():
+            return {"registers_skipped": " ".join(f.message for f in findings)}, findings
     devices = sorted({x.device for x in list(book.registers.values()) + list(book.layouts.values())}, key=str.lower)
     dev_addrs = {d: _device_addrs(ledger, d) for d in devices}
     all_addrs = set().union(*dev_addrs.values()) if dev_addrs else set()
@@ -1878,6 +2036,33 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     if all_addrs and not used & all_addrs:
         all_addrs = set()   # the code talks to another address: judge all its device traffic (a wrong address must not hide errors)
 
+    # 0. transfers that cut a wide register: a register of 16 bits takes its two bytes in one transfer; one byte written
+    # (or read) is half a value, and what the part does with it is not what the code meant
+    seen_t = set()
+    for _, w in walkers:
+        for e in w.events:
+            if e.word <= 1 or not is_int(e.reg) or not mine(e.addr):
+                continue
+            short, last = e.extra, e.reg + len(e.data)   # a write: bytes past its whole registers
+            if e.kind == "read":
+                if not (is_int(e.length) and e.length > 0):
+                    continue
+                last, j, n, _msb = model.byte_slot(e.addr, e.reg, e.length - 1)
+                short = (j + 1) % n
+            reg = reg_at(last, e.addr)
+            if reg is None or (e.file, e.line) in seen_t:
+                continue
+            if short:
+                seen_t.add((e.file, e.line))
+                wf, wl = where(model, e)
+                findings.append(RegFinding("ERROR", "REG_TRANSFER_WIDTH", wf, wl,
+                                           f"{'writes' if e.kind == 'write' else 'reads'} {short} byte(s) of {reg.name} ({_hex(reg.addr)}), "
+                                           f"a {reg.width}-bit register of {reg.nbytes} bytes ({reg.id}: "
+                                           f"{reg.byte_order.replace('_', ' ')}), so part of the value is " +
+                                           ("missing from the write." if e.kind == "write" else "never read."),
+                                           f"Transfer all {reg.nbytes} bytes of the register in one transaction, "
+                                           f"{'most' if reg.byte_order == 'msb_first' else 'least'} significant byte first."))
+
     # 1. register writes, decoded
     seen_w, fieldless = set(), set()
     for _, w in walkers:
@@ -1887,12 +2072,12 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             for r, v in writes_of(e, lambda r, a=e.addr: reg_at(r, a) is not None or bool(parts_at(r, a))):
                 if is_int(r) and isinstance(v, Part):   # read-modify-write: reserved bits it sets for certain
                     reg = reg_at(r, e.addr)
-                    extra = v.value & v.mask & 0xFF & ~(reg.defined_mask if reg is not None else 0xFF)
+                    extra = v.value & v.mask & (reg.full & ~reg.defined_mask if reg is not None else 0)
                     if reg is not None and reg.fields and extra and (e.file, e.line, r) not in seen_w:
                         seen_w.add((e.file, e.line, r))
                         wf, wl = where(model, e)
                         findings.append(RegFinding("WARNING", "REG_RESERVED_BITS", wf, wl,
-                                                   f"{reg.name} ({_hex(r)}) is written with bit(s) {_hex(extra)} set, which no field of "
+                                                   f"{reg.name} ({_hex(r)}) is written with bit(s) {reg.hexv(extra)} set, which no field of "
                                                    f"{reg.id} defines ({', '.join(f.label() for f in reg.fields)}).",
                                                    "Write only defined fields (reserved bits are usually kept or written 0)."))
                     continue
@@ -1904,18 +2089,18 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                     continue
                 seen_w.add(key)
                 wf, wl = where(model, e)
-                summary["writes"].append(f"{wf}:{wl} {reg.name} ({_hex(r)}) <- {_hex(v)}: {reg.decode(v)}")
+                summary["writes"].append(f"{wf}:{wl} {reg.name} ({_hex(r)}) <- {reg.hexv(v)}: {reg.decode(v)}")
                 if not reg.fields and r == e.reg and reg.id not in fieldless:
                     fieldless.add(reg.id)   # a record without fields would make every value it is written pass unchecked
                     findings.append(RegFinding("ERROR", "REG_FIELDS_MISSING", wf, wl,
-                                               f"{reg.name} ({_hex(r)}) <- {_hex(v)}, but {reg.id} records no fields, so what this "
+                                               f"{reg.name} ({_hex(r)}) <- {reg.hexv(v)}, but {reg.id} records no fields, so what this "
                                                "value sets is unchecked.",
                                                "record_registers again for this register with its fields (name and bits from its "
-                                               "table; a whole-register value is one field with bits '7:0')."))
-                extra = v & ~reg.defined_mask & 0xFF
+                                               f"table; a whole-register value is one field with bits '{reg.width - 1}:0')."))
+                extra = v & ~reg.defined_mask & reg.full
                 if reg.fields and extra:
                     findings.append(RegFinding("WARNING", "REG_RESERVED_BITS", wf, wl,
-                                               f"{reg.name} ({_hex(r)}) <- {_hex(v)} sets bit(s) {_hex(extra)} that no field of {reg.id} defines "
+                                               f"{reg.name} ({_hex(r)}) <- {reg.hexv(v)} sets bit(s) {reg.hexv(extra)} that no field of {reg.id} defines "
                                                f"({', '.join(f.label() for f in reg.fields)}).",
                                                "Write only defined fields (reserved bits are usually written 0), or record the missing field."))
                 for f in reg.fields:
@@ -1935,19 +2120,46 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                 reg = reg_at(rx.reg, rx.dev)
                 if reg is None or not reg.fields or not mine(rx.dev) or parts_at(rx.reg, rx.dev):
                     continue
-                bad = mask & ~reg.defined_mask & 0xFF
+                # a byte of a wide register tests the register's bits pos+7..pos; an assembled value tests them all
+                m = (mask & 0xFF) << rx.pos if isinstance(rx, RxByte) else mask
+                bad = m & ~reg.defined_mask & reg.full
                 key = (rx.reg, mask, file, line)
                 if bad and key not in seen_m:
                     seen_m.add(key)
+                    part = (f" (its byte holding bits {rx.pos + 7}..{rx.pos}, so mask {_hex(mask)} is {reg.hexv(m)} in the register)"
+                            if isinstance(rx, RxByte) and rx.width > 8 else "")
                     out.append(RegFinding("ERROR", "REG_MASK_UNDEFINED", file, line,
-                                          f"{reg.name} ({_hex(reg.addr)}) is tested with mask {_hex(mask)}, but bit(s) {_hex(bad)} are not "
-                                          f"defined there; its fields are {', '.join(f.label() for f in reg.fields)} ({reg.id}).",
-                                          f"Mask with the field's bits from the register map (e.g. {', '.join(f'{f.name} = {_hex(f.mask)}' for f in reg.fields)})."))
+                                          f"{reg.name} ({_hex(reg.addr)}) is tested with mask {reg.hexv(mask) if not part else _hex(mask)}{part}, "
+                                          f"but bit(s) {reg.hexv(bad)} are not defined there; its fields are "
+                                          f"{', '.join(f.label() for f in reg.fields)} ({reg.id}).",
+                                          f"Mask with the field's bits from the register map (e.g. {', '.join(f'{f.name} = {reg.hexv(f.mask)}' for f in reg.fields)})."))
+        # 3a. bytes of a wide register put together: each byte where the byte order puts it ((msb << 8) | lsb for a part
+        # that sends its most significant byte first); swapped, every value read is wrong
+        seen_o = set()
+        for _, w in ws:
+            for rx, shift, file, line in w.obs_shifts:
+                if not isinstance(rx, RxByte) or rx.width <= 8 or not mine(rx.dev) or (rx.reg, file, line) in seen_o:
+                    continue
+                reg = reg_at(rx.reg, rx.dev)
+                if reg is None:
+                    continue
+                # where a layout takes bits of this register, it says where they go; else the register's own value
+                wants = {lay.offset_of(k) + rx.pos - lay.parts[k].lo for lay, k in parts_at(rx.reg, rx.dev)
+                         if lay.parts[k].lo <= rx.pos <= lay.parts[k].hi} or {rx.pos}
+                if shift not in wants:
+                    seen_o.add((rx.reg, file, line))
+                    first = "most" if reg.byte_order == "msb_first" else "least"
+                    out.append(RegFinding("ERROR", "REG_BYTE_ORDER", file, line,
+                                          f"the byte of {reg.name} ({_hex(reg.addr)}) holding bits {rx.pos + 7}..{rx.pos} is put at bit "
+                                          f"{shift}, so the {reg.width}-bit value is assembled with its bytes swapped. The datasheet "
+                                          f"sends the {first} significant byte first ({reg.id}: {reg.byte_order_quote[:120]!r}).",
+                                          f"Put each byte at its own position: the byte received {'first' if first == 'most' else 'second'} "
+                                          f"goes to bits {reg.width - 1}..{reg.width - 8} (<< {reg.width - 8})."))
         # 3. shifts on bytes of multi-byte values
         seen_s = set()
         for _, w in ws:
             for rx, shift, file, line in w.obs_shifts:
-                if not mine(rx.dev):
+                if not mine(rx.dev) or rx.width > 8:
                     continue
                 parts = parts_at(rx.reg, rx.dev)
                 for lay, k in parts:
@@ -1977,10 +2189,11 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
             for e in w.events:
                 if e.kind != "read" or not is_int(e.reg) or not mine(e.addr) or (at(e.addr) and b.device.lower() not in at(e.addr)):
                     continue
-                n = e.length if is_int(e.length) else 1
-                if e.reg > b.end or e.reg + n - 1 < b.start:
+                n = e.length if is_int(e.length) and e.length > 0 else 1
+                last = model.byte_slot(e.addr, e.reg, n - 1)[0]   # registers, not bytes, for 16-bit registers
+                if e.reg > b.end or last < b.start:
                     continue
-                if not (e.reg <= b.start and e.reg + n - 1 >= b.end):
+                if not (e.reg <= b.start and last >= b.end):
                     findings.append(RegFinding("ERROR", "REG_BURST_SPLIT", *where(model, e),
                                                f"read of {_hex(e.reg)} x{n} touches {b.name} {_hex(b.start)}..{_hex(b.end)}, which the datasheet "
                                                f"requires to be read in one burst ({b.id}).",
@@ -2031,9 +2244,9 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                             continue
                         if isinstance(v, Part):        # read-modify-write: only the bits it sets are known
                             old = state.get(r)
-                            state[r] = None if old is None else (old & ~v.mask & 0xFF) | (v.value & v.mask)
+                            state[r] = None if old is None else (old & ~v.mask & reg.full) | (v.value & v.mask & reg.full)
                         elif is_int(v):
-                            state[r] = v & 0xFF
+                            state[r] = v & reg.full
                         else:
                             state[r] = None
                         hit = True
@@ -2078,7 +2291,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         detail: Dict[str, str] = {}
         loc: Dict[str, Tuple[str, int]] = {}
         read_regs: set = set()
-        expects = {rx.reg: c for _, w in walkers for rx, c, _f, _l in w.obs_compares}
+        # values the code compares registers with (an ID); one byte of a wide register is not its value
+        expects = {rx.reg: c for _, w in walkers for rx, c, _f, _l in w.obs_compares if rx.width <= 8 or isinstance(rx, RxWord)}
         for seed in (1, 2):
             vec = _probe_vector(book, seed, expects)
             expected = evaluate_formulas(book, vec)
@@ -2090,7 +2304,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                     except RecursionError:
                         continue
                     observed += [v for v in pw.values if isinstance(v[0], (int, float))]
-                    read_regs |= {e.reg + k for e in pw.events if e.kind == "read" and is_int(e.reg) for k in range(e.length if is_int(e.length) else 1)}
+                    read_regs |= {model.byte_slot(e.addr, e.reg, k)[0] for e in pw.events if e.kind == "read" and is_int(e.reg)
+                                  for k in range(e.length if is_int(e.length) and 0 < e.length <= 512 else 1)}
             for f in book.formulas.values():
                 want = expected.get(f.id)
                 if want is None:
@@ -2146,6 +2361,24 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            "Implement the recorded formula exactly (inputs from the layouts, constants and order of operations), "
                                            "or re-record the formula if the datasheet / reference code says otherwise."))
 
+    # 5b. a wide data register (no fields but its whole value, not an ID) that the code puts together into a number is a
+    # measurement: like a multi-byte value of 8-bit registers it needs a layout (is it signed?) and, through that, a
+    # formula. On the TMP117 a driver reading the two's-complement temperature as unsigned otherwise passed
+    seen_d = set()
+    for _, w in walkers:
+        for rx, _shift, file, line in w.obs_shifts:
+            if not isinstance(rx, RxByte) or rx.width <= 8 or not mine(rx.dev) or parts_at(rx.reg, rx.dev):
+                continue
+            reg = reg_at(rx.reg, rx.dev)
+            data = reg is not None and reg.id_value is None and (not reg.fields or [(f.hi, f.lo) for f in reg.fields] == [(reg.width - 1, 0)])
+            if data and reg.id not in seen_d:
+                seen_d.add(reg.id)
+                findings.append(RegFinding("ERROR", "REG_LAYOUT_MISSING", file, line,
+                                           f"the code puts {reg.name} ({_hex(reg.addr)}, {reg.width} bits, {reg.id}) together into a value, "
+                                           "but no layout says how to read it (signed or not), so what the code computes from it is unchecked.",
+                                           f"record_layouts for {reg.name}: bytes ['{_hex(reg.addr)}'] (the whole register) with signed as "
+                                           "the datasheet describes it (two's complement), then record_formula for its conversion."))
+
     # 6. bytes of a part's recorded layouts that the code assembles into numbers (shifts them into place) feed a
     # conversion: without a formula recorded for that part, nothing checks it (the code could scale, offset or
     # compensate the values any way and still pass)
@@ -2173,9 +2406,10 @@ def coverage_findings(project_dir: Path, ledger: Optional[FactLedger], model: Fl
     book = RegisterBook(project_dir)
     if book.empty():
         return []
-    devices = {r.device.lower() for r in book.registers.values()}
-    if devices and devices <= {r.device.lower() for r in book.registers.values() if _wide(r)}:
-        return []   # parts with registers wider than a byte: check_registers reports REGISTER_WIDTH_UNSUPPORTED once
+    model.words = bus_words(book, ledger)
+    _bad, skip = _without_unmodelled(book)   # check_registers reports REGISTER_WIDTH_UNRECORDED for those parts
+    if book.empty():
+        return []
     out, seen = [], set()
     known = book.known_addresses() | {a for b in book.bursts.values() for a in range(b.start, b.end + 1)}
     per_dev: Dict[str, set] = {}   # a register of one part does not map the same address on another part

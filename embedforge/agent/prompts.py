@@ -97,7 +97,9 @@ hardware problem you debug it and ship a patched build.
 5. REGISTERS (every device with registers), before its driver: `record_registers` for each register the driver
    writes, polls or tests, with its fields (bit positions, named values) quoted from the register table, and `bursts`
    for registers that must be read in one transaction. Compose written values from those fields (mode bits 5..4 = 11
-   is 0x30, not 0x03).
+   is 0x30, not 0x03). Registers wider than a byte (the memory map gives 4-hex-digit values such as 8000h; TI parts):
+   width '16', fields up to bit 15, and once per part `byte_order_quote`, the sentence that says which byte goes first
+   on the bus. A 16-bit measurement register also needs `record_layouts` (bytes ['0x00'], signed as described).
 6. `coding_brief()` before you write code and before you fix verify findings: it compiles the user's request, the
    wiring, register map, sequences, rules, readout, conversions and the datasheet's requirements into one list of
    what the code must do. Settle each datasheet requirement verify reports as REQUIREMENT_OPEN: record it, or
