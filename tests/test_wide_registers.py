@@ -27,6 +27,7 @@ BIT FIELD TYPE RESET DESCRIPTION
 6:5 AVG[1:0] R/W 01 Conversion averaging modes.
 Temperature: T = Temp_Result * 0.0078125
 One LSB equals 7.8125 m°C. One count is 7.8125 degrees.
+Table 7-1. 16-Bit Temperature Data Format TEMPERATURE (°C) TEMPERATURE REGISTER VALUE (0.0078125 °C RESOLUTION)
 Start-up: wait 2 ms after power-up, then write the configuration register.
 """
 
@@ -254,6 +255,53 @@ def test_candidate_quotes_find_ti_field_tables():
     assert first.startswith("Table 7-6.") and "6:5 AVG" in first and "Conversion Cycle Time" not in first, first
     assert "0Fh R 0117h Device_ID" in table_passages(text, ["Device_ID", "0x0F"], want_bits=False)[0]
     assert not any(p.startswith("0h") for p in table_passages(text, ["0x00"], want_bits=False))
+
+
+def test_a_value_the_quote_names_in_words_can_be_bound(tmp_path):
+    """TMP117 fix-up run: TI names the raw value 'TEMPERATURE REGISTER VALUE'; spaces were a syntax error and other
+    spellings 'not in the quote', so the model took the formula from a hobbyist library instead."""
+    p, store, ledger, src = _setup(tmp_path, code())
+    book = RegisterBook(p.root)
+    q = "TEMPERATURE REGISTER VALUE (0.0078125 °C RESOLUTION)"
+    spaced = book.record_formula(store, "TMPX", src.id, "T_A", ["T_A = TEMPERATURE REGISTER VALUE * 0.0078125"], q,
+                                 inputs={"TEMPERATURE REGISTER VALUE": "Temp_Result"})
+    assert spaced["ok"], spaced
+    joined = book.record_formula(store, "TMPX", src.id, "T_B", ["T_B = TEMPERATURE_REGISTER_VALUE * 0.0078125"], q,
+                                 inputs={"TEMPERATURE_REGISTER_VALUE": "Temp_Result"})
+    assert joined["ok"], joined
+    assert "TEMPERATURE_VALUE" in book.record_formula(store, "TMPX", src.id, "T_C", ["T_C = TEMPERATURE_VALUE * 0.0078125"], q,
+                                                     inputs={"TEMPERATURE_VALUE": "Temp_Result"})["error"]
+
+
+def test_a_formula_from_an_unofficial_source_is_refused_while_the_datasheet_is_on_record(tmp_path):
+    from embedforge.truth.registers import FormulaDef
+    p, store, ledger, src = _setup(tmp_path, code())
+    lib = store.add("https://raw.githubusercontent.com/someone/TMPX_lib/master/TMPX.h", "lib",
+                    "#define TMPX_RESOLUTION 0.0078125f ///< Scalar to convert from LSB value to degrees C", kind="web")
+    assert lib.tier == "UNOFFICIAL"
+    book = RegisterBook(p.root)
+    r = book.record_formula(store, "TMPX", lib.id, "T_L", ["T_L = LSB * 0.0078125"],
+                            "#define TMPX_RESOLUTION 0.0078125f ///< Scalar to convert from LSB value to degrees C",
+                            inputs={"LSB": "Temp_Result"})
+    assert not r["ok"] and "UNOFFICIAL" in r["error"] and src.id in r["error"], r
+    # one recorded that way before the rule fails verify until it is recorded again from the datasheet
+    book.formulas["FRM-009"] = FormulaDef("FRM-009", "TMPX", "T_L", [["T_L", "Temp_Result * 0.0078125"]], lib.id, "x")
+    book._save()
+    summary, codes, found = _codes(p, ledger)
+    assert "FORMULA_SOURCE_UNOFFICIAL" in codes, [(f.code, f.message) for f in found]
+
+
+def test_an_id_register_covered_by_a_layout_still_reads_its_id_in_the_probe(tmp_path):
+    """TMP117 fix-up run: a layout on DEVICE_ID gave the probe a random ID, the driver stopped at its ID check, and the
+    temperature formula was never compared with the code (FORMULA_UNOBSERVED)."""
+    p, store, ledger, src = _setup(tmp_path, code())
+    book = RegisterBook(p.root)
+    r = book.record_layouts(store, "TMPX", src.id, [{"name": "Device_ID", "bytes": ["0x0F"], "signed": False,
+                                                     "quote": "0Fh R 0117h Device_ID Device ID register"}])
+    assert r["ok"], r
+    summary, codes, found = _codes(p, ledger)
+    assert codes == [] and not any(f.code == "FORMULA_UNOBSERVED" for f in found), [(f.code, f.message) for f in found]
+    assert any("matches the code" in s for s in summary["formulas"]), summary["formulas"]
 
 
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):

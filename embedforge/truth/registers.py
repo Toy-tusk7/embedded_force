@@ -602,6 +602,18 @@ _PREFIXED_UNIT = re.compile(r"(\d+(?:\.\d+)?)\s*([kmμun])\s*(?:°\s*[CF]|(?:s|V
 _PER_COUNT = re.compile(r"\b(?:one|1|each)\s+(LSB|count|code|digit|step)\b[^.]{0,25}?(?:equals|=|is|corresponds to|represents)\s*[-+]?\d", re.I)
 
 
+_OFFICIAL_TIERS = ("OFFICIAL_MANUFACTURER", "OFFICIAL_REPO")
+
+
+def official_instead(store: SourceStore, source_id: str) -> List[str]:
+    """The manufacturer's documents on record when `source_id` is an UNOFFICIAL one (the TMP117 fix-up took its
+    temperature conversion from Adafruit's library header while TI's datasheet was stored): their ids, else []."""
+    src = store.get(source_id)
+    if src is None or src.tier != "UNOFFICIAL":
+        return []
+    return sorted(s.id for s in store.sources.values() if s.tier in _OFFICIAL_TIERS)
+
+
 def _prefix_factors(quote: str) -> set:
     """Unit conversions the quote itself implies: TI's 'One LSB equals 7.8125 m°C' makes / 1000 (to °C) part of the
     formula, and 0.0078125 (the same number in °C) a constant of it; '5 µs' gives 1e6, 1e-6 and 5e-6. Only prefixes
@@ -1613,6 +1625,15 @@ class RegisterBook:
         if isinstance(steps, str):
             steps = [s for s in re.split(r";\s*|\n", steps) if s.strip()]
         steps = [s for s in steps if not re.match(r"\s*return\b", str(s))] if isinstance(steps, list) else steps
+        if isinstance(inputs, dict) and isinstance(steps, list):
+            # a quote that names the value in words (TI: 'TEMPERATURE REGISTER VALUE (0.0078125 °C RESOLUTION)'): the
+            # words joined by _ are its name in the steps
+            inputs = dict(inputs)
+            for k in [k for k in inputs if re.search(r"\s", str(k).strip())]:
+                joined = re.sub(r"\s+", "_", str(k).strip())
+                words = r"\s+".join(re.escape(w) for w in str(k).split())
+                steps = [re.sub(rf"(?<![\w>.]){words}(?!\w)", joined, str(s), flags=re.I) for s in steps]
+                inputs[joined] = inputs.pop(k)
         orig_steps = list(steps) if isinstance(steps, list) else []
         problem = self._binding_problem(store, device, inputs if isinstance(inputs, dict) else {})
         if problem:
@@ -1634,6 +1655,12 @@ class RegisterBook:
         err = _quote_ok(store, source_id, quote, f"formula {name}")
         if err:
             return {"ok": False, "error": err}
+        official = official_instead(store, source_id)
+        if official:
+            src = store.get(source_id)
+            return {"ok": False, "error": f"{source_id} is an UNOFFICIAL source ({src.url if src else ''}). A conversion verify checks "
+                                          "the code against must come from the manufacturer: quote its formula, resolution or "
+                                          f"LSB statement from {', '.join(official[:4])} (or its reference code: find_reference_code)."}
         known = {l.name.lower() for l in self.layouts.values() if l.device.lower() == device.lower()}
         known |= {f.name.lower() for f in self.formulas.values() if f.device.lower() == device.lower() and f.name.lower() != name.lower()}
         parsed: List[List[str]] = []
@@ -1749,6 +1776,9 @@ class RegisterBook:
                     continue
                 if _name_spans(qn, n) or (n.lower() in bound and _name_spans(qn, n)):
                     continue
+                words = [w for w in n.split("_") if w]
+                if len(words) > 1 and re.search(r"(?<![A-Za-z0-9])" + r"[\s_]+".join(map(re.escape, words)) + r"(?![A-Za-z0-9])", q, re.I):
+                    continue   # TEMPERATURE_REGISTER_VALUE: the quote's 'TEMPERATURE REGISTER VALUE'
                 tag = re.search(r"([a-z])(\d+)$", _alnum(n))
                 if garbled and tag and tag.groups() in tags:
                     continue   # PDF math glyphs: only the index (T1, P11) of a name survives
@@ -1862,9 +1892,6 @@ def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int
     compares them with), status flags 'ready', error flags clear."""
     rnd = random.Random(seed)
     vec: Dict[int, int] = {}   # register -> its value (16 bits for a 16-bit register: the walk splits it into bytes)
-    for r in book.registers.values():
-        if r.id_value is None and re.search(r"id|who_?am_?i", r.name, re.I) and (expects or {}).get(r.addr) is not None:
-            vec[r.addr] = expects[r.addr] & r.full
     for l in book.layouts.values():
         for p in l.parts:
             reg = book.register_at(p.addr, l.device)
@@ -1873,11 +1900,15 @@ def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int
         top = l.parts[-1]
         bit = 1 << top.hi
         vec[top.addr] = (vec[top.addr] | bit) if seed == 1 else (vec[top.addr] & ~bit)
+    # an ID register reads its ID even when a layout covers it (the TMP117 fix-up recorded one for DEVICE_ID): a random
+    # ID made the driver give up after its ID check, so the temperature conversion was never reached
     for r in book.registers.values():
-        if r.addr in vec:
-            continue
         if r.id_value is not None:
             vec[r.addr] = r.id_value & r.full
+        elif re.search(r"id|who_?am_?i", r.name, re.I) and (expects or {}).get(r.addr) is not None:
+            vec[r.addr] = expects[r.addr] & r.full
+    for r in book.registers.values():
+        if r.addr in vec:
             continue
         v = 0
         for f in r.fields:
@@ -2315,7 +2346,18 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                                            "are not on record, so it could not be checked.",
                                            "record_registers with reset (and reset_quote: the memory map row) for those registers."))
 
-    # 5. formulas: probe runs with concrete register bytes
+    # 5. formulas: probe runs with concrete register bytes. A formula quoted from an unofficial source while the
+    # manufacturer's documents are on record (recorded before record_formula refused it) is not ground truth
+    store = SourceStore(Path(project_dir))
+    for f in book.formulas.values():
+        official = official_instead(store, f.source_id)
+        if official:
+            src = store.get(f.source_id)
+            findings.append(RegFinding("ERROR", "FORMULA_SOURCE_UNOFFICIAL", "", 0,
+                                       f"{f.id} {f.name} is quoted from {f.source_id}, an UNOFFICIAL source ({src.url if src else ''}), "
+                                       f"while the manufacturer's documents ({', '.join(official[:4])}) are on record.",
+                                       f"record_formula again under the same name ({f.name}), quoting the manufacturer's formula, "
+                                       "resolution or LSB statement."))
     if book.formulas:
         results: Dict[str, List[Optional[str]]] = {f.id: [] for f in book.formulas.values()}   # by id: names repeat across parts
         derived = register_derived(book)
