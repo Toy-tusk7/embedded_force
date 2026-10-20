@@ -1867,11 +1867,11 @@ def where(model: FlowModel, e: Any) -> Tuple[str, int]:
 
 
 def _device_addrs(ledger: Optional[FactLedger], device: str) -> set:
-    from embedforge.truth.verifier import _ADDR_PROP_RE
+    from embedforge.truth.verifier import address_value
     out = set()
     for f in (ledger.facts.values() if ledger is not None else []):
-        n = parse_int(str(f.value))
-        if n is not None and 0 < n < 0x400 and f.subject.lower() == device.lower() and _ADDR_PROP_RE.search(f.property):
+        n = address_value(f)
+        if n is not None and f.subject.lower() == device.lower():
             out.add(n)
     return out
 
@@ -1900,6 +1900,11 @@ def _probe_vector(book: RegisterBook, seed: int, expects: Optional[Dict[int, int
         top = l.parts[-1]
         bit = 1 << top.hi
         vec[top.addr] = (vec[top.addr] | bit) if seed == 1 else (vec[top.addr] & ~bit)
+        if seed == 1:   # and every byte's top bit: a byte buffer declared signed (int8_t) sign-extends only such bytes
+            for p in l.parts:
+                for b in range(7, p.hi + 1, 8):   # bit 7, 15, ...: the top bit of each byte of the register
+                    if b >= p.lo:
+                        vec[p.addr] |= 1 << b
     # an ID register reads its ID even when a layout covers it (the TMP117 fix-up recorded one for DEVICE_ID): a random
     # ID made the driver give up after its ID check, so the temperature conversion was never reached
     for r in book.registers.values():
@@ -2367,6 +2372,8 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
         detail: Dict[str, str] = {}
         loc: Dict[str, Tuple[str, int]] = {}
         read_regs: set = set()
+        sym_read = {model.byte_slot(e.addr, e.reg, k)[0] for _, w in walkers for e in w.events if e.kind == "read" and is_int(e.reg)
+                    and mine(e.addr) for k in range(e.length if is_int(e.length) and 0 < e.length <= 512 else 1)}
         # values the code compares registers with (an ID); one byte of a wide register is not its value
         expects = {rx.reg: c for _, w in walkers for rx, c, _f, _l in w.obs_compares if rx.width <= 8 or isinstance(rx, RxWord)}
         for seed in (1, 2):
@@ -2418,6 +2425,16 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
                 continue
             if all(r for r in res if r is not None) and any(res):
                 summary["formulas"].append(f"{f.id} {f.name}: matches the code at {res[0]}")
+            elif not deps_read and inputs & sym_read:
+                # read when nothing is known about the part, never when it answers as the datasheet says: the code gives
+                # up on a healthy part (an inverted ID check, a status test that fails on success)
+                summary["formulas"].append(f"{f.id} {f.name}: not reached on a healthy part")
+                findings.append(RegFinding("ERROR", "MEASUREMENT_UNREACHED", "", 0,
+                                           f"{f.id} {f.name}: the code reads its registers ({', '.join(_hex(a) for a in sorted(inputs & sym_read))}) "
+                                           "only when nothing is known about the part; when the part answers as the datasheet says "
+                                           "(its ID, ready flags set, every transfer succeeding) the code stops before measuring.",
+                                           "Check the conditions on the way to the measurement: the ID comparison, status and "
+                                           "transfer checks, and early returns, against what the datasheet says the part returns."))
             elif not deps_read:
                 summary["formulas"].append(f"{f.id} {f.name}: not observed (its registers are never read from {', '.join(summary['entries'])})")
                 findings.append(RegFinding("WARNING", "FORMULA_UNOBSERVED", "", 0,

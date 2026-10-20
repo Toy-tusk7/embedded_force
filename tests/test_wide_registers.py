@@ -304,6 +304,38 @@ def test_an_id_register_covered_by_a_layout_still_reads_its_id_in_the_probe(tmp_
     assert any("matches the code" in s for s in summary["formulas"]), summary["formulas"]
 
 
+def test_a_binary_7_bit_address_fact_is_an_address():
+    """TI prints addresses in binary ('1001000x'); the TMP117 run recorded '1001000', read as the decimal 1001000, so
+    no check found the device by its address (and no init sequence was asked for)."""
+    from types import SimpleNamespace
+    from embedforge.truth.verifier import address_value
+    assert address_value(SimpleNamespace(property="i2c_address_7bit", value="1001000")) == 0x48
+    assert address_value(SimpleNamespace(property="i2c_address", value="0x48")) == 0x48
+    assert address_value(SimpleNamespace(property="startup_time", value="1001000")) is None
+
+
+def test_a_driver_that_gives_up_on_a_healthy_part_is_caught(tmp_path):
+    """Mutation survivor on the TMP117 driver: the ID check inverted. Read with nothing known, the code measures; with
+    the part answering its datasheet ID it stops before measuring."""
+    gated = {": _address(address) {}": ": _address(address), _ok(false) {}", "uint8_t _address;": "uint8_t _address;\n    bool _ok;",
+             "return wr(REG_CONFIG, 0x0220);": "_ok = wr(REG_CONFIG, 0x0220);\n    return _ok;",
+             "    uint16_t cfg = 0;": "    if (!_ok) return false;\n    uint16_t cfg = 0;"}
+    p, store, ledger, src = _setup(tmp_path, code(**gated))   # reads only after a successful begin(), as the TMP117 driver
+    summary, codes, found = _codes(p, ledger)
+    assert codes == [], [(f.code, f.message) for f in found]
+    p, store, ledger, src = _setup(tmp_path / "m", code(**gated, **{"id != ID": "id == ID"}))
+    summary, codes, found = _codes(p, ledger)
+    assert "MEASUREMENT_UNREACHED" in codes, [(f.code, f.message) for f in found]
+
+
+def test_a_byte_buffer_declared_signed_is_caught(tmp_path):
+    """Mutation survivor on the TMP117 driver: uint8_t buffer[2] made int8_t. A low byte >= 0x80 sign-extends over the
+    high byte; the probe now sets every byte's top bit in its first input so that shows."""
+    p, store, ledger, src = _setup(tmp_path, code(**{"uint8_t b[2];": "int8_t b[2];"}))
+    summary, codes, found = _codes(p, ledger)
+    assert "FORMULA_MISMATCH" in codes, [(f.code, f.message) for f in found]
+
+
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):
     p, store, ledger, src = _setup(tmp_path, code().replace("0x0220)", "0x0A21)"))   # MOD=10, bit 0 reserved
     summary, codes, found = _codes(p, ledger)

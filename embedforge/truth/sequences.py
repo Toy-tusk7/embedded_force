@@ -460,7 +460,9 @@ def check_sequence(seq: SequenceRecord, trace: Trace, ledger: FactLedger, book: 
     res = FlowResult(seq.id, seq.subject, seq.name, seq.entry, trace.found, notes=list(trace.notes))
     if not trace.found:
         return res
-    dev = _fact_int(ledger, seq.device) if seq.device else None
+    from embedforge.truth.verifier import address_value
+    dev_fact = ledger.get(seq.device) if seq.device and seq.device.upper().startswith("FACT-") else None
+    dev = (address_value(dev_fact) if dev_fact is not None else None) or (_fact_int(ledger, seq.device) if seq.device else None)
     events = [e for e in trace.events if e.kind == "delay" or dev is None or not is_int(e.addr) or e.addr == dev]
     res.trace = [f"{e.file}:{e.entry_line} {e.describe()}" + ("" if e.guaranteed else " (conditional)") for e in events]
     events = _one_register_each(events, _mapped(book, seq.subject))

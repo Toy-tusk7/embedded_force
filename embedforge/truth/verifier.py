@@ -478,8 +478,8 @@ def _configured_devices(project_dir: Path, ledger: FactLedger, report: VerifyRep
     subjects = set()
     addr_subject = {}
     for f in ledger.facts.values():
-        n = parse_int(str(f.value))
-        if n is not None and 0 < n < 0x400 and _ADDR_PROP_RE.search(f.property):
+        n = address_value(f)
+        if n is not None:
             addr_subject.setdefault(n, f.subject)
     if not addr_subject:
         return subjects
@@ -490,6 +490,17 @@ def _configured_devices(project_dir: Path, ledger: FactLedger, report: VerifyRep
 
 
 _ADDR_PROP_RE = re.compile(r"(^|_)(i2c|spi|bus|slave|device|dev)?_?addr(ess)?($|_)", re.I)
+
+
+def address_value(fact: Any) -> Optional[int]:
+    """The bus address an address fact gives, else None. TI prints 7-bit addresses in binary ('1001000x' in the TMP117's
+    address table): seven binary digits are read as binary, not as the decimal 1001000 (which hid the TMP117's address
+    from every check that finds a device by it)."""
+    if not _ADDR_PROP_RE.search(str(getattr(fact, "property", ""))):
+        return None
+    v = str(getattr(fact, "value", "")).strip()
+    n = int(v, 2) if re.fullmatch(r"[01]{7}", v) else parse_int(v)
+    return n if n is not None and 0 < n < 0x400 else None
 _ENTRY_RE = re.compile(r"(init|begin|setup|start|config|probe|reset)", re.I)
 
 
@@ -515,8 +526,8 @@ def _check_flows(project_dir: Path, ledger: FactLedger, report: VerifyReport) ->
     covered = {r.subject.lower() for r in sequences}
     addr_facts = {}
     for f in ledger.facts.values():
-        n = parse_int(str(f.value))
-        if n is not None and 0 < n < 0x400 and _ADDR_PROP_RE.search(f.property):
+        n = address_value(f)
+        if n is not None:
             addr_facts.setdefault(n, f)
     entries = [name for name in model.functions if "::" not in name and (_ENTRY_RE.search(name) or name in ("main", "setup", "app_main"))]
     reported, opaque_seen = set(), set()
