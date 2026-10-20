@@ -1099,13 +1099,17 @@ class FlowModel:
         return None
 
     def trace(self, entry: str, args: Optional[List[Any]] = None, assume: Optional[Dict[str, Any]] = None,
-              context: Optional[Tuple[List[Any], Dict[str, Any], Dict[Tuple[str, str], Any], Any]] = None) -> "Trace":
+              context: Optional[Tuple[List[Any], Dict[str, Any], Dict[Tuple[str, str], Any], Any]] = None,
+              probe: Optional[Dict[int, int]] = None, spi_dummy: int = 0) -> "Trace":
         """Walk `entry`. `assume` fixes what the caller would provide: {'dev.intf': 1} sets a field of a parameter,
-        {'addr': 0x76} a parameter's value. `context` (from caller_context) is what the program's own call passes."""
+        {'addr': 0x76} a parameter's value. `context` (from caller_context) is what the program's own call passes.
+        `probe`: the register values a healthy part returns (see run), so the code's checks on them are decided."""
         fn = self.function(entry)
         if fn is None:
             return Trace(entry, [], [f"function '{entry}' not found in the project sources"], found=False)
         w = Walker(self)
+        w.probe = probe
+        w.spi_dummy = spi_dummy
         for obj_name, (cls, ctor_args) in self.global_objects.items():   # global constructors run before main/setup
             w.construct(obj_name, cls, ctor_args)
         this = None

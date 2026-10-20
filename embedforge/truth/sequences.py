@@ -589,6 +589,7 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
     model.words = bus_words(regs, ledger)   # 16-bit registers: a write's two bytes are one value
     results, findings = [], []
     entries = None
+    healthy: Optional[Dict[int, int]] = None
     for seq in book.items.values():
         fn = model.function(seq.entry)
         if entries is None:
@@ -617,7 +618,45 @@ def check_flows(project_dir: Path, ledger: FactLedger, model: Optional[FlowModel
             findings.append(("ERROR" if s.status in _ERROR else "WARNING", code, s.file or where, s.line or (fn.line if fn else 0),
                              f"{seq.id} {seq.subject}.{seq.name} step {s.step}: {s.detail}",
                              _hint(s.status)))
+        # the same sequence on a part that answers as the datasheet says (its ID, ready flags set, every transfer
+        # succeeding): a step the code takes when nothing is known but never on a healthy part means it gives up first.
+        # The TMP117 cold re-run's mutation survivor: an inverted ID check skipped the configuration write
+        if healthy is None:
+            healthy = _healthy_values(model, regs, entries)
+        if healthy and any(s.status in ("matched", "conditional") and s.op != "delay_min" for s in r.steps):
+            ctx = model.caller_context(seq.entry, entries)
+            reached = [False] * len(r.steps)
+            for dummy in (0, 1):   # SPI parts differ in whether a read returns a dummy byte first (verify tries both)
+                pr = check_sequence(seq, model.trace(seq.entry, context=ctx, probe=healthy, spi_dummy=dummy), ledger, regs)
+                reached = [a or (k < len(pr.steps) and pr.steps[k].status != "missing") for k, a in enumerate(reached)]
+            for s, ok in zip(r.steps, reached):
+                if not ok and s.op != "delay_min" and s.status in ("matched", "conditional"):
+                    findings.append(("ERROR", "SEQUENCE_UNREACHED", s.file or where, s.line or (fn.line if fn else 0),
+                                     f"{seq.id} {seq.subject}.{seq.name} step {s.step} ({s.detail.split(' — ')[0]}) happens when "
+                                     "nothing is known about the part, but not when the part answers as the datasheet says "
+                                     "(its ID, ready flags set, every transfer succeeding): on a healthy part the code stops "
+                                     "before it.",
+                                     "Check the conditions on the way to this step: the ID comparison, status and transfer "
+                                     "checks, and early returns, against what the datasheet says the part returns."))
+                    break   # the first unreached step says it; the ones after it follow from it
     return results, findings
+
+
+def _healthy_values(model: FlowModel, regs: Any, entries: Any) -> Dict[int, int]:
+    """Register values of a part that answers as its datasheet says (registers.probe vector, input 2: plausible data),
+    with ID registers at the ID on record or the one the code compares with. {} without a register map."""
+    from embedforge.truth.flow import RxWord
+    from embedforge.truth.registers import _probe_vector
+    if regs is None or not regs.registers:
+        return {}
+    expects: Dict[int, int] = {}
+    for e in entries or []:
+        try:
+            w = model.run(e)
+        except RecursionError:
+            continue
+        expects.update({rx.reg: c for rx, c, _f, _l in w.obs_compares if rx.width <= 8 or isinstance(rx, RxWord)})
+    return _probe_vector(regs, 2, expects)
 
 
 def _hint(status: str) -> str:

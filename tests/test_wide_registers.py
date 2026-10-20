@@ -353,6 +353,22 @@ def test_field_names_with_a_slash_and_register_ids_in_sequences(tmp_path):
     assert r["ok"], r
 
 
+def test_an_init_step_skipped_on_a_healthy_part_is_caught(tmp_path):
+    """TMP117 cold re-run mutation survivor: an inverted ID check made begin() skip the configuration write on a part
+    that answers its datasheet ID; the reads did not depend on begin(), so no measurement was lost. The sequence is now
+    also checked on a healthy part."""
+    def seq_errors(src_code, sub):
+        p, store, ledger, src = _setup(tmp_path / sub, src_code)
+        t = ledger.record("TMPX", "startup_time", "2", src.id, "wait 2 ms after power-up", "ms")["fact"]["id"]
+        assert SequenceBook(p.root).record(ledger, "TMPX", "init", "TMPX::begin", [
+            {"op": "delay_min", "value": t}, {"op": "write", "reg": "0x01", "fields": {"MOD": "continuous", "CONV": "4", "AVG": "1"}}],
+            src.id, "Start-up: wait 2 ms after power-up, then write the configuration register.")["ok"]
+        flows, found = check_flows(p.root, ledger, FlowModel.from_dir(p.root))
+        return {c for sev, c, *_ in found if sev == "ERROR"}
+    assert seq_errors(code(), "ok") == set()
+    assert "SEQUENCE_UNREACHED" in seq_errors(code(**{"id != ID": "id == ID"}), "inverted")
+
+
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):
     p, store, ledger, src = _setup(tmp_path, code().replace("0x0220)", "0x0A21)"))   # MOD=10, bit 0 reserved
     summary, codes, found = _codes(p, ledger)

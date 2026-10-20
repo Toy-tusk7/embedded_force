@@ -183,12 +183,14 @@ gaps above, and two more checks: a wrong device ID or an object never set up, re
 
 Every record is quoted from TI's datasheet: all 11 configuration fields, the reset values, the ID 0x0117, the signed
 temperature layout, the conversion from "One LSB equals 7.8125 m°C." (matches the code on probe input) and two
-sequences (1.5 ms power-up; soft reset, 2 ms, ID read, then 0x0220), both matched. Mutation test: 19 of 24 caught. Of
-the five survivors, two flip TI's unused bit 0 (a reserved-bit warning), one is a null check of a pointer that is
-never null, one deletes a power-up wait that a later 2 ms reset wait still covers, and one is a real gap: an inverted
-ID check makes begin() skip the configuration on a healthy part, and in this driver the reads do not depend on
-begin() succeeding, so no measurement is lost and nothing flags it. (One cold run each, not a controlled comparison;
-the harness changed between them as described above.)
+sequences (1.5 ms power-up; soft reset, 2 ms, ID read, then 0x0220), both matched. Mutation test: 20 of 24 caught.
+The first test (19 of 24) found one real gap: an inverted ID check made begin() skip the configuration on a healthy
+part, and in this driver the reads do not depend on begin(), so no measurement was lost. Each recorded sequence is now
+also walked on a part that answers as its datasheet says (its ID, ready flags, transfers succeeding), and a step that
+is reached only when nothing is known about the part is an error (`SEQUENCE_UNREACHED`). The four survivors: two flip
+TI's unused bit 0 (a reserved-bit warning), one is a null check of a pointer that is never null, one deletes a
+power-up wait that a later 2 ms reset wait still covers. (One cold run each, not a controlled comparison; the harness
+changed between them as described above.)
 
 ## NVIDIA Nemotron on Nebius Token Factory
 
