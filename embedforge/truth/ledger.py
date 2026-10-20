@@ -39,18 +39,20 @@ MATH_FOLD = {cp: c for cp, c in _MATH.items() if 0x1D400 <= cp < 0x1D800}
 def _squash(s: str) -> str:
     """Whitespace-free, case-folded form used for robust verbatim-quote containment."""
     s = s.replace("\u00ad", "").replace("\ufb01", "fi").replace("\ufb02", "fl").replace("\u00b5", "\u03bc")   # micro sign = Greek mu
+    s = s.replace("\u00d7", "x")   # the BMP388's tables print '\u00d78 \u00d71'; models type 'x8 x1' (12 rejected quotes)
     s = s.translate(_DASHES).translate(_QUOTES).translate(_SCRIPT_DIGITS).translate(_MATH)
     # Markdown table/emphasis markup from the PDF converter ('| Bit 5..4 | mode |', '**Table 40**', '<br>') is layout,
     # not text: a quote matches with or without it
     s = re.sub(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]", " ", s)   # 2<sup>osr_p</sup> = 2^osr_p
-    # quote marks carry no meaning and PDFs use curly ones the model often drops: Register 0x1B “PWR_CTRL”
+    # quote marks carry no meaning and PDFs use curly ones the model often drops: Register 0x1B “PWR_CTRL”; nor do
+    # backslashes (escaping left in a quote, '\"CONFIG\"'; a C macro's line continuation '#define X \' in a header)
     # (final sigma: 'ΔΣ'.lower() is 'δς' but 'Σ'.lower() is 'σ' — one form, so a text squashes the same in pieces)
-    return re.sub(r"[\s\"'`´]+", "", s).lower().replace("ς", "σ")
+    return re.sub(r"[\s\"'`´\\]+", "", s).lower().replace("ς", "σ")
 
 
 _MARKUP = re.compile(r"</?(?:mark|u|sup|sub|b|i|em|strong)>|<br\s*/?>|\*\*|[|`^]")
-_DROP = re.compile(r"[\s\"'`´]")
-_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", **_DASHES, **_QUOTES, **_SCRIPT_DIGITS, **_MATH}
+_DROP = re.compile(r"[\s\"'`´\\]")
+_PRE = {ord("­"): "", ord("ﬁ"): "fi", ord("ﬂ"): "fl", ord("µ"): "μ", ord("×"): "x", **_DASHES, **_QUOTES, **_SCRIPT_DIGITS, **_MATH}
 
 
 def _squash_map(s: str) -> Tuple[str, List[int]]:
@@ -286,6 +288,8 @@ def value_variants(value: str) -> List[Tuple[str, str, str]]:
         # TI writes register addresses and values as 0Fh / 00h / 0117h (Bosch writes 0x0F): leading zeros allowed
         out.append(("hex-suffix", rf"(?<![0-9a-z])0*{h}h(?![0-9a-z])", "STRICT"))
         out.append(("hex-quoted", rf"h'0*{h}'", "STRICT"))
+        if 0 < n < 0x80:   # a 7-bit I2C address as TI's tables print it: the address bits, then x for the R/W bit
+            out.append(("address-bits", rf"(?<![0-9a-z]){format(n, '07b')}x(?![0-9a-z])", "STRICT"))   # 1001000x = 0x48
         out.append(("hex-bare", rf"(?<![0-9a-z.]){h.zfill(2)}(?![0-9a-z.])", "LOOSE"))
         out.append(("decimal", rf"(?<![0-9a-z.]){n}(?![0-9a-z.])", "LOOSE"))
         if n > 0:

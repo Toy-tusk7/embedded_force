@@ -270,8 +270,9 @@ TOOL_SPECS: List[Dict[str, Any]] = [
         "Betaflight project the board config betaflight/configs/CUST/<BOARD>/config.h. Build scripts (*.py, *.mk, "
         "extra_scripts, library.json) are not allowed. For a Betaflight config the result lists the pin defines and lint problems.",
         {"path": S, "content": S}, ["path", "content"]),
-    _fn("replace_in_file", "Replace an exact text snippet in a project file (must match exactly once).",
-        {"path": S, "old": S, "new": S}, ["path", "old", "new"]),
+    _fn("replace_in_file", "Replace an exact text snippet in a project file (must match exactly once; when it occurs more "
+        "than once, `line` = the line number where the one to replace starts).",
+        {"path": S, "old": S, "new": S, "line": {"type": "integer"}}, ["path", "old", "new"]),
     _fn("rename_file", "Rename a project source file, e.g. src/driver.c -> src/driver.cpp (Arduino's Wire/Serial/SPI are C++).",
         {"path": S, "new_path": S}, ["path", "new_path"]),
     _fn("read_file", "Read a project file as numbered lines (long files come in windows; pass start/end for more).",
@@ -2004,11 +2005,15 @@ class ToolBelt:
         self.session.emit("file", path=res["path"], content=text)
         return {"ok": True, "renamed": f"{path} -> {dst_rel}", "next": "build"}
 
-    def replace_in_file(self, path: str, old: str, new: str) -> Dict[str, Any]:
+    def replace_in_file(self, path: str, old: str, new: str, line: Optional[int] = None) -> Dict[str, Any]:
         if old == new:
             return {"error": "'old' and 'new' are identical, so nothing would change. Write the corrected text in 'new'."}
         text = self.project.read_file(path)
         n = text.count(old)
+        starts = [text.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old), text)] if n > 1 else []
+        if n > 1 and isinstance(line, int) and line in starts:   # the occurrence the model means, by its first line
+            at = [m.start() for m in re.finditer(re.escape(old), text)][starts.index(line)]
+            text, old, n = text[:at] + "\x00EF\x00" + text[at + len(old):], "\x00EF\x00", 1   # replaced below
         loose = _replace_ignoring_indent(text, old, new) if n == 0 else None
         if loose is not None:
             problem = check_agent_write(path, loose)
@@ -2020,10 +2025,23 @@ class ToolBelt:
                                    "'new' was indented like the lines it replaced", **self._config_feedback(path, loose)}
         if n != 1:
             hint = ""
+            if n > 1:
+                hint = f" It starts at lines {', '.join(map(str, starts[:8]))}: pass line=<one of them> to replace that one."
             if n == 0:  # show where the text probably is, so the model can retry without re-reading the whole file
                 first = next((ln for ln in old.splitlines() if ln.strip()), "").strip()
-                hits = [f"{i}: {ln}" for i, ln in enumerate(text.splitlines(), 1) if first and first[:40] in ln][:3]
-                hint = (" Lines containing its first line: " + " | ".join(hits)) if hits else " Read the lines with read_file(path, start=…) first."
+                lines = text.splitlines()
+                hits = [i for i, ln in enumerate(lines, 1) if first and first[:40] in ln][:3]
+                hint = (" Lines containing its first line: " + " | ".join(f"{i}: {lines[i - 1]}" for i in hits)) if hits else \
+                    " Read the lines with read_file(path, start=…) first."
+                if len(hits) == 1:   # where 'old' departs from the file there, and the file's own lines to copy from
+                    want = [ln.strip() for ln in old.splitlines() if ln.strip()]
+                    have = [(i, ln) for i, ln in enumerate(lines[hits[0] - 1:], hits[0]) if ln.strip()][:len(want) + 2]
+                    diff = next((k for k, (w, (_i, h)) in enumerate(zip(want, have)) if w != h.strip()), None)
+                    if diff is not None:
+                        i, h = have[diff]
+                        span = "\n".join(f"{j}: {lines[j - 1]}" for j in range(hits[0], min(len(lines), have[-1][0]) + 1))
+                        hint += (f". It differs at line {i}: the file has {h.strip()!r} where 'old' has {want[diff]!r}. "
+                                 f"The file there (copy 'old' from it, without the 'N: ' prefixes):\n{span}")
             return {"error": f"'old' text must match exactly once; found {n} occurrences.{hint}"}
         updated = text.replace(old, new)
         problem = check_agent_write(path, updated)

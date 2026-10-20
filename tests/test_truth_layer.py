@@ -98,6 +98,22 @@ def test_ti_hex_notation(tmp_path):
         assert value_in_text(v, t) == ("hex-suffix", "STRICT"), (v, t)
     assert value_in_text("0x0F", "register 10Fh") is None and value_in_text("0x01", "Configuration 10h") is None
     assert parse_int("0Fh") == 15 and parse_int("0117h") == 0x117 and parse_int("00h") == 0
+    # a 7-bit address as TI's address table prints it: the bits, then x for the R/W bit (the TMP117 run's 0x48 was
+    # refused three times against '1001000x Ground', so it recorded '1001000', which then read as decimal)
+    assert value_in_text("0x48", "ADD0 PIN CONNECTION 1001000x Ground") == ("address-bits", "STRICT")
+    assert value_in_text("0x49", "ADD0 PIN CONNECTION 1001000x Ground") is None
+
+
+def test_quotes_typed_with_x_for_times_and_stray_backslashes(tmp_path):
+    """Retries from the runs: 'x8 x1' typed for the table's '×8 ×1', and '\\"CONFIG\\"' escaped three times for the
+    datasheet's “CONFIG”; the words were right, the quote was refused."""
+    store = SourceStore(tmp_path)
+    text = "High resolution ×8 ×1 18.69 21.53 52.71 46.42\n4.3.20. Register 0x1F “CONFIG”\n"
+    src = store.add("https://www.bosch-sensortec.com/bmp388.pdf", "BMP388", text, kind="pdf")
+    ledger = FactLedger(tmp_path, store)
+    assert ledger.record("BMP388", "t_max_x8_x1", "21.53", src.id, "High resolution   x8   x1   18.69   21.53   52.71   46.42")["ok"]
+    assert ledger.record("BMP388", "config_reg", "0x1F", src.id, 'Register 0x1F \\\\\\"CONFIG\\\\\\"')["ok"]
+    assert not ledger.record("BMP388", "t", "21.53", src.id, "High resolution x16 x1 18.69 21.53")["ok"]   # other words
     assert parse_int("each") is None and parse_int("1001000") == 1001000   # binary digits are not guessed
 
 

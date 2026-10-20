@@ -143,6 +143,17 @@ def test_replace_miss_points_at_the_line(project):
     assert "2: #define LED_PIN 13" in err
     # only whitespace around the lines differs (a trailing space): matched, not refused
     assert "indentation ignored" in belt.replace_in_file("src/main.c", "#define LED_PIN 13 \n", "#define LED_PIN 12")["note"]
+    # the miss says where 'old' departs from the file and shows the file's lines to copy (a retry without read_file)
+    assert "differs at line 3: the file has 'int b;' where 'old' has 'int c;'" in err and "3: int b;" in err, err
+
+
+def test_replace_picks_one_of_several_occurrences_by_line(project):
+    belt = _belt(project)
+    belt.write_file("src/main.c", "void a() {\n  wr(1);\n}\nvoid b() {\n  wr(1);\n}\n")
+    err = belt.replace_in_file("src/main.c", "  wr(1);", "  wr(2);")["error"]
+    assert "found 2 occurrences" in err and "lines 2, 5" in err, err
+    assert "error" not in belt.replace_in_file("src/main.c", "  wr(1);", "  wr(2);", line=5)
+    assert (project.root / "src/main.c").read_text() == "void a() {\n  wr(1);\n}\nvoid b() {\n  wr(2);\n}\n"
 
 
 # ------------------------------------------------------------------ build feedback
