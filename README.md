@@ -192,6 +192,11 @@ TI's unused bit 0 (a reserved-bit warning), one is a null check of a pointer tha
 power-up wait that a later 2 ms reset wait still covers. (One cold run each, not a controlled comparison; the harness
 changed between them as described above.)
 
+Validating the delivered projects then found a requirement no check had looked at: the task says "weact_rp2350b with
+2 MB flash", and both TMP117 runs had left the build at the board's default 16 MB (the BMP388 run had set it). Verify
+now compares a flash size the request states with the build (`BUILD_FLASH_SIZE`); resumed with the same neutral
+message, Nemotron fixed each TMP117 project in 6 steps with no refused call, and both pass again.
+
 ## NVIDIA Nemotron on Nebius Token Factory
 
 - **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
