@@ -66,6 +66,13 @@ def test_statuses_that_report_failure_must_be_checked(call, flagged):
     ("if (read_regs(0x04, b, 6) != 0) return true;", True),
     ("if (read_regs(0x04, b, 6) == 0) return true;", False),      # the success branch
     ("if (n != 3) return true;", False),                          # not a call that reports failure
+    # the TMP117 driver's mutation survivors: a wrong device, and an object never set up, reported as success
+    ("if (deviceID != DEVICE_ID_VALUE) {\n        return true;\n    }", True),
+    ("if (deviceID != DEVICE_ID_VALUE) {\n        return false;\n    }", False),
+    ("if (chip_id != 0x50) return true;", True),
+    ("if (!_initialized) {\n        return true;\n    }", True),
+    ("if (!_initialized) return false;", False),
+    ("if (valid != 3) return true;", False),                      # 'valid' is not an ID
 ])
 def test_a_failure_must_not_be_reported_as_success(branch, flagged):
     code = OWN.replace("static bool ok_read", "static bool wr2").replace("bool wr2", "bool ok_read") + \

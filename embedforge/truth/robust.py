@@ -218,13 +218,21 @@ def failures_reported_as_success(texts: Dict[str, List[str]]) -> List[Tuple[str,
                 cond, end = _block(fbody, m.end() - 1)
                 failed = re.match(r"\s*!\s*\(?\s*" + call, cond) or (re.search(call, cond) and re.search(
                     r"\)\s*(!=\s*(0|true|\w*OK\b|\w+)|<\s*0|==\s*(false|-\s*\d))", cond))
-                if not failed:
+                # the device is not the part (its ID read does not match), or the object was never set up: the TMP117
+                # driver's mutation test turned both branches' 'return false' into 'return true' unnoticed
+                id_bad = re.fullmatch(r"\s*\(?\s*\w*(?:chip_?id|device_?id|dev_?id|part_?id|who_?am_?i|\bid)\w*\s*\)?\s*!=\s*\w+\s*",
+                                      cond, re.I)
+                not_ready = re.fullmatch(r"\s*!\s*(?:this\s*->\s*)?(\w*(?:initiali[sz]ed|inited|ready|begun|started)\w*)\s*", cond, re.I)
+                if not (failed or id_bad or not_ready):
                     continue
                 branch, _ = _body(fbody, end)
                 if re.search(rf"\breturn\s+{success}\s*;", branch) or re.fullmatch(rf"\s*return\s+{success}\s*", branch):
                     line = _line_of(starts, base + m.start())
-                    out.append((rel, line, f"When {failed.group(1)}() fails, this branch returns {success} (success): the "
-                                           "caller carries on as if it had worked."))
+                    why = (f"When {failed.group(1)}() fails" if failed else
+                           f"When the ID read does not match ({cond.strip()})" if id_bad else
+                           f"When {not_ready.group(1)} says the device was never set up")
+                    out.append((rel, line, f"{why}, this branch returns {success} (success): the caller carries on as if it "
+                                           "had worked."))
     return out
 
 
