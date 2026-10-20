@@ -111,17 +111,27 @@ def table_passages(text: str, keys: List[str], want_bits: bool = True, limit: in
     the table of contents."""
     scored = []
     for key in [k for k in keys if k and len(k) >= 2]:
-        rx = rf"(?<![0-9A-Za-z]){re.escape(key)}(?![0-9A-Za-z])" if re.fullmatch(r"0x[0-9A-Fa-f]+", key) else re.escape(key)
-        for m in re.finditer(rx, text, re.I):
+        if re.fullmatch(r"0x[0-9A-Fa-f]+", key):   # TI writes the address 0x01 as 01h (two digits: '0h' is a reset value)
+            rxs = [rf"(?<![0-9A-Za-z]){re.escape(key)}(?![0-9A-Za-z])", rf"(?<![0-9A-Za-z]){int(key, 16):02X}h(?![0-9A-Za-z])"]
+        else:
+            rxs = [re.escape(key)]
+        for m in (m for rx in rxs for m in re.finditer(rx, text, re.I)):
             a = text.rfind("\n", 0, m.start()) + 1
+            if m.start() - a > 200:   # a PDF line that is a whole page (TI): start at the table caption or the key itself
+                cap = [c for c in re.finditer(r"Table\s+\d+(?:[-.]\d+)*\.?\s", text[m.start() - 160:m.start()])]
+                a = m.start() - 160 + cap[-1].start() if cap else m.start()
             window = text[a:a + size]
             if "....." in window[:200]:
                 continue   # table of contents
-            score = (2 if re.search(r"\bBit\s*\d", window) or not want_bits else 0) + (1 if re.match(r"\s*Table\s+\d+", window) else 0)
+            bits = bool(re.search(r"\bBit\s*\d", window) or re.search(r"\bBIT\s+FIELD\b|Field\s+Descriptions", window, re.I))
+            if bits and want_bits:   # a field table: up to the next table's caption ('Table 7-7. Conversion ...', not
+                nxt = re.search(r"\sTable\s+\d+(?:-\d+)?[.:]\s+[A-Z]", text[a + 60:a + 2400])   # 'see Table 7-7 for')
+                window = text[a:a + 60 + nxt.start()] if nxt else text[a:a + 2400]
+            score = (2 if bits or not want_bits else 0) + (1 if re.match(r"\s*Table\s+\d+", window) else 0)
             scored.append((-score, a, window))
     out: List[str] = []
     for _s, _a, w in sorted(scored):
-        w = (w[:w.rfind("\n")] if "\n" in w[size // 3:] else w).strip()
+        w = (w[:w.rfind("\n")] if "\n" in w[max(size, len(w)) // 3:] else w).strip()
         if w and all(w[:80] not in o for o in out):
             out.append(w)
         if len(out) >= limit:
@@ -1460,7 +1470,8 @@ class RegisterBook:
         if rejected:
             out["rejected"] = rejected
             out["hint"] = ("`bytes` lists the registers LEAST significant first ('0x31' = bits 7..0, '0x32' = bits 15..8); a partial "
-                           "byte is '0xE5[3:0]'. The quote must contain every address and, if it says, the signedness.")
+                           "byte is '0xE5[3:0]'. A register recorded with width 16 is listed once: ['0x00'] is the whole value. "
+                           "The quote must contain every address and, if it says, the signedness.")
         return out
 
     @staticmethod
@@ -1511,6 +1522,14 @@ class RegisterBook:
                     "(recorded with width 16) is one part, '0x00' or '0x00[15:0]'")
         if len(parts) > 8:
             return "at most 8 bytes"
+        width_at = self._width_fn(device)
+        for i, a in enumerate(parts):   # a register listed twice: the TMP117 fix-up run gave ['0x00', '0x00'] for one
+            for b in parts[i + 1:]:     # 16-bit register, a 32-bit value made of the same bits twice
+                if a.addr == b.addr and a.lo <= b.hi and b.lo <= a.hi:
+                    w = width_at(a.addr)
+                    return (f"{_hex(a.addr)} is listed twice with the same bits. " +
+                            (f"It is one {w}-bit register: list it once ('{_hex(a.addr)}' is bits {w - 1}..0 of the value)"
+                             if w > 8 else "List each byte once, least significant first"))
         err = _quote_ok(store, source_id, quote, name)
         if err:
             return err
@@ -2182,6 +2201,14 @@ def check_registers(project_dir: Path, ledger: Optional[FactLedger], model: Opti
     findings += bits
     for lay in book.layouts.values():
         summary["layouts"].append(f"{lay.id} {lay.describe()}")
+        twice = sorted({a.addr for i, a in enumerate(lay.parts) for b in lay.parts[i + 1:]
+                        if a.addr == b.addr and a.lo <= b.hi and b.lo <= a.hi})
+        if twice:   # recorded before record_layouts refused it: the same bits twice make a value of twice the width
+            findings.append(RegFinding("ERROR", "LAYOUT_INVALID", "", 0,
+                                       f"{lay.id} {lay.describe()}: {', '.join(_hex(a) for a in twice)} is listed twice with the "
+                                       "same bits, so the value verify checks the code against is not the register's.",
+                                       f"record_layouts again under the same name ({lay.name}), listing each register once "
+                                       "(a 16-bit register is one entry: ['0x00'])."))
 
     # 4. burst reads
     for b in book.bursts.values():

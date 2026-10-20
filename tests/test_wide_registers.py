@@ -217,6 +217,34 @@ def test_a_unit_prefix_in_the_quote_allows_its_factor(tmp_path):
     assert not bad["ok"] and "1000" in bad["error"], bad
 
 
+def test_a_16_bit_register_listed_twice_in_a_layout_is_refused(tmp_path):
+    """TMP117 fix-up run: bytes ['0x00', '0x00'] for one 16-bit register recorded a 32-bit value of the same bits twice."""
+    from embedforge.truth.registers import LayoutDef, LayoutPart
+    p, store, ledger, src = _setup(tmp_path, code())
+    book = RegisterBook(p.root)
+    quote = DS[DS.index("00h R 8000h"):DS.index("m°C") + 3]
+    r = book.record_layouts(store, "TMPX", src.id, [{"name": "Temp_Result", "bytes": ["0x00", "0x00"], "signed": True, "quote": quote}])
+    assert not r["ok"] and "one 16-bit register: list it once" in r["rejected"][0]["error"], r
+    # a doubled layout already on record (made before the refusal) fails verify until it is recorded again
+    book.layouts["LAY-001"] = LayoutDef("LAY-001", "TMPX", "Temp_Result", [LayoutPart(0, 15, 0), LayoutPart(0, 15, 0)], True, src.id, quote)
+    book._save()
+    summary, codes, found = _codes(p, ledger)
+    assert "LAYOUT_INVALID" in codes, [(f.code, f.message) for f in found]
+
+
+def test_candidate_quotes_find_ti_field_tables():
+    """TI prints a page as one line, writes addresses as 01h and field tables as 'BIT FIELD TYPE RESET': the candidates
+    offered for a rejected register must be its field table, up to the next table's caption (not 'see Table 7-7')."""
+    from embedforge.truth.registers import table_passages
+    text = ("x " * 150 + "Table 7-6. Configuration Register Field Descriptions BIT FIELD TYPE RESET DESCRIPTION 15 HIGH_Alert R 0 "
+            "High alert flag. 9:7 CONV[2:0] R/W 100 Conversion cycle bit. See Table 7-7 for the standby time. 6:5 AVG[1:0] "
+            "R/W 01 Conversion averaging modes. Table 7-7. Conversion Cycle Time 000 15.5 ms 0Fh R 0117h Device_ID R 0h x")
+    first = table_passages(text, ["Configuration", "0x01"])[0]
+    assert first.startswith("Table 7-6.") and "6:5 AVG" in first and "Conversion Cycle Time" not in first, first
+    assert "0Fh R 0117h Device_ID" in table_passages(text, ["Device_ID", "0x0F"], want_bits=False)[0]
+    assert not any(p.startswith("0h") for p in table_passages(text, ["0x00"], want_bits=False))
+
+
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):
     p, store, ledger, src = _setup(tmp_path, code().replace("0x0220)", "0x0A21)"))   # MOD=10, bit 0 reserved
     summary, codes, found = _codes(p, ledger)

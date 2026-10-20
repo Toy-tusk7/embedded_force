@@ -450,6 +450,7 @@ def next_step(project: Any, kind: str, meta: Dict[str, Any], facts: List[Any], u
                   "REG_UNMAPPED": "record_registers / record_layouts for the unmapped addresses",
                   "REGISTER_WIDTH_UNRECORDED": "record_registers again with width '16', fields and byte_order_quote",
                   "REG_LAYOUT_MISSING": "record_layouts for the 16-bit measurement registers (+ record_formula)",
+                  "LAYOUT_INVALID": "record_layouts again for the layouts it names (each register once)",
                   "FORMULA_MISSING": "record_formula for the conversions", "FLOW_UNSPECIFIED": "record_sequence for the init order"}
         todo = [t for c, t in record.items() if c in codes]
         if todo:

@@ -1775,25 +1775,8 @@ class ToolBelt:
         src = self.store.get(source_id)
         if not src:
             return []
-        text = src.text
-        out: List[str] = []
-        scored = []
-        for key in [k for k in keys if k and len(k) >= 2]:
-            for m in re.finditer(re.escape(key), text, re.I):
-                a = text.rfind("\n", 0, m.start()) + 1
-                window = text[a:a + 520]
-                if "....." in window[:200]:
-                    continue   # table of contents
-                score = (2 if re.search(r"\bBit\s*\d", window) or not want_bits else 0) + (1 if re.match(r"\s*Table\s+\d+", window) else 0)
-                scored.append((-score, a, window))
-        for _s, _a, w in sorted(scored)[:12]:
-            w = w[:w.rfind("\n")] if "\n" in w[200:] else w
-            w = w.strip()
-            if w and all(w[:80] not in o for o in out):
-                out.append(w)
-            if len(out) >= limit:
-                break
-        return out
+        from embedforge.truth.registers import table_passages
+        return table_passages(src.text, keys, want_bits=want_bits, limit=limit)
 
     def _source_with(self, quote: str, exclude: str) -> Optional[str]:
         """Another stored (non-user) source in which the quote is verbatim: models often cite the wrong SRC id."""
