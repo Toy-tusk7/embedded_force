@@ -215,6 +215,17 @@ def test_a_unit_prefix_in_the_quote_allows_its_factor(tmp_path):
     bad = book.record_formula(store, "TMPX", src.id, "T_X", ["T_X = count * 7.8125 / 1000"], "One count is 7.8125 degrees.",
                               inputs={"count": "Temp_Result"})
     assert not bad["ok"] and "1000" in bad["error"], bad
+    # the TMP117 fix-up run's attempt: the quoted 7.8125 m°C written in °C (0.0078125) is the same number
+    base = book.record_formula(store, "TMPX", src.id, "T_C2", ["T_C2 = LSB * 0.0078125"], "One LSB equals 7.8125 m°C.",
+                               inputs={"LSB": "Temp_Result"})
+    assert base["ok"], base
+    for wrong in ("0.0078", "0.0000078125"):   # not the quoted value in any unit its prefix gives
+        r = book.record_formula(store, "TMPX", src.id, "T_W", [f"T_W = LSB * {wrong}"], "One LSB equals 7.8125 m°C.",
+                                inputs={"LSB": "Temp_Result"})
+        assert not r["ok"] and "not in the quote" in r["error"], r
+    # without the binding, the error says which word of the quote names the raw value
+    unbound = book.record_formula(store, "TMPX", src.id, "T_U", ["T_U = Temp_Result * 0.0078125"], "One LSB equals 7.8125 m°C.")
+    assert not unbound["ok"] and "scale per LSB" in unbound["error"] and "inputs={'LSB'" in unbound["error"], unbound
 
 
 def test_a_16_bit_register_listed_twice_in_a_layout_is_refused(tmp_path):

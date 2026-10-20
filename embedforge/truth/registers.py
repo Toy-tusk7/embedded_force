@@ -598,16 +598,18 @@ _AMBIGUOUS_POW = re.compile(r"(?<![\w.^*])2(-?\d{1,2})(?![\w.])")   # '214' / '2
 
 
 _SI_PREFIX = {"k": 1e3, "m": 1e-3, "μ": 1e-6, "u": 1e-6, "n": 1e-9}
-_PREFIXED_UNIT = re.compile(r"\d\s*([kmμun])\s*(?:°\s*[CF]|(?:s|V|A|W|Hz|Pa|g|bar|m|K|G)\b|Ω)")
+_PREFIXED_UNIT = re.compile(r"(\d+(?:\.\d+)?)\s*([kmμun])\s*(?:°\s*[CF]|(?:s|V|A|W|Hz|Pa|g|bar|m|K|G)\b|Ω)")
+_PER_COUNT = re.compile(r"\b(?:one|1|each)\s+(LSB|count|code|digit|step)\b[^.]{0,25}?(?:equals|=|is|corresponds to|represents)\s*[-+]?\d", re.I)
 
 
 def _prefix_factors(quote: str) -> set:
     """Unit conversions the quote itself implies: TI's 'One LSB equals 7.8125 m°C' makes / 1000 (to °C) part of the
-    formula; '5 µs' gives 1e6 and 1e-6. Only prefixes the quote puts on a number."""
+    formula, and 0.0078125 (the same number in °C) a constant of it; '5 µs' gives 1e6, 1e-6 and 5e-6. Only prefixes
+    the quote puts on a number."""
     out = set()
     for m in _PREFIXED_UNIT.finditer(unicodedata.normalize("NFKC", quote or "")):
-        f = _SI_PREFIX[m.group(1)]
-        out |= {f, 1 / f}
+        f = _SI_PREFIX[m.group(2)]
+        out |= {f, 1 / f, float(m.group(1)) * f}
     return out
 
 
@@ -1684,10 +1686,15 @@ class RegisterBook:
         foreign = self._names_not_in_quote(orig_steps, quote, inputs if isinstance(inputs, dict) else {})
         if foreign:
             names = _quote_names(quote)
+            per = _PER_COUNT.search(unicodedata.normalize("NFKC", quote or ""))
+            # 'One LSB equals 7.8125 m°C': the quote names the raw value only by its unit (a scale per count)
+            per_hint = (f" This quote gives a scale per {per.group(1)}: that word is the raw value's name here, e.g. "
+                        f"steps=['{name} = {per.group(1)} * <the quoted number, in your unit>'], inputs={{'{per.group(1)}': "
+                        "'<the recorded layout>'}." if per else "")
             return {"ok": False, "error": f"{', '.join(foreign)} do(es) not appear in the quote. Write the steps with the quote's own "
                                           "names (e.g. calib_data->par_t1, uncomp_temp) and bind them to recorded layouts/formulas "
                                           "with inputs={...}: a value the quote uses must be the value it means, not a similar raw one."
-                                          + (f" Names in this quote: {', '.join(names)}." if names else "")}
+                                          + (f" Names in this quote: {', '.join(names)}." if names else "") + per_hint}
         if missing_consts:
             return {"ok": False, "error": f"constant(s) {', '.join(sorted(set(missing_consts)))} are not in the quote. Quote the "
                                           "text that states the formula (the datasheet, or the manufacturer's reference code)."}
