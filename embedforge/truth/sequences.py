@@ -163,7 +163,11 @@ class SequenceBook:
                 v = named[0] if named else parse_int(key) if not re.fullmatch(r"[01]+", key) or len(key) != f.width else int(key, 2)
             if v is None or not 0 <= v < (1 << f.width):
                 names = ", ".join(f"{n}={'|'.join(str(x) for x in vs)}" for n, vs in f.values.items())
-                return f"{reg.name}.{f.name} = {fv!r} is not a value of this {f.width}-bit field" + (f" (named values: {names})" if names else "")
+                return (f"{reg.name}.{f.name} = {fv!r} is not a value of this {f.width}-bit field" +
+                        (f" (named values: {names})" if names else
+                         f": no named values are on record for it, so give the number its table lists for that setting "
+                         f"(0..{(1 << f.width) - 1}, e.g. {min(4, (1 << f.width) - 1)} or "
+                         f"'0b{format(min(4, (1 << f.width) - 1), f'0{f.width}b')}')"))   # the TMP117 run sent CONV='1s' three times
             out[f.name] = v
         if st.value:
             want, mask = _fields_value(reg, out)
