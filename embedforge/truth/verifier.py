@@ -372,6 +372,7 @@ def verify_project(project_dir: Path, ledger: FactLedger, pico: bool = False, ch
 
     flow_steps = _check_flows(project_dir, ledger, report)
     _check_registers(project_dir, ledger, report)
+    report.findings.extend(_check_flash_size(project_dir, ledger))
     report.stats = {"files": len(files), "literals_checked": literals_checked, "justified": justified, "facts_used": len(used_facts),
                     "sequences": len(report.flows), "sequence_steps_matched": flow_steps,
                     "formulas_matched": sum(1 for x in report.registers.get("formulas", []) if "matches the code" in x)}
@@ -439,6 +440,45 @@ def _pin_capability(project_dir: Path, stripped: Dict[Path, List[Dict[str, str]]
                                   f" as {fn[1]}, or " if fn else "")
                                + "check the schematic's pin with query_board."))
     return out
+
+
+# the board's program flash as a request states it: 'board weact_rp2350b with 2 MB flash', '4 MB of flash'. Not an
+# external memory chip on the board ('16 MB SPI flash chip', 'W25Q128 flash'), which the build does not size
+_FLASH_STATED = re.compile(r"(?<![\w.])(\d{1,2})\s*(?:MB|MiB|M\b)\s*(?:of\s+)?(?:on-?board\s+|program\s+|q?spi\s+)?flash\b"
+                           r"(?!\s*(?:chip|memory|ic\b|module|storage|card))", re.I)
+
+
+def _check_flash_size(project_dir: Path, ledger: FactLedger) -> List[Finding]:
+    """A flash size the user states for the board must be the one the build is sized for: the TMP117 runs were asked for
+    'weact_rp2350b with 2 MB flash' and left platformio.ini at the board's default 16 MB (the BMP388 run had set
+    board_upload.maximum_size = 2097152). On a 2 MB part an image or filesystem laid out for 16 MB does not fit."""
+    ini = Path(project_dir) / "platformio.ini"
+    if not ini.exists():
+        return []
+    stated = None
+    for src in ledger.store.sources.values():
+        if src.tier != "USER":
+            continue
+        for line in src.text.splitlines():
+            m = _FLASH_STATED.search(line)
+            if m and not re.search(r"\bexternal\b|\bW25|\bAT25|\bIS25|\bMX25|\bGD25", line, re.I):
+                stated = int(m.group(1))
+                break
+        if stated:
+            break
+    if not stated:
+        return []
+    text = ini.read_text(encoding="utf-8", errors="ignore")
+    m = re.search(r"^\s*board_upload\.maximum_size\s*=\s*(\d+)", text, re.M)
+    want = stated * 1024 * 1024
+    if m and int(m.group(1)) == want:
+        return []
+    have = f"sets board_upload.maximum_size = {m.group(1)}" if m else "does not set board_upload.maximum_size (the build assumes the board's default)"
+    line = next((k for k, ln in enumerate(text.splitlines(), 1) if ln.strip().startswith("[env")), 1)
+    return [Finding("ERROR", "BUILD_FLASH_SIZE", "platformio.ini", line,
+                    f"The request says the board has {stated} MB of flash, but platformio.ini {have}.",
+                    suggestion=f"Add 'board_upload.maximum_size = {want}' to the [env] section of platformio.ini "
+                               "(replace_in_file), then build and verify again.")]
 
 
 def _check_registers(project_dir: Path, ledger: FactLedger, report: VerifyReport) -> None:

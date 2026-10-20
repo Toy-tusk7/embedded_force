@@ -369,6 +369,31 @@ def test_an_init_step_skipped_on_a_healthy_part_is_caught(tmp_path):
     assert "SEQUENCE_UNREACHED" in seq_errors(code(**{"id != ID": "id == ID"}), "inverted")
 
 
+def test_a_flash_size_the_request_states_must_be_the_builds(tmp_path):
+    """Both TMP117 runs were asked for 'board weact_rp2350b with 2 MB flash' and left platformio.ini at the board's
+    default 16 MB; verify did not look."""
+    from embedforge.truth.verifier import _check_flash_size
+    store = SourceStore(tmp_path)
+    ledger = FactLedger(tmp_path, store)
+    ini = tmp_path / "platformio.ini"
+    ini.write_text("[env:weact_rp2350b]\nboard = weact_rp2350b\nframework = arduino\n", encoding="utf-8")
+    assert _check_flash_size(tmp_path, ledger) == []   # nothing stated
+    store.add_user_text("Write a driver ... (Arduino framework, board weact_rp2350b with 2 MB flash). The TMP117 is on I2C.")
+    found = _check_flash_size(tmp_path, ledger)
+    assert [f.code for f in found] == ["BUILD_FLASH_SIZE"] and "2 MB" in found[0].message, found
+    ini.write_text(ini.read_text() + "board_upload.maximum_size = 2097152\n", encoding="utf-8")
+    assert _check_flash_size(tmp_path, ledger) == []
+    ini.write_text(ini.read_text().replace("2097152", "16777216"), encoding="utf-8")
+    assert "sets board_upload.maximum_size = 16777216" in _check_flash_size(tmp_path, ledger)[0].message
+    # an external memory chip on the board is not the program flash the build is sized for
+    other = tmp_path / "o"
+    other.mkdir()
+    (other / "platformio.ini").write_text("[env:x]\nboard = x\n", encoding="utf-8")
+    s2 = SourceStore(other)
+    s2.add_user_text("Log the readings to the 16 MB SPI flash chip (W25Q128) on the board.")
+    assert _check_flash_size(other, FactLedger(other, s2)) == []
+
+
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):
     p, store, ledger, src = _setup(tmp_path, code().replace("0x0220)", "0x0A21)"))   # MOD=10, bit 0 reserved
     summary, codes, found = _codes(p, ledger)
