@@ -220,11 +220,12 @@ def _stated_bits(quotes: List[str], fname: str) -> Optional[Tuple[int, int]]:
 
 
 def _name_spans(quote: str, name: str) -> List[Tuple[int, int]]:
-    """Where `name` occurs in the quote, ignoring case, spaces, underscores and hyphens inside it."""
+    """Where `name` occurs in the quote, ignoring case, spaces, underscores, hyphens and slashes inside it (TI names
+    fields T/nA and DR/Alert; the TMP117 re-run was refused 15 times on them, typed T_nA, TnA and T/nA alike)."""
     chars = [re.escape(c) for c in name if c.isalnum()]
     if not chars:
         return []
-    rx = r"(?<![A-Za-z0-9_])" + r"[\s_\-]*".join(chars) + r"(?![A-Za-z0-9_])"   # a whole word: drdy is not drdy_press
+    rx = r"(?<![A-Za-z0-9_])" + r"[\s_\-/]*".join(chars) + r"(?![A-Za-z0-9_])"   # a whole word: drdy is not drdy_press
     return [(m.start(), m.end()) for m in re.finditer(rx, quote, re.I)]
 
 

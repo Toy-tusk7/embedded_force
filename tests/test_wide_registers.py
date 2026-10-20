@@ -336,6 +336,23 @@ def test_a_byte_buffer_declared_signed_is_caught(tmp_path):
     assert "FORMULA_MISMATCH" in codes, [(f.code, f.message) for f in found]
 
 
+def test_field_names_with_a_slash_and_register_ids_in_sequences(tmp_path):
+    """TMP117 cold re-run: TI names fields T/nA and DR/Alert; the name check never matched a slash, so Configuration was
+    refused 15 times whether the model wrote T_nA, TnA or T/nA. A sequence step naming the register by its record id
+    (REG-002) was refused too."""
+    from embedforge.truth.registers import _name_spans
+    q = "4 T/nA R/W 0 Therm/alert mode select. 2 DR/Alert R/W 0 ALERT pin select bit."
+    for n in ("T/nA", "T_nA", "TnA", "DR/Alert", "DR_Alert"):
+        assert _name_spans(q, n), n
+    p, store, ledger, src = _setup(tmp_path, code())
+    t = ledger.record("TMPX", "startup_time", "2", src.id, "wait 2 ms after power-up", "ms")["fact"]["id"]
+    reg_id = RegisterBook(p.root).register_at(0x01).id
+    r = SequenceBook(p.root).record(ledger, "TMPX", "init", "TMPX::begin", [
+        {"op": "delay_min", "value": t}, {"op": "write", "reg": reg_id, "fields": {"MOD": "continuous", "CONV": "4", "AVG": "1"}}],
+        src.id, "Start-up: wait 2 ms after power-up, then write the configuration register.")
+    assert r["ok"], r
+
+
 def test_reserved_bits_and_field_values_of_a_16_bit_write(tmp_path):
     p, store, ledger, src = _setup(tmp_path, code().replace("0x0220)", "0x0A21)"))   # MOD=10, bit 0 reserved
     summary, codes, found = _codes(p, ledger)

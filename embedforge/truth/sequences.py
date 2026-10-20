@@ -245,6 +245,13 @@ class SequenceBook:
                 continue
             st = Step(op=str(raw.get("op") or "").strip(), reg=str(raw.get("reg") or "").strip(), value=str(raw.get("value") or "").strip(),
                       mask=str(raw.get("mask") or "").strip(), unit=str(raw.get("unit") or "").strip().lower())
+            if re.fullmatch(r"REG-\d+", st.reg, re.I):   # a register record's own id (the TMP117 re-run): its address
+                from embedforge.truth.registers import RegisterBook
+                rec = RegisterBook(self.path.parent).registers.get(st.reg.upper())
+                if rec is None:
+                    problems.append(f"step {k}: reg {st.reg!r} is not a register record id")
+                    continue
+                st.reg = f"0x{rec.addr:02X}"
             if raw.get("fields"):
                 err = self._resolve_fields(st, raw.get("fields"), ledger, subject)
                 if err:
