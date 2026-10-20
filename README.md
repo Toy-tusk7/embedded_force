@@ -170,6 +170,26 @@ reports as a reserved-bit warning. The first mutation test of this driver (13 of
 gaps above, and two more checks: a wrong device ID or an object never set up, reported as success, is now
 `FAILURE_AS_SUCCESS`.
 
+**The same task, cold, after the fixes.** A new project, the first cold run's task word for word, the same model
+(Nemotron 3 Ultra on NVIDIA's API), 20 October:
+
+| | First cold run (19 Oct) | Cold run after the fixes (20 Oct) |
+|---|---|---|
+| Steps | 150 (step budget), then ~44 in four fix-up runs | 55 |
+| Tool calls refused by the gates | 35 | 15 (at most 4 for any one tool) |
+| Builds | 5 | 3 |
+| Tavily credits | 10 | 1 |
+| Verify | FAIL | PASS, 0 errors, 0 warnings |
+
+Every record is quoted from TI's datasheet: all 11 configuration fields, the reset values, the ID 0x0117, the signed
+temperature layout, the conversion from "One LSB equals 7.8125 m°C." (matches the code on probe input) and two
+sequences (1.5 ms power-up; soft reset, 2 ms, ID read, then 0x0220), both matched. Mutation test: 19 of 24 caught. Of
+the five survivors, two flip TI's unused bit 0 (a reserved-bit warning), one is a null check of a pointer that is
+never null, one deletes a power-up wait that a later 2 ms reset wait still covers, and one is a real gap: an inverted
+ID check makes begin() skip the configuration on a healthy part, and in this driver the reads do not depend on
+begin() succeeding, so no measurement is lost and nothing flags it. (One cold run each, not a controlled comparison;
+the harness changed between them as described above.)
+
 ## NVIDIA Nemotron on Nebius Token Factory
 
 - **Default model:** `nvidia/Nemotron-3-Ultra-550b-a55b` on Nebius Token Factory (OpenAI-compatible API). In our
