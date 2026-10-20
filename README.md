@@ -142,8 +142,33 @@ which the fact gate did not match (fixed since), and the TMP117 has 16-bit regis
 It does now: a register is recorded with its width and the datasheet's sentence on byte order ("Register bytes are
 sent with the most significant byte first"), and verify reads the code's two-byte writes and reads as 16-bit values.
 On top of the 8-bit checks this catches bytes put together swapped, a register written or read in half, and a
-16-bit measurement read with the wrong sign. The cold run's records predate this, so verify now asks for them again
-(`REGISTER_WIDTH_UNRECORDED`) rather than misreading the two-byte writes as two 8-bit registers.
+16-bit measurement read with the wrong sign.
+
+**The TMP117 fix-up.** The same project was then resumed on Nemotron 3 Ultra with one message ("the verifier has
+been updated; run verify and fix what it reports"), no new Tavily calls and no change to the driver code. Unaided,
+Nemotron re-recorded the three registers as 16-bit with TI's byte-order sentence, the configuration fields, the
+temperature layout (signed) and formula, and the power-up sequence. It took four short runs, stopped in between to
+load harness fixes for gaps each one exposed, all general:
+
+- a 16-bit register listed twice in a layout (`['0x00', '0x00']`) made a 32-bit value: now refused;
+- the candidate quotes offered for a rejected register missed TI's field tables (`01h` addresses, `BIT FIELD`
+  headers, a page printed as one line): fixed;
+- TI states the conversion as "One LSB equals 7.8125 m°C" or names the value "TEMPERATURE REGISTER VALUE": a number
+  with a unit prefix now counts in base units and a value named in words can be bound, after the model had fallen
+  back to Adafruit's library header, which a formula may no longer be quoted from while the datasheet is on record;
+- the probe gave the ID register a random value when a layout covered it, so the driver stopped at its ID check and
+  the formula was never compared with the code (verify had passed): fixed, and a part that never gets measured on
+  healthy datasheet values is now an error;
+- the I2C address was recorded as TI prints it, in binary (`1001000`), and read as decimal, so verify never asked for
+  the init sequence: fixed.
+
+Result: verify PASS (Configuration 0x01 <- 0x0220 decodes as MOD=0 continuous, CONV=4, AVG=1; the temperature formula,
+quoted from TI's datasheet, matches the code on probe input; the 1.5 ms power-up wait is met by the code's 2 ms).
+Mutation test: 19 of 25 planted faults caught. The six survivors: four sign changes that alter no value, one
+(`int8_t buffer[2]` passed as `uint8_t*`) that would not compile, and a flip of TI's unused bit 0, which verify
+reports as a reserved-bit warning. The first mutation test of this driver (13 of 25) is what exposed the last two
+gaps above, and two more checks: a wrong device ID or an object never set up, reported as success, is now
+`FAILURE_AS_SUCCESS`.
 
 ## NVIDIA Nemotron on Nebius Token Factory
 
@@ -174,7 +199,7 @@ On top of the 8-bit checks this catches bytes put together swapped, a register w
 
 Every run records its provider, model, harness version, and each step's tokens and model time in the project's
 `trace.jsonl`, so this table is generated, not written (`python -m embedforge.runlog --markdown`; `--runs` lists each
-run). Snapshot of 18 October 2026:
+run). Snapshot of 20 October 2026:
 
 | Provider | Model | Runs | Ended built + verified | Steps (median per run) | Prompt + completion tokens | Model time per step |
 |---|---|---|---|---|---|---|
@@ -182,14 +207,14 @@ run). Snapshot of 18 October 2026:
 | Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | 8 | 1 | 412 (60) | 8.8M + 294k | 6 s |
 | Nebius Token Factory | `nvidia/Nemotron-3_5-Lightning` | 6 | 2 | 313 (58) | 8.5M + 124k | 4 s |
 | Nebius Token Factory | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | 8 | 1 | 150 (7.5) | 1.8M + 230k | 12 s |
-| NVIDIA API | `nvidia/nemotron-3-ultra-550b-a55b` | 9 | 4 | 197 (15) | 7.9M + 83k | 19 s |
-| NVIDIA API | `nvidia/nemotron-3-super-120b-a12b` | 10 | 1 | 507 (56) | 28.5M + 610k | 35 s |
+| NVIDIA API | `nvidia/nemotron-3-ultra-550b-a55b` | 18 | 9 | 426 (13.5) | 18.7M + 180k | 20 s |
+| NVIDIA API | `nvidia/nemotron-3-super-120b-a12b` | 18 | 3 | 758 (38.5) | 42.8M + 923k | 93 s |
 
 Read it with care: the runs are not a controlled comparison. Most of the 47 Token Factory Ultra runs were
 development runs on one day while the harness changed between them, the tasks differ (Betaflight board configs,
 sensor drivers), and "ended built + verified" counts a run's own end state, not task difficulty. Two things hold
 across them: the agent prompt is about 20–55k tokens per step, so context size drives cost; and Token Factory served
-Nemotron 3 Ultra at about 5 s of model time per agent step, against about 19 s on NVIDIA's API with prompts of the
+Nemotron 3 Ultra at about 5 s of model time per agent step, against about 20 s on NVIDIA's API with prompts of the
 same size.
 
 EmbedForge was built and evaluated on Nebius Token Factory: 69 runs over four Nemotron models, including verified
