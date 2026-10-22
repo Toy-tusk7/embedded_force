@@ -226,7 +226,7 @@ message, Nemotron fixed each TMP117 project in 6 steps with no refused call, and
 
 Every run records its provider, model, harness version, and each step's tokens and model time in the project's
 `trace.jsonl`, so this table is generated, not written (`python -m embedforge.runlog --markdown`; `--runs` lists each
-run). Snapshot of 20 October 2026:
+run; every run is listed in [RUNS.md](RUNS.md)). Snapshot of 22 October 2026:
 
 | Provider | Model | Runs | Ended built + verified | Steps (median per run) | Prompt + completion tokens | Model time per step |
 |---|---|---|---|---|---|---|
@@ -234,7 +234,7 @@ run). Snapshot of 20 October 2026:
 | Nebius Token Factory | `nvidia/nemotron-3-super-120b-a12b` | 8 | 1 | 412 (60) | 8.8M + 294k | 6 s |
 | Nebius Token Factory | `nvidia/Nemotron-3_5-Lightning` | 6 | 2 | 313 (58) | 8.5M + 124k | 4 s |
 | Nebius Token Factory | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B` | 8 | 1 | 150 (7.5) | 1.8M + 230k | 12 s |
-| NVIDIA API | `nvidia/nemotron-3-ultra-550b-a55b` | 18 | 9 | 426 (13.5) | 18.7M + 180k | 20 s |
+| NVIDIA API | `nvidia/nemotron-3-ultra-550b-a55b` | 23 | 13 | 544 (12) | 22.3M + 236k | 19 s |
 | NVIDIA API | `nvidia/nemotron-3-super-120b-a12b` | 18 | 3 | 758 (38.5) | 42.8M + 923k | 93 s |
 
 Read it with care: the runs are not a controlled comparison. Most of the 47 Token Factory Ultra runs were
