@@ -346,12 +346,12 @@ $("reset").onclick = () => selectProject(state.cur);
 
 (async () => {
   try {
-    state.projects = await (await fetch("bundle/projects.json")).json();
+    state.projects = await (await fetch("projects.json")).json();
     selectProject(state.projects[0]);
     const py = await loadPyodide();
     $("status").innerHTML = `<span class="spinner"></span>Loading EmbedForge…`;
     await py.loadPackage("pydantic");
-    const code = await (await fetch("bundle/embedforge.json")).json();
+    const code = await (await fetch("embedforge.json")).json();
     for (const [path, text] of Object.entries(code)) {   // the package's sources into the browser's Python
       const dir = "/home/pyodide/" + path.split("/").slice(0, -1).join("/");
       py.FS.mkdirTree(dir);

@@ -221,16 +221,17 @@ def main() -> int:
 
     if out.exists():
         shutil.rmtree(out)
-    (out / "bundle").mkdir(parents=True)
-    # the package as text (path -> source): a Hugging Face Space refuses binary files pushed without Git LFS
+    out.mkdir(parents=True)
+    # four flat files, so the Space can be filled by dragging them into its web uploader. The package goes as text
+    # (path -> source): a Hugging Face Space refuses binary files pushed without Git LFS
     code = {str(p.relative_to(REPO)).replace("\\", "/"): p.read_text(encoding="utf-8")
             for p in sorted((REPO / "embedforge").rglob("*.py")) if "__pycache__" not in p.parts}
-    (out / "bundle" / "embedforge.json").write_text(json.dumps(code), encoding="utf-8")
-    (out / "bundle" / "projects.json").write_text(json.dumps(bundle), encoding="utf-8")
+    (out / "embedforge.json").write_text(json.dumps(code), encoding="utf-8")
+    (out / "projects.json").write_text(json.dumps(bundle), encoding="utf-8")
     shutil.copy(HERE / "playground" / "index.html", out / "index.html")
     shutil.copy(HERE / "playground" / "README.md", out / "README.md")
-    print(f"built {out} ({(out / 'bundle' / 'embedforge.json').stat().st_size // 1024} KB code, "
-          f"{(out / 'bundle' / 'projects.json').stat().st_size // 1024} KB projects)")
+    print(f"built {out} ({(out / 'embedforge.json').stat().st_size // 1024} KB code, "
+          f"{(out / 'projects.json').stat().st_size // 1024} KB projects)")
     return 0
 
 
