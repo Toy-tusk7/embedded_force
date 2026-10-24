@@ -37,3 +37,11 @@ services:
         value: "/opt/render/project/src/.pio_core"
       - key: PLATFORMIO_BUILD_CACHE_DIR
         value: "/opt/render/project/src/.pio_build_cache"
+
+  # the Verify Playground: a static page that runs verify in the visitor's browser (never sleeps, no keys)
+  - type: web
+    name: embedforge-playground
+    runtime: static
+    branch: main
+    buildCommand: "echo static site"
+    staticPublishPath: ./demo/site

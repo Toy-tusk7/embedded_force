@@ -12,6 +12,9 @@ live Nemotron runs on your NVIDIA API key and Tavily key, and caps on steps and 
 4. **Apply**. The first deploy installs the RP2350 toolchain and compiles its framework (several minutes).
 5. Open `https://<service>.onrender.com`; the browser asks for the password (any user name).
 
+The same Blueprint also creates `embedforge-playground`, a static site serving `demo/site` (the Verify Playground:
+verify in the visitor's browser on two drivers Nemotron wrote). It needs no keys and does not sleep.
+
 What to expect on the free plan:
 
 - It sleeps after 15 minutes without visitors; the first visit after that waits about a minute.
