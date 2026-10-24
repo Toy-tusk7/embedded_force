@@ -1,0 +1,39 @@
+# Render Blueprint: the EmbedForge IDE as a password-protected web service with live Nemotron runs.
+# Keys and the password are not in this file: Render asks for every `sync: false` value when the Blueprint is created.
+# Steps: deploy/render/README.md
+services:
+  - type: web
+    name: embedforge
+    runtime: python
+    plan: free
+    branch: main
+    # the RP2350 toolchain is installed and its framework compiled at deploy time, into the service's own directory
+    buildCommand: pip install -e ".[pdf]" && python deploy/render/prepare_toolchain.py
+    startCommand: python -m embedforge.server
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: EMBEDFORGE_HOST            # reachable from outside: the server refuses this without EMBEDFORGE_PASSWORD
+        value: "0.0.0.0"
+      - key: EMBEDFORGE_PASSWORD        # the browser asks for it (any user name); share it with the judges only
+        sync: false
+      - key: NVIDIA_API_KEY             # Nemotron through NVIDIA's API (or set NEBIUS_API_KEY for Token Factory)
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: "nvidia/nemotron-3-ultra-550b-a55b"
+      # spending caps per run: agent steps, and Tavily searches/maps (basic depth costs half)
+      - key: EMBEDFORGE_MAX_STEPS
+        value: "80"
+      - key: EMBEDFORGE_TAVILY_MAX_CALLS
+        value: "6"
+      - key: TAVILY_SEARCH_DEPTH
+        value: "basic"
+      # the free instance has 512 MB: one compiler at a time; toolchain and build cache inside the deployed directory
+      - key: EMBEDFORGE_BUILD_JOBS
+        value: "1"
+      - key: PLATFORMIO_CORE_DIR
+        value: "/opt/render/project/src/.pio_core"
+      - key: PLATFORMIO_BUILD_CACHE_DIR
+        value: "/opt/render/project/src/.pio_build_cache"
