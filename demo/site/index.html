@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EmbedForge Verify Playground</title>
+<meta name="description" content="Plant a bug in a firmware driver NVIDIA Nemotron wrote, and watch EmbedForge's verifier catch it from the datasheet. Runs in your browser.">
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c2330; --line: #2a3340; --text: #e6edf3; --muted: #9aa7b4;
+    --accent: #76b900; --accent-ink: #0d1117; --bad: #ff6b6b; --bad-bg: #3a1d22; --ok: #3fb950; --ok-bg: #16301d;
+    --warn: #e3b341; --warn-bg: #3a3016; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent); }
+  header { padding: 28px 24px 18px; border-bottom: 1px solid var(--line); background: linear-gradient(180deg, #121a10 0%, var(--bg) 100%); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; color: var(--muted); font-size: 14px; }
+  .brand b { color: var(--text); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  h1 { margin: 10px 0 8px; font-size: clamp(22px, 3.2vw, 32px); line-height: 1.2; max-width: 960px; }
+  header p { margin: 0; max-width: 900px; color: var(--muted); }
+  header .links { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 16px; font-size: 14px; }
+  .layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 0; min-height: calc(100vh - 160px); }
+  aside { border-right: 1px solid var(--line); padding: 18px 16px; background: var(--panel); }
+  aside h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 6px 0 10px; }
+  .cards { display: grid; gap: 10px; margin-bottom: 22px; }
+  .card { text-align: left; width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 12px; cursor: pointer; font: inherit; }
+  .card:hover { border-color: #3d4a5c; }
+  .card[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .card .t { font-weight: 600; }
+  .card .k { color: var(--muted); font-size: 13px; }
+  .card .s { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #232c39; color: var(--muted); }
+  .pill.ok { background: var(--ok-bg); color: var(--ok); }
+  .bugs { display: grid; gap: 6px; }
+  .bug { text-align: left; width: 100%; background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; cursor: pointer; font: inherit; font-size: 14px; }
+  .bug:hover { background: var(--panel-2); }
+  .bug[aria-pressed="true"] { border-color: var(--bad); background: var(--bad-bg); }
+  .bug small { display: block; color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+  details.more { margin-top: 12px; }
+  details.more summary { cursor: pointer; color: var(--muted); font-size: 14px; padding: 4px 0; }
+  details.more .bugs { margin-top: 8px; }
+  .reset { margin-top: 16px; width: 100%; padding: 9px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; cursor: pointer; }
+  .reset:hover { background: var(--panel-2); }
+  section.work { padding: 16px 20px 28px; min-width: 0; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
+  .tab { background: var(--panel); color: var(--muted); border: 1px solid var(--line); border-radius: 7px; padding: 5px 10px; font: 13px var(--mono); cursor: pointer; }
+  .tab[aria-selected="true"] { color: var(--text); border-color: #4a5a70; background: var(--panel-2); }
+  .tab.changed::after { content: " •"; color: var(--warn); }
+  .verify { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 8px; padding: 9px 18px; font: 600 15px system-ui, sans-serif; cursor: pointer; }
+  .verify:disabled { opacity: .5; cursor: wait; }
+  .status { color: var(--muted); font-size: 13px; min-height: 20px; }
+  .editor { display: grid; grid-template-columns: auto minmax(0, 1fr); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #0b0f14; height: 46vh; min-height: 280px; }
+  .gutter { margin: 0; padding: 10px 8px 10px 10px; text-align: right; color: #56606c; font: 13px/20px var(--mono); user-select: none; overflow: hidden; background: #0f141b; border-right: 1px solid var(--line); white-space: pre; }
+  .gutter .e { color: var(--bad); font-weight: 700; }
+  .gutter .c { color: var(--warn); font-weight: 700; }
+  textarea.code { margin: 0; padding: 10px 12px; border: 0; outline: none; resize: none; background: transparent; color: var(--text); font: 13px/20px var(--mono); white-space: pre; overflow: auto; tab-size: 4; }
+  .results { margin-top: 16px; }
+  .banner { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 10px; font-weight: 600; }
+  .banner.pass { background: var(--ok-bg); color: var(--ok); }
+  .banner.fail { background: var(--bad-bg); color: var(--bad); }
+  .banner.idle { background: var(--panel); color: var(--muted); font-weight: 500; }
+  .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }
+  .cmp { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
+  .cmp .h { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .cmp .v { margin-top: 4px; }
+  .cmp.missed .v { color: var(--muted); }
+  .cmp.caught .v { color: var(--bad); font-weight: 600; }
+  .why { margin: 10px 0 0; color: var(--muted); }
+  .findings { display: grid; gap: 8px; margin-top: 12px; }
+  .finding { border: 1px solid var(--line); border-left: 4px solid var(--bad); border-radius: 8px; padding: 10px 12px; background: var(--panel); }
+  .finding.warning { border-left-color: var(--warn); }
+  .finding .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .code-id { font: 600 13px var(--mono); color: var(--bad); }
+  .finding.warning .code-id { color: var(--warn); }
+  .where { font: 13px var(--mono); color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; }
+  .finding p { margin: 6px 0 0; }
+  .finding .fix { color: var(--muted); font-size: 14px; }
+  details.checked { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
+  details.checked summary { cursor: pointer; font-weight: 600; }
+  details.checked h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 6px; }
+  details.checked ul { margin: 0; padding-left: 18px; }
+  details.checked li { font: 13px/1.6 var(--mono); word-break: break-word; }
+  footer { border-top: 1px solid var(--line); padding: 16px 24px 28px; color: var(--muted); font-size: 13.5px; }
+  footer p { margin: 6px 0; max-width: 1000px; }
+  .spinner { width: 14px; height: 14px; border: 2px solid #3a4452; border-top-color: var(--accent); border-radius: 50%; display: inline-block; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 860px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    header, footer { padding-left: 16px; padding-right: 16px; }
+    section.work { padding: 14px 16px 24px; }
+    .editor { height: 52vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span><b>EmbedForge</b> · Verify Playground</div>
+  <h1>Plant a bug in a driver NVIDIA Nemotron wrote, and watch the datasheet catch it.</h1>
+  <p>Both drivers were written by Nemotron 3 Ultra and verified against facts it quoted word for word from the
+     manufacturer's datasheet. Pick a bug, or edit the code yourself, and press Verify: EmbedForge reads the C without
+     running it, works out every byte it would send to the chip, and checks register fields, byte order, formulas and
+     timing against those quotes. It runs here, in your browser.</p>
+  <div class="links"><a href="https://github.com/Toy-tusk7/embedded_force">Source and README on GitHub</a>
+    <a href="https://github.com/Toy-tusk7/embedded_force/blob/main/RUNS.md">Every Nemotron run</a></div>
+</header>
+
+<div class="layout">
+  <aside>
+    <h2>1 · Pick a driver</h2>
+    <div class="cards" id="cards"></div>
+    <h2>2 · Plant a bug</h2>
+    <div class="bugs" id="stories"></div>
+    <details class="more"><summary id="more-label">More planted faults</summary><div class="bugs" id="more"></div></details>
+    <button class="reset" id="reset" type="button">Back to the delivered driver</button>
+  </aside>
+
+  <section class="work">
+    <div class="toolbar">
+      <div class="tabs" id="tabs" role="tablist"></div>
+      <button class="verify" id="verify" type="button" disabled>Verify</button>
+    </div>
+    <div class="status" id="status" aria-live="polite"><span class="spinner"></span>Loading Python in your browser (first visit takes a few seconds)…</div>
+    <div class="editor">
+      <pre class="gutter" id="gutter" aria-hidden="true"></pre>
+      <textarea class="code" id="code" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Driver source code"></textarea>
+    </div>
+    <div class="results" id="results"></div>
+  </section>
+</div>
+
+<footer>
+  <p><b>What runs here.</b> EmbedForge's verifier (Python, in the browser through Pyodide) on the driver and the records
+     Nemotron made: facts, register map, byte layouts, formulas, datasheet rules and init sequences, each with its
+     verbatim datasheet quote. No AI model is called on this page and nothing is sent anywhere.</p>
+  <p><b>Not included.</b> The datasheets' full text (verify checks against the quoted records, not the PDF) and
+     the compiler. Where a bug shows what the compiler and cppcheck say, that was measured with PlatformIO, GCC with
+     all warnings, and cppcheck when this page was built.</p>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const BOOT = `
+import sys, types, json, shutil
+from pathlib import Path
+# stand-ins for libraries verify imports but never uses here: web fetching, .env loading, console colours
+httpx = types.ModuleType("httpx")
+class _Unavailable(Exception):
+    pass
+httpx.Client = httpx.AsyncClient = object
+httpx.HTTPError = httpx.TimeoutException = _Unavailable
+httpx.Timeout = lambda *a, **k: None
+dotenv = types.ModuleType("dotenv")
+dotenv.load_dotenv = lambda *a, **k: False
+rich, rc, rt = types.ModuleType("rich"), types.ModuleType("rich.console"), types.ModuleType("rich.theme")
+class Console:
+    def __init__(self, *a, **k): pass
+    def print(self, *a, **k): pass
+    def log(self, *a, **k): pass
+    def rule(self, *a, **k): pass
+rc.Console = Console
+rt.Theme = lambda *a, **k: None
+sys.modules.update({"httpx": httpx, "dotenv": dotenv, "rich": rich, "rich.console": rc, "rich.theme": rt})
+from embedforge.truth import FactLedger, SourceStore, verify_project
+
+def run_verify(key, files_json, chip):
+    files = json.loads(files_json)
+    root = Path("/work") / key
+    if root.exists():
+        shutil.rmtree(root)
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    rep = verify_project(root, FactLedger(root, SourceStore(root)), pico=True, chip=chip)
+    return json.dumps({"passed": rep.passed, "summary": rep.summary(),
+                       "findings": [{"severity": f.severity, "code": f.code, "file": f.file, "line": f.line,
+                                     "message": f.message, "suggestion": getattr(f, "suggestion", "")} for f in rep.findings],
+                       "registers": rep.registers, "flows": rep.flows}, default=str)
+`;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const state = { projects: [], cur: null, files: {}, edited: {}, file: "", preset: null, py: null, last: null };
+
+function codeFiles(p) { return Object.keys(p.files).filter((f) => /^(src|include|lib)\//.test(f) || f === "platformio.ini"); }
+
+function renderCards() {
+  $("cards").innerHTML = state.projects.map((p, i) => `
+    <button class="card" type="button" data-i="${i}" aria-pressed="${state.cur === p}">
+      <div class="t">${esc(p.title)}</div><div class="k">${esc(p.kind)}</div>
+      <div class="s"><span class="pill ok">verify PASS</span><span class="pill">planted faults caught: ${esc(p.mutation)}</span></div>
+    </button>`).join("");
+  document.querySelectorAll(".card").forEach((b) => b.onclick = () => selectProject(state.projects[+b.dataset.i]));
+}
+
+function bugButton(p, i) {
+  return `<button class="bug" type="button" data-i="${i}" aria-pressed="${state.preset === p}">${esc(p.title)}${p.why ? `<small>${esc(p.why)}</small>` : ""}</button>`;
+}
+
+function renderBugs() {
+  const ps = state.cur.presets;
+  $("stories").innerHTML = ps.map((p, i) => p.story ? bugButton(p, i) : "").join("");
+  const more = ps.map((p, i) => p.story ? "" : bugButton(p, i)).join("");
+  $("more").innerHTML = more;
+  $("more-label").textContent = `More planted faults (${ps.filter((p) => !p.story).length}, from the mutation test)`;
+  document.querySelectorAll(".bug").forEach((b) => b.onclick = () => plant(ps[+b.dataset.i]));
+}
+
+function renderTabs() {
+  $("tabs").innerHTML = codeFiles(state.cur).map((f) => `<button class="tab${state.edited[f] !== state.cur.files[f] ? " changed" : ""}" role="tab" type="button" data-f="${esc(f)}" aria-selected="${f === state.file}">${esc(f)}</button>`).join("");
+  document.querySelectorAll(".tab").forEach((b) => b.onclick = () => openFile(b.dataset.f));
+}
+
+function changedLines(f) {
+  const a = (state.cur.files[f] ?? "").split("\n"), b = (state.edited[f] ?? "").split("\n");
+  const out = new Set();
+  for (let i = 0; i < Math.max(a.length, b.length); i++) if (a[i] !== b[i]) { out.add(i + 1); if (out.size > 12) break; }
+  return out;
+}
+
+function renderGutter() {
+  const n = $("code").value.split("\n").length;
+  const errs = new Set((state.last?.findings || []).filter((x) => x.file === state.file && x.severity === "ERROR").map((x) => x.line));
+  const changed = changedLines(state.file);
+  let s = "";
+  for (let i = 1; i <= n; i++) s += errs.has(i) ? `<span class="e">${i}</span>\n` : changed.has(i) ? `<span class="c">${i}</span>\n` : `${i}\n`;
+  $("gutter").innerHTML = s;
+  $("gutter").scrollTop = $("code").scrollTop;
+}
+
+function openFile(f, line) {
+  state.file = f;
+  $("code").value = state.edited[f];
+  renderTabs(); renderGutter();
+  if (line) jumpTo(line);
+}
+
+function jumpTo(line) {
+  const ta = $("code"), lines = ta.value.split("\n");
+  let start = 0;
+  for (let i = 0; i < Math.min(line - 1, lines.length); i++) start += lines[i].length + 1;
+  ta.focus();
+  ta.setSelectionRange(start, start + (lines[line - 1] || "").length);
+  ta.scrollTop = Math.max(0, (line - 6) * 20);
+  renderGutter();
+}
+
+function selectProject(p) {
+  state.cur = p; state.preset = null; state.last = null;
+  state.edited = { ...p.files };
+  renderCards(); renderBugs();
+  openFile(codeFiles(p).find((f) => f.startsWith("src/") && !f.endsWith("main.cpp")) || codeFiles(p)[0]);
+  $("results").innerHTML = `<div class="banner idle">${esc(p.story)}</div>`;
+  if (state.py) runVerify();
+}
+
+function plant(p) {
+  state.preset = p;
+  state.edited = { ...state.cur.files };
+  const text = state.edited[p.file];
+  if (p.old !== undefined) state.edited[p.file] = text.replace(p.old, p.new);
+  else { const ls = text.split("\n"); ls[p.line - 1] = p.after; state.edited[p.file] = ls.join("\n"); }
+  renderBugs();
+  const first = [...changedLines(p.file)][0] || p.line || 1;
+  openFile(p.file, first);
+  state.reveal = window.matchMedia("(max-width: 860px)").matches;   // on a phone the result is below the list
+  runVerify();
+}
+
+function toolchainCard(p, caughtByVerify) {
+  if (!p || !p.toolchain) return "";
+  const t = p.toolchain;
+  const gcc = !t.compiles ? ["caught", `Does not compile: ${t.first_error}`] : t.warning ? ["caught", `Warning: ${t.warning}`] : ["missed", "Compiles, no new warning"];
+  const cpp = !t.compiles ? ["missed", "Not run (no build)"] : t.cppcheck ? ["caught", `Finding: ${t.cppcheck}`] : ["missed", "No new finding"];
+  return `<div class="compare">
+    <div class="cmp ${gcc[0]}"><div class="h">Compiler · GCC, all warnings</div><div class="v">${esc(gcc[1])}</div></div>
+    <div class="cmp ${cpp[0]}"><div class="h">Static analysis · cppcheck</div><div class="v">${esc(cpp[1])}</div></div>
+    <div class="cmp ${caughtByVerify ? "caught" : "missed"}"><div class="h">EmbedForge verify</div><div class="v">${caughtByVerify ? "Caught: see below" : "Not caught"}</div></div>
+  </div>`;
+}
+
+function renderResults(r) {
+  state.last = r;
+  // the finding on the line that was changed is the direct cause: it comes first, consequences after it
+  const onChange = (f) => (f.file && changedLines(f.file).has(f.line)) ? 0 : 1;
+  const errs = r.findings.filter((f) => f.severity === "ERROR").sort((a, b) => onChange(a) - onChange(b));
+  const warns = r.findings.filter((f) => f.severity === "WARNING");
+  const banner = r.passed ? `<div class="banner pass">✓ ${esc(r.summary)}</div>` : `<div class="banner fail">✗ ${esc(r.summary)}</div>`;
+  const why = state.preset?.why ? `<p class="why">${esc(state.preset.why)}</p>` : "";
+  // one entry per kind of error: the same error for each of 14 formulas reads as one finding, with its count
+  const groups = new Map();
+  for (const f of [...errs, ...warns]) {
+    const k = f.severity + f.code;
+    if (groups.has(k)) groups.get(k).n++; else groups.set(k, { ...f, n: 1 });
+  }
+  const list = [...groups.values()].map((f) => `
+    <div class="finding ${f.severity === "WARNING" ? "warning" : ""}">
+      <div class="head"><span class="code-id">${esc(f.code)}</span>${f.file ? `<button class="where" type="button" data-f="${esc(f.file)}" data-l="${f.line}">${esc(f.file)}${f.line ? ":" + f.line : ""}</button>` : ""}${f.n > 1 ? `<span class="pill">and ${f.n - 1} more like it</span>` : ""}</div>
+      <p>${esc(f.message)}</p>${f.suggestion ? `<p class="fix">Fix: ${esc(f.suggestion)}</p>` : ""}
+    </div>`).join("");
+  const reg = r.registers || {};
+  const section = (title, items) => items && items.length ? `<h3>${esc(title)}</h3><ul>${items.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "";
+  const flows = (r.flows || []).map((f) => `${f.subject}.${f.name}: ` + (f.steps || []).map((s) => `${s.step}. ${s.op} ${s.status}`).join(" · "));
+  const checked = `<details class="checked"${r.passed ? " open" : ""}><summary>What verify checked in this driver</summary>
+    ${section("Register writes, decoded from the register map", reg.writes)}
+    ${section("Conversions compared with the datasheet formulas", reg.formulas)}
+    ${section("Datasheet rules over the settings", reg.constraints)}
+    ${section("Init sequences: order and timing", flows)}
+    ${section("Byte layouts of multi-byte values", reg.layouts)}</details>`;
+  $("results").innerHTML = banner + toolchainCard(state.preset, errs.length > 0) + why + `<div class="findings">${list}</div>` + checked;
+  document.querySelectorAll(".where").forEach((b) => b.onclick = () => {
+    if (state.edited[b.dataset.f] !== undefined) openFile(b.dataset.f, +b.dataset.l);
+  });
+  renderGutter(); renderTabs();
+  if (state.reveal) { state.reveal = false; $("results").scrollIntoView({ behavior: "smooth", block: "start" }); }
+}
+
+function runVerify() {
+  if (!state.py) return;
+  $("verify").disabled = true;
+  $("status").innerHTML = `<span class="spinner"></span>Verifying…`;
+  setTimeout(() => {
+    try {
+      const t0 = performance.now();
+      const out = state.py.globals.get("run_verify")(state.cur.key, JSON.stringify(state.edited), state.cur.chip);
+      renderResults(JSON.parse(out));
+      $("status").textContent = `Verified in ${Math.round(performance.now() - t0)} ms, in your browser.`;
+    } catch (e) {
+      $("status").textContent = "Verify could not run: " + e.message;
+    } finally { $("verify").disabled = false; }
+  }, 30);
+}
+
+$("code").addEventListener("input", () => { state.edited[state.file] = $("code").value; renderGutter(); renderTabs(); });
+$("code").addEventListener("scroll", () => { $("gutter").scrollTop = $("code").scrollTop; });
+$("code").addEventListener("keydown", (e) => {
+  if (e.key === "Tab") { e.preventDefault(); const t = e.target, s = t.selectionStart; t.setRangeText("    ", s, t.selectionEnd, "end"); t.dispatchEvent(new Event("input")); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") runVerify();
+});
+$("verify").onclick = runVerify;
+$("reset").onclick = () => selectProject(state.cur);
+
+(async () => {
+  try {
+    state.projects = await (await fetch("projects.json")).json();
+    selectProject(state.projects[0]);
+    const py = await loadPyodide();
+    $("status").innerHTML = `<span class="spinner"></span>Loading EmbedForge…`;
+    await py.loadPackage("pydantic");
+    const code = await (await fetch("embedforge.json")).json();
+    for (const [path, text] of Object.entries(code)) {   // the package's sources into the browser's Python
+      const dir = "/home/pyodide/" + path.split("/").slice(0, -1).join("/");
+      py.FS.mkdirTree(dir);
+      py.FS.writeFile("/home/pyodide/" + path, text);
+    }
+    py.runPython(BOOT);
+    state.py = py;
+    $("verify").disabled = false;
+    runVerify();
+  } catch (e) {
+    $("status").textContent = "Could not start Python in this browser: " + e.message;
+  }
+})();
+</script>
+</body>
+</html>
