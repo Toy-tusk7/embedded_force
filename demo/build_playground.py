@@ -11,12 +11,10 @@ PlatformIO under the strict warning set and checked with cppcheck, to show what 
   python demo/build_playground.py [--compile] [--out demo/dist]
 """
 import argparse
-import io
 import json
 import shutil
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -224,16 +222,15 @@ def main() -> int:
     if out.exists():
         shutil.rmtree(out)
     (out / "bundle").mkdir(parents=True)
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in sorted((REPO / "embedforge").rglob("*.py")):
-            if "__pycache__" not in p.parts:
-                z.write(p, str(p.relative_to(REPO)).replace("\\", "/"))
-    (out / "bundle" / "embedforge.zip").write_bytes(buf.getvalue())
+    # the package as text (path -> source): a Hugging Face Space refuses binary files pushed without Git LFS
+    code = {str(p.relative_to(REPO)).replace("\\", "/"): p.read_text(encoding="utf-8")
+            for p in sorted((REPO / "embedforge").rglob("*.py")) if "__pycache__" not in p.parts}
+    (out / "bundle" / "embedforge.json").write_text(json.dumps(code), encoding="utf-8")
     (out / "bundle" / "projects.json").write_text(json.dumps(bundle), encoding="utf-8")
     shutil.copy(HERE / "playground" / "index.html", out / "index.html")
     shutil.copy(HERE / "playground" / "README.md", out / "README.md")
-    print(f"built {out} ({len(buf.getvalue()) // 1024} KB code, {(out / 'bundle' / 'projects.json').stat().st_size // 1024} KB projects)")
+    print(f"built {out} ({(out / 'bundle' / 'embedforge.json').stat().st_size // 1024} KB code, "
+          f"{(out / 'bundle' / 'projects.json').stat().st_size // 1024} KB projects)")
     return 0
 
 

@@ -351,8 +351,12 @@ $("reset").onclick = () => selectProject(state.cur);
     const py = await loadPyodide();
     $("status").innerHTML = `<span class="spinner"></span>Loading EmbedForge…`;
     await py.loadPackage("pydantic");
-    const zip = await (await fetch("bundle/embedforge.zip")).arrayBuffer();
-    py.unpackArchive(zip, "zip", { extractDir: "/home/pyodide" });
+    const code = await (await fetch("bundle/embedforge.json")).json();
+    for (const [path, text] of Object.entries(code)) {   // the package's sources into the browser's Python
+      const dir = "/home/pyodide/" + path.split("/").slice(0, -1).join("/");
+      py.FS.mkdirTree(dir);
+      py.FS.writeFile("/home/pyodide/" + path, text);
+    }
     py.runPython(BOOT);
     state.py = py;
     $("verify").disabled = false;

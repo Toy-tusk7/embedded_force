@@ -13,6 +13,16 @@ word for word from the source, writes the firmware and compiles it with the real
 reads the C code without running it, works out exactly what it would send to the chip, and compares that with the
 recorded datasheet facts. Any difference is an error with a file and line, and goes back to the agent to fix.
 
+**Try it in your browser:** the [Verify Playground](https://huggingface.co/spaces/Toytusk/embedforge) holds two
+drivers Nemotron wrote. Plant a bug, or edit the code, and verify finds it in about half a second. No install, no
+keys, no model call.
+
+| Result | |
+|---|---|
+| 73 realistic bugs planted in two drivers Nemotron wrote (TI TMP117, Bosch BMP388) | **All 73 compile with no new warning** under GCC's strict warnings; cppcheck flags **1**; EmbedForge verify catches **68** |
+| The TMP117 task run cold on Nemotron 3 Ultra | Task to a verified driver in **55 steps**, 1 Tavily credit, **0 errors and 0 warnings**, every value quoted from TI's datasheet |
+| Bosch's own BMP3 reference driver | Verify found a **real defect**: the soft-reset routine uses the command register's address as a bit mask |
+
 ---
 
 ## Why
@@ -104,6 +114,21 @@ place, the wrong signedness, a required delay deleted, a write to the next regis
 reported as success) and the delivery report gives the score and lists each fault verify did not catch. On the
 BMP388 driver Nemotron wrote for an RP2350B board: 48 of 49 caught (98%); the survivor is listed
 (`python -m embedforge.truth.mutate <project dir>`).
+
+**What the toolchain alone would catch.** The same faults, planted in the two delivered drivers (BMP388 and
+TMP117), were also built with PlatformIO under the strict warning set (`-Wall -Wextra -Wshadow -Wformat=2
+-Wnull-dereference -Wduplicated-cond -Wlogical-op`) and checked with cppcheck:
+
+| | Faults | Fail to compile | New compiler warning | cppcheck finding | EmbedForge verify |
+|---|---|---|---|---|---|
+| BMP388 (Bosch) | 49 | 0 | 0 | 1 | **48** |
+| TMP117 (TI) | 24 | 0 | 0 | 0 | **20** |
+| **Total** | **73** | **0** | **0** | **1** | **68** |
+
+These are datasheet bugs: the code is valid C, so the compiler has nothing to say. Of the five faults verify did not
+catch, none changes what these drivers send to the chip in practice: one makes a variable signed that only ever holds
+a small positive number, one changes the branch of a null check on a pointer that is never null, two flip a bit the
+datasheet marks unused, and one deletes a wait that a later, longer wait still covers.
 
 **A bug verify caught in Nemotron's own driver.** The first BMP388 driver set normal mode before its oversampling
 and data rate. It compiled, and its register values were right; only the order was wrong. Once the datasheet's

@@ -1,0 +1,434 @@
+{
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 7, \"#define TMP117_I2C_ADDR   0x49   /* FACT-001 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 9, \"#define TMP117_REG_TEMP_RESULT    0x01   /* FACT-006 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 10, \"#define TMP117_REG_CONFIGURATION  0x00   /* FACT-007 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 11, \"#define TMP117_REG_THIGH_LIMIT    0x03   /* FACT-008 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 12, \"#define TMP117_REG_TLOW_LIMIT     0x02   /* FACT-009 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"include/tmp117.h\", null, null, 13, \"#define TMP117_REG_DEVICE_ID      0x0E   /* FACT-010 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 7, \"    _wire->setSDA(17);   /* FACT-002 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 8, \"    _wire->setSCL(18);   /* FACT-003 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 16, \"    if (!writeRegister((TMP117_REG_CONFIGURATION) + 1, 0x0002)) {  // SOFT_RESET bit 1 = 1\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 38, \"    if (!writeRegister((TMP117_REG_CONFIGURATION) + 1, config)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 17, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 26, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 29, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 39, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 81, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 80, \"    if (_wire->endTransmission(false) == 0) {  // repeated start\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", null, null, 85, \"    if (_wire->requestFrom(static_cast<uint8_t>(TMP117_I2C_ADDR), static_cast<uint8_t>(2)) == 2) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 8, \"#define BMP388_I2C_ADDR        0x77  /* FACT-004 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 12, \"#define BMP388_REG_CMD         0x7F  /* FACT-007 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 14, \"#define BMP388_REG_OSR         0x1D  /* FACT-010 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 16, \"#define BMP388_REG_CONFIG      0x1E  /* FACT-031 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 22, \"#define BMP388_CMD_SOFTRESET   0xB7  /* FACT-008 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 60, \"#define BMP388_REG_PRESS_DATA   0x05  /* FACT-014 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 103, \"        uint16_t nvm_par_p1;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 105, \"        uint8_t nvm_par_p3;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 107, \"        int16_t nvm_par_p5;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", null, null, 109, \"        uint8_t nvm_par_p7;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 8, \"    _wire.setSDA(17); /* FACT-002 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 9, \"    _wire.setSCL(18); /* FACT-001 */\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 13, \"\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 21, \"\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 16, \"    if (!_writeRegister((BMP388_REG_CMD) + 1, BMP388_CMD_SOFTRESET)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 16, \"    if (!_writeRegister(BMP388_REG_CMD, (BMP388_CMD_SOFTRESET) ^ 0x01)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 40, \"    if (!_writeRegister((BMP388_REG_OSR) + 1, osr)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 40, \"    if (!_writeRegister(BMP388_REG_OSR, (osr) ^ 0x01)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 46, \"    if (!_writeRegister((BMP388_REG_ODR) + 1, BMP388_ODR_SEL_50)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 46, \"    if (!_writeRegister(BMP388_REG_ODR, (BMP388_ODR_SEL_50) ^ 0x01)) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 17, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 31, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 47, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 60, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 91, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 117, \"        return true;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": "('knownConditionTrueFalse', 'src/bmp388.cpp', 30)"
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 90, \"    if (_wire.endTransmission(false) == 0) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 95, \"    if (received == len) {\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 123, \"    _nvm_calib.nvm_par_t2 = (int16_t)((calib_data[3] << 16) | calib_data[2]);      // 0x33, 0x34\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 125, \"    _nvm_calib.nvm_par_p1 = (int16_t)((calib_data[6] << 16) | calib_data[5]);      // 0x36, 0x37\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 126, \"    _nvm_calib.nvm_par_p2 = (int16_t)((calib_data[8] << 16) | calib_data[7]);      // 0x38, 0x39\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 129, \"    _nvm_calib.nvm_par_p5 = (int16_t)((calib_data[12] << 16) | calib_data[11]);    // 0x3C, 0x3D\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 130, \"    _nvm_calib.nvm_par_p6 = (int16_t)((calib_data[14] << 16) | calib_data[13]);    // 0x3E, 0x3F\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 125, \"    _nvm_calib.nvm_par_p1 = (int16_t)((calib_data[7] << 8) | calib_data[5]);      // 0x36, 0x37\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 129, \"    _nvm_calib.nvm_par_p5 = (int16_t)((calib_data[13] << 8) | calib_data[11]);    // 0x3C, 0x3D\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 133, \"    _nvm_calib.nvm_par_p9 = (int16_t)((calib_data[19] << 8) | calib_data[17]);    // 0x42, 0x43\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 183, \"                          ((uint32_t)data[2] << 8) |\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 187, \"    raw_temp = (int32_t)((uint32_t)data[4] |\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 149, \"    _calib.par_t3 = (double)_nvm_calib.nvm_par_t3 * 281474976710656.0;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 153, \"    _calib.par_p2 = (double)(_nvm_calib.nvm_par_p2 - 16384) * 536870912.0;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 157, \"    _calib.par_p4 = (double)_nvm_calib.nvm_par_p4 * 137438953472.0;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 161, \"    _calib.par_p6 = (double)_nvm_calib.nvm_par_p6 * 64.0;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", null, null, 165, \"    _calib.par_p8 = (double)_nvm_calib.nvm_par_p8 * 32768.0;\"]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"value = (static_cast<uint16_t>(msb) << 8) | lsb;\", \"value = (static_cast<uint16_t>(lsb) << 8) | msb;\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"int16_t LSB = static_cast<int16_t>(raw);\", \"uint16_t LSB = raw;\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"    _wire->write(static_cast<uint8_t>(value & 0xFF)); // LSB\\n\", \"\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"config |= (0b100 << 7);  // CONV = 1s\", \"config |= (0b101 << 7);  // CONV = 1s\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"if (device_id != TMP117_DEVICE_ID_VALUE) {\", \"if (device_id == TMP117_DEVICE_ID_VALUE) {\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"src/tmp117.cpp\", \"delay(TMP117_SOFT_RESET_DELAY_MS);\", \"delay(1);\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261020-180358-f3b1\", \"platformio.ini\", \"board_upload.maximum_size = 2097152\\n\", \"\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", \"    // Configure oversampling (SEQ-001 step 5)\", \"    if (!_writeRegister(BMP388_REG_PWR_CTRL, BMP388_PWR_CTRL_PRESS_EN | BMP388_PWR_CTRL_TEMP_EN | BMP388_PWR_CTRL_MODE_NORMAL)) {\\n        return false;\\n    }\\n\\n    // Configure oversampling (SEQ-001 step 5)\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", \"_calib.par_t1 = (double)_nvm_calib.nvm_par_t1 / 0.00390625;\", \"_calib.par_t1 = (double)_nvm_calib.nvm_par_t1 * 0.00390625;\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"include/bmp388.h\", \"        uint16_t nvm_par_t2;\", \"        int16_t nvm_par_t2;\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", \"_nvm_calib.nvm_par_t1 = (uint16_t)((calib_data[1] << 8) | calib_data[0]);\", \"_nvm_calib.nvm_par_t1 = (uint16_t)((calib_data[0] << 8) | calib_data[1]);\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ },
+ "[\"20261016-002347-cc5f\", \"src/bmp388.cpp\", \"if (chip_id != BMP388_CHIP_ID) {\", \"if (chip_id == BMP388_CHIP_ID) {\", null, null]": {
+  "compiles": true,
+  "first_error": "",
+  "warning": "",
+  "cppcheck": ""
+ }
+}
