@@ -42,6 +42,10 @@ tracing = [
 [project.scripts]
 embedforge = "embedforge.server:main"
 
+[tool.setuptools.packages.find]
+# the repository root also holds demo/ and deploy/ (scripts, not packages)
+include = ["embedforge*"]
+
 [tool.setuptools.package-data]
 # the IDE, the agent's skills (playbooks) and the benchmark's datasheet ship with the package
 embedforge = ["web/*", "skills/*.md", "verifybench/*.md"]
