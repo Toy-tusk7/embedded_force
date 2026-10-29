@@ -13,7 +13,7 @@ word for word from the source, writes the firmware and compiles it with the real
 reads the C code without running it, works out exactly what it would send to the chip, and compares that with the
 recorded datasheet facts. Any difference is an error with a file and line, and goes back to the agent to fix.
 
-**Try it in your browser:** the [Verify Playground](https://huggingface.co/spaces/Toytusk/embedforge) holds two
+**Try it in your browser:** the [Verify Playground](https://embedforge-playground.onrender.com/) holds two
 drivers Nemotron wrote. Plant a bug, or edit the code, and verify finds it in about half a second. No install, no
 keys, no model call.
 
